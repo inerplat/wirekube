@@ -1,0 +1,93 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wirekube-agent
+  namespace: wirekube-system
+  labels:
+    app: wirekube-agent
+spec:
+  selector:
+    matchLabels:
+      app: wirekube-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: wirekube-agent
+    spec:
+      serviceAccountName: wirekube-agent
+      hostNetwork: true            # Required: agent manages host network interfaces
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists          # Run on all nodes including control-plane
+      # Only deploy on VPN-enabled nodes
+      nodeSelector:
+        wirekube.io/vpn-enabled: "true"
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Load WireGuard kernel module if not already loaded
+        - name: load-wireguard-module
+          image: alpine:3.19
+          command: [sh, -c, "modprobe wireguard || echo 'WireGuard module not available, userspace fallback required'"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+      containers:
+        - name: agent
+          image: ghcr.io/wirekube/agent:latest
+          imagePullPolicy: Always
+          command:
+            - /agent
+          args:
+            - --node-name=$(NODE_NAME)
+            - --mesh-name=default
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: false
+            capabilities:
+              add:
+                - NET_ADMIN      # Create and configure network interfaces
+                - SYS_MODULE     # Load kernel modules (wireguard)
+          volumeMounts:
+            - name: wireguard-keys
+              mountPath: /var/lib/wirekube
+            - name: host-proc
+              mountPath: /proc
+              readOnly: true
+          resources:
+            limits:
+              cpu: 200m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          livenessProbe:
+            exec:
+              command: [wg, show]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: wireguard-keys
+          hostPath:
+            path: /var/lib/wirekube
+            type: DirectoryOrCreate
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
