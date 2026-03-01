@@ -1,0 +1,8 @@
+bin/
+*.pem
+*.key
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate.*.backup
+.terraform/
+.claude/
