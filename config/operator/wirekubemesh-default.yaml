@@ -1,0 +1,33 @@
+---
+# Default WireKubeMesh — apply this after installing CRDs and operator.
+# Adjust meshCIDR and mode as needed.
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  # IP pool for mesh addresses (one /32 per node)
+  meshCIDR: "10.100.0.0/24"
+
+  # "selective": only nodes labeled wirekube.io/vpn-enabled=true join
+  # "all":       every node joins automatically
+  mode: selective
+
+  listenPort: 51820
+  interfaceName: wg0
+  mtu: 1420
+
+  # STUN servers for NAT traversal (used by nodes behind NAT, e.g. home PCs)
+  stunServers:
+    - stun:stun.l.google.com:19302
+    - stun:stun1.l.google.com:19302
+    - stun:stun.cloudflare.com:3478
+
+  # Optional: relay server for Symmetric NAT (Uncomment if needed)
+  # relay:
+  #   enabled: true
+  #   endpoint: "relay.example.com:3478"
+
+  # Multi-cluster example (uncomment and adjust for cluster-1):
+  # clusterID: 1
+  # clusterMeshCIDR: "10.100.1.0/24"

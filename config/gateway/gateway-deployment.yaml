@@ -1,0 +1,17 @@
+---
+# Example WireKubeGateway resource.
+# Create this to bridge non-VPN nodes into the mesh.
+# The operator will automatically create the gateway pod.
+#
+# Replace:
+#   spec.nodeName       → a VPN-enabled node name
+#   spec.routedCIDRs    → pod CIDRs of non-VPN nodes
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeGateway
+metadata:
+  name: default-gateway
+spec:
+  nodeName: node-worker-1       # Must be a VPN-enabled node
+  masqueradeEnabled: true
+  routedCIDRs:
+    - 10.244.2.0/24             # non-VPN node pod CIDR (example)
