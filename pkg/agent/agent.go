@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -239,6 +240,14 @@ func (a *Agent) sync(ctx context.Context) error {
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if p.Name == myPeerName {
+			// Update preferred source IP from own allowedIPs so outgoing packets use
+			// the node's private IP as source (required for WireGuard AllowedIPs filter).
+			if len(p.Spec.AllowedIPs) > 0 {
+				ip, _, _ := net.ParseCIDR(p.Spec.AllowedIPs[0])
+				if ip != nil {
+					a.wgMgr.SetPreferredSrc(ip.String())
+				}
+			}
 			continue
 		}
 		if p.Spec.PublicKey == "" {
