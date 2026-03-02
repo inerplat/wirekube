@@ -14,11 +14,19 @@ import (
 
 // Manager manages a WireGuard interface using wgctrl (kernel WireGuard).
 type Manager struct {
-	ifaceName  string
-	listenPort int
-	mtu        int
-	kp         *KeyPair
-	wgClient   *wgctrl.Client
+	ifaceName    string
+	listenPort   int
+	mtu          int
+	kp           *KeyPair
+	wgClient     *wgctrl.Client
+	preferredSrc net.IP // source IP for routes in table 51820 (avoids public IP being selected)
+}
+
+// SetPreferredSrc sets the source IP used when adding routes to the WireGuard routing table.
+// This ensures outgoing packets use the node's private IP as source, which must match
+// the AllowedIPs filter on the receiving peer's WireGuard interface.
+func (m *Manager) SetPreferredSrc(ip string) {
+	m.preferredSrc = net.ParseIP(ip)
 }
 
 // NewManager creates a new WireGuard interface manager.
@@ -288,6 +296,7 @@ func (m *Manager) AddRoute(dst string) error {
 		LinkIndex: link.Attrs().Index,
 		Dst:       ipnet,
 		Table:     wgRouteTable,
+		Src:       m.preferredSrc,
 	}
 	if addErr := netlink.RouteAdd(route); addErr != nil {
 		if isRouteExists(addErr) {
