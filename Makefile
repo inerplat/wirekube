@@ -1,5 +1,5 @@
 IMG ?= inerplat/wirekube
-VERSION ?= v0.0.1
+VERSION ?= v0.0.2
 
 GO = go
 GOFLAGS =
@@ -36,11 +36,11 @@ manifests:
 
 .PHONY: docker-build
 docker-build:
-	docker build -t $(IMG):$(VERSION) .
+	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG):$(VERSION) --load .
 
 .PHONY: docker-push
-docker-push: docker-build
-	docker push $(IMG):$(VERSION)
+docker-push:
+	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG):$(VERSION) --push .
 
 ## ─── Deploy ──────────────────────────────────────────────────────────────────
 
