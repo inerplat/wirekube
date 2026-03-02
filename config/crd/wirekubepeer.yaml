@@ -76,6 +76,12 @@ spec:
                 endpointDiscoveryMethod:
                   type: string
                   description: "How endpoint was discovered: annotation|ipv6|stun|aws-metadata|internal-ip"
+                transportMode:
+                  type: string
+                  description: "Current transport: direct|relay"
+                relayLatencyMs:
+                  type: integer
+                  description: Latency to peer via relay (ms). Set when transportMode is relay.
                 conditions:
                   type: array
                   items:
