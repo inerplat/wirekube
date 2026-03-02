@@ -97,10 +97,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: KUBECONFIG
-              value: ""
-            - name: WIREKUBE_KUBE_APISERVER
-              value: "https://wk-api-lb-129103036-913d8f2961b5.jpn.lb.naverncp.com:6443"
             - name: WIREKUBE_INTERFACE
               value: "wire_kube"
           securityContext:

@@ -104,12 +104,10 @@ Three-tier fallback:
 
 ```
 config/
-  crd/          # Auto-generated CRD manifests (do not hand-edit)
-  rbac/         # ClusterRole + ClusterRoleBinding
-  agent/        # DaemonSet YAML
-  operator/     # Operator Deployment + example WireKubeMesh CR
-  relay/        # Relay Deployment + Service examples
-  bootstrap/    # Bootstrap scripts
+  crd/                        # Auto-generated CRD manifests (do not hand-edit)
+  agent/                      # DaemonSet YAML (includes RBAC)
+  relay/                      # Relay Deployment + Service examples
+  wirekubemesh-default.yaml   # Example WireKubeMesh CR
 ```
 
 ## Code Generation Notes
