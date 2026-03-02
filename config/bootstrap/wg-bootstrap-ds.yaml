@@ -68,11 +68,12 @@ spec:
               apk add --no-cache wireguard-tools curl iproute2 jq 2>/dev/null
 
               NODE=${NODE_NAME}
+              WG_IFACE=${WIREKUBE_INTERFACE:-wire_kube}
               APISERVER="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
               TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
               CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 
-              # Generate WireGuard key (if not exists)
+              # Generate WireGuard key pair if not present
               if [ ! -f /wg/privatekey ]; then
                 wg genkey > /wg/privatekey
                 chmod 600 /wg/privatekey
@@ -80,19 +81,18 @@ spec:
               PRIVKEY=$(cat /wg/privatekey)
               PUBKEY=$(echo "$PRIVKEY" | wg pubkey)
 
-              # Detect public IP (WireGuard endpoint)
+              # Detect public IP for WireGuard endpoint
               NODE_IP=$(curl -s --connect-timeout 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')
               [ -z "$NODE_IP" ] && NODE_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
               ENDPOINT="${NODE_IP}:51820"
               echo "[${NODE}] endpoint=${ENDPOINT} pub=${PUBKEY:0:12}..."
 
-              # Create wg0 interface (if not exists)
-              if ! ip link show wg0 > /dev/null 2>&1; then
-                ip link add wg0 type wireguard
-                ip link set wg0 up
+              if ! ip link show "$WG_IFACE" > /dev/null 2>&1; then
+                ip link add "$WG_IFACE" type wireguard
+                ip link set "$WG_IFACE" up
               fi
-              echo "$PRIVKEY" | wg set wg0 listen-port 51820 private-key /dev/stdin
-              echo "[${NODE}] wg0 up"
+              echo "$PRIVKEY" | wg set "$WG_IFACE" listen-port 51820 private-key /dev/stdin
+              echo "[${NODE}] ${WG_IFACE} up"
 
               # Register WireKubePeer (create or patch)
               PEER_NAME="node-${NODE}"
@@ -118,7 +118,7 @@ spec:
                   --cacert "${CA}" \
                   -d "{\"spec\":{\"publicKey\":\"${PUBKEY}\",\"endpoint\":\"${ENDPOINT}\"}}"
               fi
-              echo "[${NODE}] WireKubePeer registration complete (HTTP ${HTTP_CODE})"
+              echo "[${NODE}] WireKubePeer registered (HTTP ${HTTP_CODE})"
 
               # Main loop: sync peers every 30 seconds
               while true; do
@@ -127,7 +127,7 @@ spec:
                   -H "Authorization: Bearer ${TOKEN}" \
                   --cacert "${CA}" 2>/dev/null)
 
-                # Exclude self, process only peers with allowedIPs
+                # Process only peers with allowedIPs, excluding self
                 echo "$PEERS_JSON" | jq -r --arg self "$PEER_NAME" \
                   '.items[] | select(.metadata.name != $self) | select((.spec.allowedIPs // []) | length > 0) | .metadata.name' \
                   | while read -r PNAME; do
@@ -138,22 +138,22 @@ spec:
                     [ -z "$PPUB" ] && continue
                     [ -z "$PIPS" ] && continue
 
-                    wg set wg0 peer "$PPUB" \
+                    wg set "$WG_IFACE" peer "$PPUB" \
                       allowed-ips "$PIPS" \
                       persistent-keepalive 25 2>/dev/null
 
                     if [ -n "$PEND" ]; then
-                      wg set wg0 peer "$PPUB" endpoint "$PEND" 2>/dev/null
+                      wg set "$WG_IFACE" peer "$PPUB" endpoint "$PEND" 2>/dev/null
                     fi
 
                     # allowedIPs → kernel route
                     echo "$PIPS" | tr ',' '\n' | while read -r CIDR; do
                       [ -z "$CIDR" ] && continue
-                      ip route replace "$CIDR" dev wg0 metric 200 2>/dev/null || true
+                      ip route replace "$CIDR" dev "$WG_IFACE" metric 200 2>/dev/null || true
                     done
                   done
 
-                PEER_COUNT=$(wg show wg0 peers 2>/dev/null | wc -l)
+                PEER_COUNT=$(wg show "$WG_IFACE" peers 2>/dev/null | wc -l)
                 echo "[${NODE}] ${PEER_COUNT} peers synced"
                 sleep 30
               done
@@ -162,6 +162,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: WIREKUBE_INTERFACE
+              value: "wire_kube"
           securityContext:
             capabilities:
               add: ["NET_ADMIN", "SYS_MODULE"]

@@ -13,7 +13,7 @@ func TestGenerateKeyPair(t *testing.T) {
 		t.Fatalf("generateKeyPair() error: %v", err)
 	}
 
-	// 32-byte keys must be generated
+	// Must produce 32-byte keys
 	if len(kp.Private) != 32 {
 		t.Errorf("private key len = %d, want 32", len(kp.Private))
 	}
@@ -21,7 +21,7 @@ func TestGenerateKeyPair(t *testing.T) {
 		t.Errorf("public key len = %d, want 32", len(kp.Public))
 	}
 
-	// Must not be empty
+	// Must not be all zeros
 	var zero [32]byte
 	if kp.Private == zero {
 		t.Error("private key is all zeros")
@@ -30,7 +30,7 @@ func TestGenerateKeyPair(t *testing.T) {
 		t.Error("public key is all zeros")
 	}
 
-	// RFC 7748 clamp verification
+	// Verify RFC 7748 clamping
 	if kp.Private[0]&7 != 0 {
 		t.Error("private key[0] low 3 bits should be zero (clamp)")
 	}
@@ -60,7 +60,7 @@ func TestKeyPair_Base64Encoding(t *testing.T) {
 	privB64 := kp.PrivateKeyBase64()
 	pubB64 := kp.PublicKeyBase64()
 
-	// Must be 32 bytes after base64 decoding
+	// Decoded base64 must be 32 bytes
 	privBytes, err := base64.StdEncoding.DecodeString(privB64)
 	if err != nil {
 		t.Fatalf("PrivateKeyBase64() is not valid base64: %v", err)
@@ -81,19 +81,18 @@ func TestKeyPair_Base64Encoding(t *testing.T) {
 func TestLoadOrGenerate_CreatesNew(t *testing.T) {
 	dir := t.TempDir()
 
-	// Test by overriding KeyDir with temp directory
+	// Test with a temp directory instead of the package-level KeyDir.
+	// KeyDir is a package const, so we call loadOrGenerateFromDir directly.
 	origDir := KeyDir
-	// keyDir is package const so cannot change directly → instead of calling LoadOrGenerate directly,
-	// test internal loadOrGenerateFromDir or create files and verify
 	_ = origDir
 
-	// Create new key
+	// Generate new keys
 	kp, err := loadOrGenerateFromDir(dir)
 	if err != nil {
 		t.Fatalf("loadOrGenerateFromDir() error: %v", err)
 	}
 
-	// Files must have been created
+	// Key files must be created
 	if _, err := os.Stat(filepath.Join(dir, PrivKeyFile)); err != nil {
 		t.Errorf("privatekey file not created: %v", err)
 	}
@@ -101,7 +100,7 @@ func TestLoadOrGenerate_CreatesNew(t *testing.T) {
 		t.Errorf("publickey file not created: %v", err)
 	}
 
-	// Reloading must return the same key
+	// Reloading must return the same keys
 	kp2, err := loadOrGenerateFromDir(dir)
 	if err != nil {
 		t.Fatalf("second loadOrGenerateFromDir() error: %v", err)

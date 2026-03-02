@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -43,8 +41,6 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(testScheme))
 	utilruntime.Must(wirekubev1alpha1.AddToScheme(testScheme))
-	utilruntime.Must(appsv1.AddToScheme(testScheme))
-	utilruntime.Must(corev1.AddToScheme(testScheme))
 }
 
 // TestMain starts the envtest environment and runs all tests.
@@ -97,13 +93,6 @@ func TestMain(m *testing.M) {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		panic("failed to setup WireKubePeer controller: " + err.Error())
-	}
-
-	if err = (&controller.WireKubeGatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		panic("failed to setup WireKubeGateway controller: " + err.Error())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

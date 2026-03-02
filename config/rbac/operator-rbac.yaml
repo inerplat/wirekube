@@ -19,26 +19,17 @@ metadata:
 rules:
   # WireKube CRDs
   - apiGroups: [wirekube.io]
-    resources: [wirekubemeshes, wirekubepeers, wirekubegateways]
+    resources: [wirekubemeshes, wirekubepeers]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [wirekube.io]
-    resources: [wirekubemeshes/status, wirekubepeers/status, wirekubegateways/status]
+    resources: [wirekubemeshes/status, wirekubepeers/status]
     verbs: [get, update, patch]
   - apiGroups: [wirekube.io]
-    resources: [wirekubemeshes/finalizers, wirekubepeers/finalizers, wirekubegateways/finalizers]
+    resources: [wirekubemeshes/finalizers, wirekubepeers/finalizers]
     verbs: [update]
-  # Nodes (read-only for IPAM and eligibility checks)
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
-  # Pods (for gateway status)
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch]
-  # Deployments (for gateway pod management)
-  - apiGroups: [apps]
-    resources: [deployments]
-    verbs: [get, list, watch, create, update, patch, delete]
   # Events
   - apiGroups: [""]
     resources: [events]

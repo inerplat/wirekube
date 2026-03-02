@@ -53,7 +53,7 @@ func TestDiscoverEndpoint_ManualAnnotation(t *testing.T) {
 }
 
 func TestDiscoverEndpoint_ManualOverrides_All(t *testing.T) {
-	// Annotation takes precedence over all other methods (no network calls)
+	// Annotation overrides all other discovery methods (no network calls)
 	node := makeNode(
 		map[string]string{AnnotationEndpoint: "9.9.9.9:12345"},
 		[]corev1.NodeAddress{

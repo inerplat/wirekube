@@ -1,9 +1,5 @@
-IMG_REGISTRY ?= ghcr.io/wirekube
-VERSION ?= latest
-
-OPERATOR_IMG = $(IMG_REGISTRY)/operator:$(VERSION)
-AGENT_IMG    = $(IMG_REGISTRY)/agent:$(VERSION)
-GATEWAY_IMG  = $(IMG_REGISTRY)/gateway:$(VERSION)
+IMG ?= inerplat/wirekube
+VERSION ?= v0.0.1
 
 GO = go
 GOFLAGS =
@@ -11,7 +7,7 @@ GOFLAGS =
 ## ─── Build ───────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build: build-operator build-agent build-wirekubectl build-gateway
+build: build-operator build-agent build-relay build-wirekubectl
 
 build-operator:
 	$(GO) build $(GOFLAGS) -o bin/operator ./cmd/operator
@@ -19,11 +15,11 @@ build-operator:
 build-agent:
 	$(GO) build $(GOFLAGS) -o bin/agent ./cmd/agent
 
+build-relay:
+	$(GO) build $(GOFLAGS) -o bin/relay ./cmd/relay
+
 build-wirekubectl:
 	$(GO) build $(GOFLAGS) -o bin/wirekubectl ./cmd/wirekubectl
-
-build-gateway:
-	$(GO) build $(GOFLAGS) -o bin/gateway ./cmd/gateway
 
 ## ─── Generate ────────────────────────────────────────────────────────────────
 
@@ -39,21 +35,12 @@ manifests:
 ## ─── Docker ──────────────────────────────────────────────────────────────────
 
 .PHONY: docker-build
-docker-build: docker-build-operator docker-build-agent docker-build-gateway
+docker-build:
+	docker build -t $(IMG):$(VERSION) .
 
-docker-build-operator:
-	docker build -f Dockerfile.operator -t $(OPERATOR_IMG) .
-
-docker-build-agent:
-	docker build -f Dockerfile.agent -t $(AGENT_IMG) .
-
-docker-build-gateway:
-	docker build -f Dockerfile.gateway -t $(GATEWAY_IMG) .
-
+.PHONY: docker-push
 docker-push: docker-build
-	docker push $(OPERATOR_IMG)
-	docker push $(AGENT_IMG)
-	docker push $(GATEWAY_IMG)
+	docker push $(IMG):$(VERSION)
 
 ## ─── Deploy ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +60,10 @@ deploy-operator: install-crds install-rbac
 deploy-agent:
 	kubectl apply -f config/agent/
 
+.PHONY: deploy-relay
+deploy-relay:
+	kubectl apply -f config/relay/
+
 .PHONY: deploy
 deploy: deploy-operator deploy-agent
 
@@ -85,29 +76,13 @@ undeploy:
 
 ## ─── Quick start ─────────────────────────────────────────────────────────────
 
-# Label a node as VPN-enabled (replace NODE_NAME)
 .PHONY: label-node
 label-node:
 	kubectl label node $(NODE_NAME) wirekube.io/vpn-enabled=true
 
-# Create default WireKubeMesh
 .PHONY: init-mesh
 init-mesh:
-	kubectl apply -f - <<'EOF'
-	apiVersion: wirekube.io/v1alpha1
-	kind: WireKubeMesh
-	metadata:
-	  name: default
-	spec:
-	  meshCIDR: "10.100.0.0/24"
-	  mode: selective
-	  listenPort: 51820
-	  interfaceName: wg0
-	  mtu: 1420
-	  stunServers:
-	    - stun:stun.l.google.com:19302
-	    - stun:stun1.l.google.com:19302
-	EOF
+	kubectl apply -f config/operator/wirekubemesh-default.yaml
 
 ## ─── Dev ─────────────────────────────────────────────────────────────────────
 
@@ -137,10 +112,11 @@ help:
 	@echo "  build              Build all binaries"
 	@echo "  generate           Regenerate deepcopy functions"
 	@echo "  manifests          Regenerate CRD manifests"
-	@echo "  docker-build       Build Docker images"
-	@echo "  docker-push        Build and push Docker images"
+	@echo "  docker-build       Build Docker image"
+	@echo "  docker-push        Build and push Docker image"
 	@echo "  install-crds       Install CRDs into the cluster"
 	@echo "  deploy             Deploy operator + agent"
+	@echo "  deploy-relay       Deploy relay server"
 	@echo "  undeploy           Remove all WireKube resources"
 	@echo "  label-node         Label a node: NODE_NAME=<name> make label-node"
 	@echo "  init-mesh          Create default WireKubeMesh"
