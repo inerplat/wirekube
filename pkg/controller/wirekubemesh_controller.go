@@ -15,7 +15,7 @@ import (
 const (
 	AnnotationEndpoint   = "wirekube.io/endpoint"
 	DefaultListenPort    = 51820
-	DefaultInterfaceName = "wg0"
+	DefaultInterfaceName = "wire_kube"
 	DefaultMTU           = 1420
 	DefaultKeepalive     = 25
 )

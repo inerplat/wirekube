@@ -1,0 +1,22 @@
+---
+# Example: WireKubeMesh with external relay server.
+# User provides a pre-existing relay endpoint (public IP server, third-party service).
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51820
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
+  relay:
+    mode: auto
+    provider: external
+    external:
+      endpoint: "relay.example.com:3478"
+      transport: tcp
+    handshakeTimeoutSeconds: 30
+    directRetryIntervalSeconds: 120

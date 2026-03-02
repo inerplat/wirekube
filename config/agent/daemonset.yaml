@@ -1,9 +1,46 @@
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wirekube-agent
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wirekube-agent
+rules:
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubepeers"]
+    verbs: ["get", "list", "create", "patch", "update"]
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubepeers/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubemeshes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wirekube-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wirekube-agent
+subjects:
+  - kind: ServiceAccount
+    name: wirekube-agent
+    namespace: kube-system
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: wirekube-agent
-  namespace: wirekube-system
+  namespace: kube-system
   labels:
     app: wirekube-agent
 spec:
@@ -20,52 +57,58 @@ spec:
         app: wirekube-agent
     spec:
       serviceAccountName: wirekube-agent
-      hostNetwork: true            # Required: agent manages host network interfaces
-      dnsPolicy: ClusterFirstWithHostNet
+      hostNetwork: true
+      dnsPolicy: Default
       priorityClassName: system-node-critical
       tolerations:
-        - operator: Exists          # Run on all nodes including control-plane
-      # Only deploy on VPN-enabled nodes
-      nodeSelector:
-        wirekube.io/vpn-enabled: "true"
+        - operator: Exists
       terminationGracePeriodSeconds: 30
       initContainers:
-        # Load WireGuard kernel module if not already loaded
-        - name: load-wireguard-module
-          image: alpine:3.19
-          command: [sh, -c, "modprobe wireguard || echo 'WireGuard module not available, userspace fallback required'"]
+        - name: cleanup
+          image: alpine:3.21
+          command:
+            - /bin/sh
+            - -c
+            - |
+              IFACE="${WIREKUBE_INTERFACE:-wire_kube}"
+              if ip link show "$IFACE" >/dev/null 2>&1; then
+                echo "cleaning up stale $IFACE routes and interface"
+                ip route flush dev "$IFACE" 2>/dev/null
+                ip link delete "$IFACE"
+              fi
+          env:
+            - name: WIREKUBE_INTERFACE
+              value: "wire_kube"
           securityContext:
-            privileged: true
-          volumeMounts:
-            - name: lib-modules
-              mountPath: /lib/modules
-              readOnly: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          resources:
+            limits:
+              cpu: 50m
+              memory: 16Mi
       containers:
         - name: agent
-          image: ghcr.io/wirekube/agent:latest
-          imagePullPolicy: Always
-          command:
-            - /agent
+          image: inerplat/wirekube:v0.0.1
+          command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
-            - --mesh-name=default
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: KUBECONFIG
+              value: ""
+            - name: WIREKUBE_KUBE_APISERVER
+              value: "https://wk-api-lb-129103036-913d8f2961b5.jpn.lb.naverncp.com:6443"
+            - name: WIREKUBE_INTERFACE
+              value: "wire_kube"
           securityContext:
-            privileged: false
             capabilities:
-              add:
-                - NET_ADMIN      # Create and configure network interfaces
-                - SYS_MODULE     # Load kernel modules (wireguard)
+              add: ["NET_ADMIN", "SYS_MODULE"]
           volumeMounts:
             - name: wireguard-keys
               mountPath: /var/lib/wirekube
-            - name: host-proc
-              mountPath: /proc
-              readOnly: true
           resources:
             limits:
               cpu: 200m
@@ -73,21 +116,8 @@ spec:
             requests:
               cpu: 10m
               memory: 32Mi
-          livenessProbe:
-            exec:
-              command: [wg, show]
-            initialDelaySeconds: 30
-            periodSeconds: 30
-            failureThreshold: 3
       volumes:
         - name: wireguard-keys
           hostPath:
             path: /var/lib/wirekube
             type: DirectoryOrCreate
-        - name: lib-modules
-          hostPath:
-            path: /lib/modules
-            type: Directory
-        - name: host-proc
-          hostPath:
-            path: /proc

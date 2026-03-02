@@ -1,13 +1,11 @@
 // operator is the WireKube Kubernetes operator.
-// It manages WireKubeMesh, WireKubePeer, and WireKubeGateway resources.
+// It manages WireKubeMesh and WireKubePeer resources.
 package main
 
 import (
 	"flag"
 	"os"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -28,8 +26,6 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(wirekubev1alpha1.AddToScheme(scheme))
-	utilruntime.Must(appsv1.AddToScheme(scheme))
-	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
 func main() {
@@ -71,14 +67,6 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WireKubePeer")
-		os.Exit(1)
-	}
-
-	if err = (&controller.WireKubeGatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WireKubeGateway")
 		os.Exit(1)
 	}
 
