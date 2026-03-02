@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/rest"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,12 +36,14 @@ func main() {
 	var ifaceName string
 	var listenPort int
 	var mtu int
+	var apiServer string
 
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of this Kubernetes node")
 	flag.StringVar(&meshName, "mesh-name", "default", "Name of the WireKubeMesh resource")
-	flag.StringVar(&ifaceName, "interface", "wg0", "WireGuard interface name")
+	flag.StringVar(&ifaceName, "interface", os.Getenv("WIREKUBE_INTERFACE"), "WireGuard interface name (overrides CR interfaceName)")
 	flag.IntVar(&listenPort, "listen-port", 51820, "WireGuard UDP listen port")
 	flag.IntVar(&mtu, "mtu", 1420, "WireGuard interface MTU")
+	flag.StringVar(&apiServer, "kube-apiserver", os.Getenv("WIREKUBE_KUBE_APISERVER"), "Kubernetes API server URL (overrides in-cluster discovery)")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -54,15 +57,63 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load or generate WireGuard key pair
+	// Priority: --kube-apiserver flag > WireKubeMesh CR apiServerURL > in-cluster default
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error(err, "in-cluster config failed")
+		os.Exit(1)
+	}
+
+	if apiServer != "" {
+		log.Info("API server set via flag/env", "server", apiServer)
+		restConfig.Host = apiServer
+	}
+
+	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		log.Error(err, "creating Kubernetes client")
+		os.Exit(1)
+	}
+
+	// Read WireKubeMesh CR for settings (apiServerURL, interfaceName, listenPort, mtu)
+	meshList := &wirekubev1alpha1.WireKubeMeshList{}
+	if listErr := k8sClient.List(context.Background(), meshList); listErr == nil && len(meshList.Items) > 0 {
+		mesh := &meshList.Items[0]
+
+		if apiServer == "" && mesh.Spec.APIServerURL != "" {
+			log.Info("API server overridden by WireKubeMesh CR", "server", mesh.Spec.APIServerURL)
+			restConfig.Host = mesh.Spec.APIServerURL
+			k8sClient, err = client.New(restConfig, client.Options{Scheme: scheme})
+			if err != nil {
+				log.Error(err, "creating Kubernetes client with CR apiServerURL")
+				os.Exit(1)
+			}
+		}
+
+		if ifaceName == "" && mesh.Spec.InterfaceName != "" {
+			ifaceName = mesh.Spec.InterfaceName
+		}
+		if mesh.Spec.ListenPort > 0 {
+			listenPort = int(mesh.Spec.ListenPort)
+		}
+		if mesh.Spec.MTU > 0 {
+			mtu = int(mesh.Spec.MTU)
+		}
+	}
+	log.Info("API server", "host", restConfig.Host)
+
+	if ifaceName == "" {
+		ifaceName = "wire_kube"
+	}
+
 	kp, err := wireguard.LoadOrGenerate()
 	if err != nil {
 		log.Error(err, "key management failed")
 		os.Exit(1)
 	}
 	log.Info("WireGuard key ready", "publicKey", kp.PublicKeyBase64())
+	log.Info("interface config", "name", ifaceName, "listenPort", listenPort, "mtu", mtu)
 
-	// Create WireGuard manager
 	wgMgr, err := wireguard.NewManager(ifaceName, listenPort, mtu, kp)
 	if err != nil {
 		log.Error(err, "creating WireGuard manager")
@@ -70,14 +121,6 @@ func main() {
 	}
 	defer wgMgr.Close()
 
-	// Create Kubernetes client
-	k8sClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
-	if err != nil {
-		log.Error(err, "creating Kubernetes client")
-		os.Exit(1)
-	}
-
-	// Create and run agent
 	a := agentpkg.NewAgent(k8sClient, wgMgr, nodeName)
 	ctx := ctrl.SetupSignalHandler()
 	log.Info("starting agent", "node", nodeName)

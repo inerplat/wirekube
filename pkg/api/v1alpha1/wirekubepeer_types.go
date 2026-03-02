@@ -54,6 +54,17 @@ type WireKubePeerStatus struct {
 	// +optional
 	EndpointDiscoveryMethod string `json:"endpointDiscoveryMethod,omitempty"`
 
+	// TransportMode indicates the current transport path to this peer.
+	// "direct": WireGuard P2P connection using discovered endpoint.
+	// "relay": traffic routed through a relay server.
+	// +optional
+	TransportMode string `json:"transportMode,omitempty"`
+
+	// RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
+	// Only set when TransportMode is "relay".
+	// +optional
+	RelayLatencyMs int32 `json:"relayLatencyMs,omitempty"`
+
 	// Conditions reflect the current state of the peer.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

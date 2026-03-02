@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
+	relayproto "github.com/wirekube/wirekube/pkg/relay"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 )
 
@@ -27,23 +30,48 @@ type Agent struct {
 	wgMgr     *wireguard.Manager
 	nodeName  string
 	syncEvery time.Duration
+
+	relayClient  *agentrelay.Client
+	relayMode    string
+	relayTimeout time.Duration
+	relayRetry   time.Duration
+	// peerFirstSeen tracks when we first observed a peer without handshake,
+	// used to decide when to trigger relay fallback.
+	peerFirstSeen map[string]time.Time
+	// relayedPeers tracks which peers are currently using relay transport.
+	relayedPeers map[string]bool
+	// directEndpoints stores the original direct endpoint before relay override.
+	directEndpoints map[string]string
+	// directRetryTime tracks the last time we attempted direct connectivity for a relayed peer.
+	directRetryTime map[string]time.Time
+	// directProbing tracks peers currently being probed for direct connectivity.
+	directProbing map[string]bool
 }
 
 // NewAgent creates a new Agent.
 func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName string) *Agent {
 	return &Agent{
-		client:    k8sClient,
-		wgMgr:     wgMgr,
-		nodeName:  nodeName,
-		syncEvery: 30 * time.Second,
+		client:          k8sClient,
+		wgMgr:           wgMgr,
+		nodeName:        nodeName,
+		syncEvery:       30 * time.Second,
+		peerFirstSeen:   make(map[string]time.Time),
+		relayedPeers:    make(map[string]bool),
+		directEndpoints: make(map[string]string),
+		directRetryTime: make(map[string]time.Time),
+		directProbing:   make(map[string]bool),
 	}
 }
 
 // Run starts the agent loop. Blocks until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
+	// Clean up stale interface from previous runs
+	_ = a.wgMgr.DeleteInterface()
+
 	if err := a.setup(ctx); err != nil {
 		return fmt.Errorf("agent setup: %w", err)
 	}
+	defer a.cleanup()
 
 	ticker := time.NewTicker(a.syncEvery)
 	defer ticker.Stop()
@@ -57,6 +85,20 @@ func (a *Agent) Run(ctx context.Context) error {
 				fmt.Printf("sync error: %v\n", err)
 			}
 		}
+	}
+}
+
+// cleanup removes WireGuard routes and interface on shutdown.
+func (a *Agent) cleanup() {
+	fmt.Printf("[cleanup] removing routes and WireGuard interface %s\n", a.wgMgr.InterfaceName())
+	if a.relayClient != nil {
+		a.relayClient.Close()
+	}
+	if err := a.wgMgr.SyncRoutes(nil); err != nil {
+		fmt.Printf("[cleanup] warning: flushing routes: %v\n", err)
+	}
+	if err := a.wgMgr.DeleteInterface(); err != nil {
+		fmt.Printf("[cleanup] warning: deleting interface: %v\n", err)
 	}
 }
 
@@ -76,14 +118,8 @@ func (a *Agent) setup(ctx context.Context) error {
 		return err
 	}
 
-	if err := a.wgMgr.EnsureInterface(); err != nil {
-		return fmt.Errorf("creating WireGuard interface: %w", err)
-	}
-	if err := a.wgMgr.Configure(); err != nil {
-		return fmt.Errorf("configuring WireGuard interface: %w", err)
-	}
-
-	// Discover endpoint from node annotation or STUN
+	// Discover endpoint BEFORE creating WireGuard interface.
+	// STUN needs to bind the listen port, which WireGuard will claim.
 	node := &corev1.Node{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, node); err != nil {
 		return fmt.Errorf("getting node: %w", err)
@@ -93,10 +129,22 @@ func (a *Agent) setup(ctx context.Context) error {
 		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
 	}
 
+	if err := a.wgMgr.EnsureInterface(); err != nil {
+		return fmt.Errorf("creating WireGuard interface: %w", err)
+	}
+	if err := a.wgMgr.Configure(); err != nil {
+		return fmt.Errorf("configuring WireGuard interface: %w", err)
+	}
+
 	// Upsert our WireKubePeer
 	peerName := "node-" + a.nodeName
 	if err := a.upsertOwnPeer(ctx, peerName, kp.PublicKeyBase64(), epResult); err != nil {
 		return fmt.Errorf("upserting own peer: %w", err)
+	}
+
+	// Initialize relay client if configured
+	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64()); err != nil {
+		fmt.Printf("warning: relay init failed (will retry): %v\n", err)
 	}
 
 	// Initial sync
@@ -178,24 +226,34 @@ func (a *Agent) sync(ctx context.Context) error {
 	wgPeers := make([]wireguard.PeerConfig, 0, len(peerList.Items))
 	allRoutes := []string{}
 
-	for _, p := range peerList.Items {
-		// Skip self
+	// Build stats map for relay fallback decisions
+	statsByKey := make(map[string]wireguard.PeerStats)
+	if a.relayClient != nil {
+		if stats, err := a.wgMgr.GetStats(); err == nil {
+			for _, s := range stats {
+				statsByKey[s.PublicKeyB64] = s
+			}
+		}
+	}
+
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
 		if p.Name == myPeerName {
 			continue
 		}
-		// Skip peers not yet initialized (no public key)
 		if p.Spec.PublicKey == "" {
 			continue
 		}
 
+		endpoint := a.resolveEndpointForPeer(p, statsByKey)
+
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
-			Endpoint:         p.Spec.Endpoint,
+			Endpoint:         endpoint,
 			AllowedIPs:       p.Spec.AllowedIPs,
 			KeepaliveSeconds: int(p.Spec.PersistentKeepalive),
 		})
 
-		// Collect routes: AllowedIPs → wg0
 		allRoutes = append(allRoutes, p.Spec.AllowedIPs...)
 	}
 
@@ -213,7 +271,85 @@ func (a *Agent) sync(ctx context.Context) error {
 		fmt.Printf("warning: updating own peer status: %v\n", err)
 	}
 
+	// Update transport mode status on relayed peers
+	a.updateTransportStatus(ctx, peerList)
+
+	// Reflect NAT-mapped endpoints back to CRDs (only for direct peers)
+	a.reflectNATEndpoints(ctx, peerList)
+
 	return nil
+}
+
+// updateTransportStatus patches WireKubePeer status with current transport mode.
+func (a *Agent) updateTransportStatus(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+		if p.Name == "node-"+a.nodeName {
+			continue
+		}
+
+		mode := "direct"
+		if a.relayedPeers[p.Name] {
+			mode = "relay"
+		}
+
+		if p.Status.TransportMode == mode {
+			continue
+		}
+
+		patch := client.MergeFrom(p.DeepCopy())
+		p.Status.TransportMode = mode
+		if err := a.client.Status().Patch(ctx, p, patch); err != nil {
+			fmt.Printf("warning: updating transport status for %s: %v\n", p.Name, err)
+		}
+	}
+}
+
+// reflectNATEndpoints detects when WireGuard has learned a different endpoint
+// for a peer (e.g. due to NAT port mapping) and patches the WireKubePeer CRD
+// so other nodes also learn the correct endpoint.
+// Skips peers using relay transport (their endpoints are local proxy addresses).
+func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
+	stats, err := a.wgMgr.GetStats()
+	if err != nil {
+		return
+	}
+
+	statsByKey := make(map[string]wireguard.PeerStats, len(stats))
+	for _, s := range stats {
+		statsByKey[s.PublicKeyB64] = s
+	}
+
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+
+		// Never reflect relay proxy addresses back to CRD
+		if a.relayedPeers[p.Name] {
+			continue
+		}
+
+		s, ok := statsByKey[p.Spec.PublicKey]
+		if !ok || s.ActualEndpoint == "" {
+			continue
+		}
+		if time.Since(s.LastHandshake) > 3*time.Minute {
+			continue
+		}
+		if s.ActualEndpoint == p.Spec.Endpoint {
+			continue
+		}
+		// Skip if the actual endpoint is a localhost address (relay proxy)
+		if len(s.ActualEndpoint) > 0 && s.ActualEndpoint[:10] == "127.0.0.1:" {
+			continue
+		}
+		fmt.Printf("[nat-reflect] peer %s: CRD=%s actual=%s → patching\n",
+			p.Name, p.Spec.Endpoint, s.ActualEndpoint)
+		patch := client.MergeFrom(p.DeepCopy())
+		p.Spec.Endpoint = s.ActualEndpoint
+		if patchErr := a.client.Patch(ctx, p, patch); patchErr != nil {
+			fmt.Printf("[nat-reflect] warning: patching peer %s: %v\n", p.Name, patchErr)
+		}
+	}
 }
 
 // updateOwnStatus reads WireGuard stats and updates this node's WireKubePeer status.
@@ -251,6 +387,144 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string) error {
 		peer.Status.LastHandshake = &t
 	}
 	return a.client.Status().Patch(ctx, peer, patch)
+}
+
+// initRelay sets up the relay client from the mesh relay configuration.
+func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, myPubKeyB64 string) error {
+	if mesh.Spec.Relay == nil {
+		return nil
+	}
+
+	relay := mesh.Spec.Relay
+	a.relayMode = relay.Mode
+	if a.relayMode == "never" {
+		return nil
+	}
+
+	a.relayTimeout = time.Duration(relay.HandshakeTimeoutSeconds) * time.Second
+	if a.relayTimeout == 0 {
+		a.relayTimeout = 30 * time.Second
+	}
+	a.relayRetry = time.Duration(relay.DirectRetryIntervalSeconds) * time.Second
+	if a.relayRetry == 0 {
+		a.relayRetry = 120 * time.Second
+	}
+
+	var endpoint string
+	switch relay.Provider {
+	case "external":
+		if relay.External == nil || relay.External.Endpoint == "" {
+			return fmt.Errorf("external relay endpoint not configured")
+		}
+		endpoint = relay.External.Endpoint
+	case "managed":
+		endpoint = "wirekube-relay.wirekube-system.svc.cluster.local:3478"
+		if relay.Managed != nil && relay.Managed.Port != 0 {
+			endpoint = fmt.Sprintf("wirekube-relay.wirekube-system.svc.cluster.local:%d", relay.Managed.Port)
+		}
+	default:
+		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
+	}
+
+	var pubKey [relayproto.PubKeySize]byte
+	keyBytes, err := base64.StdEncoding.DecodeString(myPubKeyB64)
+	if err != nil {
+		return fmt.Errorf("decoding own public key: %w", err)
+	}
+	copy(pubKey[:], keyBytes)
+
+	a.relayClient = agentrelay.NewClient(endpoint, pubKey, int(mesh.Spec.ListenPort))
+	if err := a.relayClient.Connect(ctx); err != nil {
+		a.relayClient = nil
+		return fmt.Errorf("connecting to relay: %w", err)
+	}
+
+	fmt.Printf("[relay] connected to %s (mode=%s)\n", endpoint, a.relayMode)
+	return nil
+}
+
+// resolveEndpointForPeer determines the effective WireGuard endpoint for a peer,
+// applying relay fallback if the peer is unreachable directly.
+func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stats map[string]wireguard.PeerStats) string {
+	if a.relayClient == nil || a.relayMode == "never" {
+		return peer.Spec.Endpoint
+	}
+
+	if a.relayMode == "always" {
+		return a.enableRelayForPeer(peer)
+	}
+
+	// auto mode: check handshake freshness
+	s, hasStats := stats[peer.Spec.PublicKey]
+	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < 3*time.Minute
+
+	if hasRecentHandshake {
+		if a.relayedPeers[peer.Name] {
+			// Handshake succeeded through relay. Stay on relay to ensure stability.
+			return a.enableRelayForPeer(peer)
+		}
+		// Not on relay — handshake is genuinely direct.
+		delete(a.peerFirstSeen, peer.Name)
+		return peer.Spec.Endpoint
+	}
+
+	// No recent handshake
+	firstSeen, tracked := a.peerFirstSeen[peer.Name]
+	if !tracked {
+		a.peerFirstSeen[peer.Name] = time.Now()
+		return peer.Spec.Endpoint
+	}
+
+	if time.Since(firstSeen) < a.relayTimeout {
+		return peer.Spec.Endpoint
+	}
+
+	// Timeout exceeded: enable relay
+	return a.enableRelayForPeer(peer)
+}
+
+func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
+	if a.relayClient == nil {
+		return peer.Spec.Endpoint
+	}
+
+	var pubKey [relayproto.PubKeySize]byte
+	keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
+	if err != nil {
+		return peer.Spec.Endpoint
+	}
+	copy(pubKey[:], keyBytes)
+
+	proxy, err := a.relayClient.GetOrCreateProxy(pubKey)
+	if err != nil {
+		fmt.Printf("[relay] failed to create proxy for %s: %v\n", peer.Name, err)
+		return peer.Spec.Endpoint
+	}
+
+	if !a.relayedPeers[peer.Name] {
+		a.directEndpoints[peer.Name] = peer.Spec.Endpoint
+		a.relayedPeers[peer.Name] = true
+		fmt.Printf("[relay] peer %s: falling back to relay via %s\n", peer.Name, proxy.ListenAddr())
+	}
+
+	return proxy.ListenAddr()
+}
+
+func (a *Agent) disableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
+	if a.relayClient == nil {
+		return
+	}
+
+	var pubKey [relayproto.PubKeySize]byte
+	keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
+	if err != nil {
+		return
+	}
+	copy(pubKey[:], keyBytes)
+
+	a.relayClient.RemoveProxy(pubKey)
+	delete(a.relayedPeers, peer.Name)
+	delete(a.directEndpoints, peer.Name)
 }
 
 func (a *Agent) getMesh(ctx context.Context) (*wirekubev1alpha1.WireKubeMesh, error) {

@@ -5,4 +5,7 @@ terraform.tfstate
 terraform.tfstate.backup
 *.tfstate.*.backup
 .terraform/
+site/
 .claude/
+/relay
+internal/
