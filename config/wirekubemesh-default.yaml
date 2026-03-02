@@ -4,7 +4,7 @@ kind: WireKubeMesh
 metadata:
   name: default
 spec:
-  listenPort: 51820
+  listenPort: 51822
   interfaceName: wire_kube
   mtu: 1420
   stunServers:
