@@ -92,6 +92,7 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 	}
 
 	if len(results) == 1 {
+		fmt.Printf("[stun] warning: only 1 STUN server responded — cannot detect Symmetric NAT (need 2+ servers)\n")
 		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATUnknown}, nil
 	}
 

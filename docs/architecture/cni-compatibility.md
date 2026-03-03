@@ -109,13 +109,13 @@ pods, eliminating the issue at the source.
 
 ## fwmark Routing
 
-WireKube uses `fwmark` 0x4000 to prevent WireGuard packet loops:
+WireKube uses `fwmark` 0x574B to prevent WireGuard packet loops:
 
 ```bash
-# WireGuard marks its own UDP packets with fwmark 0x4000
+# WireGuard marks its own UDP packets with fwmark 0x574B
 # This rule ensures marked packets use the main routing table
 # (bypassing the wire_kube interface)
-ip rule add fwmark 0x4000 lookup main priority 100
+ip rule add fwmark 0x574B lookup main priority 100
 ```
 
 Without this, a WireGuard UDP packet destined for a peer's node IP would
