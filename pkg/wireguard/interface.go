@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 	"time"
 
@@ -66,7 +67,14 @@ func (m *Manager) EnsureInterface() error {
 	if err != nil {
 		return err
 	}
-	return netlink.LinkSetUp(l)
+	if err := netlink.LinkSetUp(l); err != nil {
+		return err
+	}
+	// Prevent IPSec/xfrm from intercepting traffic on this interface.
+	// Without this, xfrm policies (e.g. site-to-site VPN) can hijack
+	// packets routed through wire_kube before WireGuard encrypts them.
+	m.disableXfrm()
+	return nil
 }
 
 const (
@@ -74,9 +82,6 @@ const (
 	// 0x574B = "WK" in ASCII. Users may change the listen port freely via WireKubeMesh CR.
 	wkFwMark     = 0x574B
 	wkRouteTable = 0x574B
-	// Legacy values used before the rename (v0.0.3 and earlier).
-	legacyFwMark     = 51820
-	legacyRouteTable = 51820
 )
 
 // Configure sets the WireGuard interface's private key, listen port, and fwmark.
@@ -105,8 +110,6 @@ func (m *Manager) Configure() error {
 //  1. fwmark 0x574B → main table (priority 100): WG socket bypasses tunnel routes
 //  2. all → WireKube table (priority 200): normal traffic uses WG tunnel routes
 func (m *Manager) ensureRoutingRules() error {
-	m.removeLegacyRoutingRules()
-
 	fwRule := netlink.NewRule()
 	fwRule.Mark = wkFwMark
 	fwRule.Table = 254
@@ -126,24 +129,6 @@ func (m *Manager) ensureRoutingRules() error {
 		}
 	}
 	return nil
-}
-
-// removeLegacyRoutingRules cleans up ip rules from previous versions that used
-// the WireGuard listen port (51820) as fwmark and routing table number.
-func (m *Manager) removeLegacyRoutingRules() {
-	if legacyFwMark == wkFwMark {
-		return
-	}
-	legacyFw := netlink.NewRule()
-	legacyFw.Mark = legacyFwMark
-	legacyFw.Table = 254
-	legacyFw.Priority = 100
-	_ = netlink.RuleDel(legacyFw)
-
-	legacyWg := netlink.NewRule()
-	legacyWg.Table = legacyRouteTable
-	legacyWg.Priority = 200
-	_ = netlink.RuleDel(legacyWg)
 }
 
 func (m *Manager) ruleExists(target *netlink.Rule) bool {
@@ -290,6 +275,13 @@ func (m *Manager) DeleteInterface() error {
 	return netlink.LinkDel(link)
 }
 
+func (m *Manager) disableXfrm() {
+	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/disable_xfrm", m.ifaceName)
+	if err := os.WriteFile(path, []byte("1"), 0644); err != nil {
+		fmt.Printf("[wireguard] warning: failed to disable xfrm on %s: %v\n", m.ifaceName, err)
+	}
+}
+
 func (m *Manager) removeRoutingRules() {
 	fwRule := netlink.NewRule()
 	fwRule.Mark = wkFwMark
@@ -301,8 +293,6 @@ func (m *Manager) removeRoutingRules() {
 	wgRule.Table = wkRouteTable
 	wgRule.Priority = 200
 	_ = netlink.RuleDel(wgRule)
-
-	m.removeLegacyRoutingRules()
 }
 
 // AddRoute adds a route for the given CIDR through the WireGuard interface
