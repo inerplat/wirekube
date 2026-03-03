@@ -52,11 +52,12 @@ All major cloud NAT gateways use Symmetric NAT:
 Most home/ISP routers use Cone NAT (STUN-based P2P works).
 
 !!! info "When is relay needed?"
-    Relay is needed when **any** peer in the pair is behind Symmetric NAT.
-    WireKube's Symmetric NAT nodes proactively enable relay for all peers
-    (they don't attempt direct handshake). Only Cone-to-Cone or same-network
-    pairs achieve direct P2P. Since most cloud NAT gateways are Symmetric,
-    cross-cloud and cloud-to-home traffic typically routes through relay.
+    Relay is needed only when **both** peers are behind Symmetric NAT. Cone ↔
+    Symmetric pairs achieve direct P2P: the Symmetric side initiates a
+    handshake to the Cone peer's stable STUN endpoint; the Cone NAT accepts
+    the packet (Endpoint-Independent Filtering), and WireGuard responds to
+    the actual source address. Each node publishes its `natType` in its
+    WireKubePeer status, so peers can determine the optimal transport path.
 
 ## Traversal Strategy
 
@@ -73,9 +74,9 @@ graph TD
     D --> I
     H --> I
     I --> J[Configure WireGuard peers]
-    J --> K{Symmetric NAT?}
-    K -->|Yes| L[Proactively enable relay]
-    K -->|No| M{Handshake within<br/>timeout?}
+    J --> K{Symmetric NAT<br/>and peer also<br/>Symmetric?}
+    K -->|Both Symmetric| L[Relay immediately]
+    K -->|No / Cone peer| M{Handshake within<br/>timeout?}
     M -->|Yes| N[Direct P2P]
     M -->|No| L
     L --> O[Relay mode]
@@ -99,15 +100,21 @@ with the configured WireGuard listen port as its registered endpoint. The port
 won't match the actual NAT mapping, but it provides a valid public IP for peers
 to attempt direct connections (which will fail, triggering relay).
 
-### Stage 2: Direct P2P or Proactive Relay
+### Stage 2: Direct P2P or Relay
 
 After endpoint discovery:
 
 - **Cone NAT / Public IP**: Agent configures WireGuard with the peer's discovered
   endpoint and waits for a handshake.
-- **Symmetric NAT**: Agent proactively activates relay for all peers immediately,
-  without waiting for handshake timeout. This avoids a 30-second delay.
-- **Handshake timeout**: If a Cone NAT peer's handshake doesn't complete within
+- **Symmetric NAT → Cone/Public peer**: Agent tries direct. The Symmetric side
+  initiates a handshake to the Cone peer's stable endpoint. Cone NAT accepts
+  the incoming packet, WireGuard responds to the actual source address, and a
+  bidirectional tunnel is established.
+- **Symmetric NAT → Symmetric NAT peer**: Relay is activated immediately (both
+  sides change ports per destination — direct P2P is impossible without a birthday
+  attack). The peer's `natType` field in its WireKubePeer status is used to make
+  this decision.
+- **Handshake timeout**: If any peer's handshake doesn't complete within
   `handshakeTimeoutSeconds` (default 30s), relay is activated for that peer.
 
 ### Stage 3: Relay Fallback
@@ -134,21 +141,35 @@ peers to check if direct connectivity has become available:
 4. If no handshake → cancel probe, resume relay, wait for next retry interval
 
 !!! note "Skipping futile probes"
-    The agent skips direct probes for peers whose `WireKubePeer.Status.TransportMode`
-    is `relay`. This indicates the peer itself knows it's behind Symmetric NAT —
-    probing would always fail.
+    The agent skips direct probes for peers whose `WireKubePeer.Status.NATType`
+    is `symmetric` when the local node is also Symmetric NAT. This prevents
+    wasting cycles probing paths that cannot succeed (both sides use endpoint-
+    dependent mapping).
 
-## Transport Modes
+## Transport Modes and NAT Type Reporting
 
-Each agent sets its own `transportMode` in its WireKubePeer status:
+Each agent publishes two transport-related fields in its WireKubePeer status:
+
+**`natType`** — The node's detected NAT mapping behavior (`cone`, `symmetric`,
+or empty if detection was inconclusive). Other agents use this to decide whether
+direct P2P is possible.
+
+**`peerTransports`** — A per-peer map recording the transport mode to each
+remote peer (e.g., `{"node-worker1": "direct", "node-worker7": "relay"}`).
+This gives full visibility into which paths use relay.
+
+**`transportMode`** — Aggregate derived from `peerTransports`:
 
 | Mode | Meaning |
 |------|---------|
-| `direct` | All peers are connected via direct P2P |
-| `relay` | Node is behind Symmetric NAT; all traffic routes through relay |
-| `mixed` | Some peers are direct, some are relayed |
+| `direct` | All peers connected via direct P2P |
+| `relay` | All peers via relay |
+| `mixed` | Some peers direct, some relayed |
 
-Each agent only updates its **own** node's transport mode. This prevents
+Both `natType` and `transportMode` appear as kubectl print columns (`NAT`, `Mode`)
+for quick inspection: `kubectl get wirekubepeers`.
+
+Each agent only updates its **own** node's status. This prevents
 conflicting updates from multiple agents and eliminates status flapping.
 
 ## Relay Protocol

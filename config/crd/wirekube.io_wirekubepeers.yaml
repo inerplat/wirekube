@@ -26,6 +26,12 @@ spec:
     - jsonPath: .status.connected
       name: Connected
       type: boolean
+    - jsonPath: .status.natType
+      name: NAT
+      type: string
+    - jsonPath: .status.transportMode
+      name: Mode
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -180,6 +186,13 @@ spec:
                   "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
                   Empty string means NAT type was not determined (e.g., only one STUN server responded).
                 type: string
+              peerTransports:
+                additionalProperties:
+                  type: string
+                description: |-
+                  PeerTransports records per-peer transport mode as seen by this node.
+                  Key is the peer CRD name (e.g. "node-worker7"), value is "direct" or "relay".
+                type: object
               relayLatencyMs:
                 description: |-
                   RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
@@ -188,10 +201,11 @@ spec:
                 type: integer
               transportMode:
                 description: |-
-                  TransportMode indicates the current transport path to this peer.
-                  "direct": WireGuard P2P connection using discovered endpoint.
-                  "relay": traffic routed through a relay server.
-                  "mixed": some peers direct, some relayed.
+                  TransportMode is the aggregate transport state across all peers.
+                  "direct": all peers reachable via P2P.
+                  "relay": all peers via relay.
+                  "mixed": some direct, some relayed.
+                  Derived from PeerTransports; retained for kubectl column convenience.
                 type: string
             type: object
         type: object
