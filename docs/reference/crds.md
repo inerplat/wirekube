@@ -123,17 +123,21 @@ spec:
 | Field | Type | Description |
 |-------|------|-------------|
 | `connected` | bool | Whether a recent WireGuard handshake has been observed |
-| `transportMode` | string | `direct`, `relay`, or `mixed`. Each agent sets only its own node's mode. |
+| `natType` | string | Detected NAT mapping behavior: `cone`, `symmetric`, or empty (undetermined). Published by the agent so other peers can decide transport path. |
+| `transportMode` | string | Aggregate transport state derived from `peerTransports`: `direct`, `relay`, or `mixed`. |
+| `peerTransports` | map[string]string | Per-peer transport mode. Key is peer CRD name (e.g., `node-worker7`), value is `direct` or `relay`. |
 | `endpointDiscoveryMethod` | string | How the endpoint was discovered: `stun`, `annotation`, `ipv6`, `aws-imds`, `upnp`, `internal` |
-| `lastHandshakeTime` | string | Timestamp of the last successful WireGuard handshake |
+| `lastHandshake` | time | Timestamp of the last successful WireGuard handshake |
 
 Transport mode values:
 
 | Value | Meaning |
 |-------|---------|
-| `direct` | All peers are connected via direct P2P |
-| `relay` | Node is behind Symmetric NAT; traffic routes through relay |
-| `mixed` | Some peers are direct, some are relayed |
+| `direct` | All peers connected via direct P2P |
+| `relay` | All peers via relay |
+| `mixed` | Some peers direct, some relayed |
+
+The `natType` and `transportMode` fields are shown as `NAT` and `Mode` columns in `kubectl get wirekubepeers` output.
 
 ### Labels
 
