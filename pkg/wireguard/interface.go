@@ -276,10 +276,27 @@ func (m *Manager) DeleteInterface() error {
 }
 
 func (m *Manager) disableXfrm() {
-	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/disable_xfrm", m.ifaceName)
-	if err := os.WriteFile(path, []byte("1"), 0644); err != nil {
-		fmt.Printf("[wireguard] warning: failed to disable xfrm on %s: %v\n", m.ifaceName, err)
+	// DaemonSet mounts host /proc/sys/net → /host/proc/sys/net.
+	// disable_xfrm: prevents outbound xfrm policy matching on this interface.
+	// disable_policy: prevents inbound xfrm policy matching (replies would be
+	// dropped if an IPSec policy requires ESP for the src/dst CIDR pair).
+	for _, sysctl := range []string{"disable_xfrm", "disable_policy"} {
+		paths := []string{
+			fmt.Sprintf("/host/proc/sys/net/ipv4/conf/%s/%s", m.ifaceName, sysctl),
+			fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/%s", m.ifaceName, sysctl),
+		}
+		set := false
+		for _, path := range paths {
+			if err := os.WriteFile(path, []byte("1"), 0644); err == nil {
+				set = true
+				break
+			}
+		}
+		if !set {
+			fmt.Printf("[wireguard] warning: could not set %s on %s\n", sysctl, m.ifaceName)
+		}
 	}
+	fmt.Printf("[wireguard] xfrm bypass enabled on %s\n", m.ifaceName)
 }
 
 func (m *Manager) removeRoutingRules() {
