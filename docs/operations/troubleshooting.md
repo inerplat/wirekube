@@ -182,14 +182,14 @@ getting encrypted again infinitely.
 **Diagnosis:**
 
 ```bash
-ip rule show | grep 0x4000
-# Should show: 100: from all fwmark 0x4000 lookup main
+ip rule show | grep 0x574B
+# Should show: 100: from all fwmark 0x574B lookup main
 ```
 
 **Fix:**
 
 ```bash
-ip rule add fwmark 0x4000 lookup main priority 100
+ip rule add fwmark 0x574B lookup main priority 100
 ```
 
 The agent should create this rule automatically on startup. If missing,

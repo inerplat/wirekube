@@ -19,7 +19,7 @@ type Manager struct {
 	mtu          int
 	kp           *KeyPair
 	wgClient     *wgctrl.Client
-	preferredSrc net.IP // source IP for routes in table 51820 (avoids public IP being selected)
+	preferredSrc net.IP // source IP for routes in the WireKube routing table
 }
 
 // SetPreferredSrc sets the source IP used when adding routes to the WireGuard routing table.
@@ -70,22 +70,27 @@ func (m *Manager) EnsureInterface() error {
 }
 
 const (
-	wgFwMark    = 51820
-	wgRouteTable = 51820
+	// Fixed identifiers for WireKube routing, independent of the WireGuard listen port.
+	// 0x574B = "WK" in ASCII. Users may change the listen port freely via WireKubeMesh CR.
+	wkFwMark     = 0x574B
+	wkRouteTable = 0x574B
+	// Legacy values used before the rename (v0.0.3 and earlier).
+	legacyFwMark     = 51820
+	legacyRouteTable = 51820
 )
 
 // Configure sets the WireGuard interface's private key, listen port, and fwmark.
 // Routing strategy to prevent loops when AllowedIPs overlap with peer endpoints:
-//   - WireGuard routes go into custom table 51820 (not main).
+//   - WireGuard routes go into a dedicated routing table (not main).
 //   - Fwmarked packets (WireGuard socket) → main table (no WG routes, no loop).
-//   - All other packets → table 51820 (WG routes apply for tunnel traffic).
+//   - All other packets → WireKube table (WG routes apply for tunnel traffic).
 func (m *Manager) Configure() error {
 	privKey, err := decodeKey(m.kp.PrivateKeyBase64())
 	if err != nil {
 		return err
 	}
 	port := m.listenPort
-	fwmark := wgFwMark
+	fwmark := wkFwMark
 	if err := m.wgClient.ConfigureDevice(m.ifaceName, wgtypes.Config{
 		PrivateKey:   &privKey,
 		ListenPort:   &port,
@@ -97,12 +102,13 @@ func (m *Manager) Configure() error {
 }
 
 // ensureRoutingRules sets up two ip rules:
-//  1. fwmark 0xca6c → main table (priority 100): WG socket bypasses tunnel routes
-//  2. all → table 51820 (priority 200): normal traffic uses WG tunnel routes
+//  1. fwmark 0x574B → main table (priority 100): WG socket bypasses tunnel routes
+//  2. all → WireKube table (priority 200): normal traffic uses WG tunnel routes
 func (m *Manager) ensureRoutingRules() error {
-	// Rule 1: fwmarked → main table
+	m.removeLegacyRoutingRules()
+
 	fwRule := netlink.NewRule()
-	fwRule.Mark = wgFwMark
+	fwRule.Mark = wkFwMark
 	fwRule.Table = 254
 	fwRule.Priority = 100
 	if !m.ruleExists(fwRule) {
@@ -111,9 +117,8 @@ func (m *Manager) ensureRoutingRules() error {
 		}
 	}
 
-	// Rule 2: all traffic → custom WG table
 	wgRule := netlink.NewRule()
-	wgRule.Table = wgRouteTable
+	wgRule.Table = wkRouteTable
 	wgRule.Priority = 200
 	if !m.ruleExists(wgRule) {
 		if err := netlink.RuleAdd(wgRule); err != nil {
@@ -121,6 +126,24 @@ func (m *Manager) ensureRoutingRules() error {
 		}
 	}
 	return nil
+}
+
+// removeLegacyRoutingRules cleans up ip rules from previous versions that used
+// the WireGuard listen port (51820) as fwmark and routing table number.
+func (m *Manager) removeLegacyRoutingRules() {
+	if legacyFwMark == wkFwMark {
+		return
+	}
+	legacyFw := netlink.NewRule()
+	legacyFw.Mark = legacyFwMark
+	legacyFw.Table = 254
+	legacyFw.Priority = 100
+	_ = netlink.RuleDel(legacyFw)
+
+	legacyWg := netlink.NewRule()
+	legacyWg.Table = legacyRouteTable
+	legacyWg.Priority = 200
+	_ = netlink.RuleDel(legacyWg)
 }
 
 func (m *Manager) ruleExists(target *netlink.Rule) bool {
@@ -269,20 +292,22 @@ func (m *Manager) DeleteInterface() error {
 
 func (m *Manager) removeRoutingRules() {
 	fwRule := netlink.NewRule()
-	fwRule.Mark = wgFwMark
+	fwRule.Mark = wkFwMark
 	fwRule.Table = 254
 	fwRule.Priority = 100
 	_ = netlink.RuleDel(fwRule)
 
 	wgRule := netlink.NewRule()
-	wgRule.Table = wgRouteTable
+	wgRule.Table = wkRouteTable
 	wgRule.Priority = 200
 	_ = netlink.RuleDel(wgRule)
+
+	m.removeLegacyRoutingRules()
 }
 
 // AddRoute adds a route for the given CIDR through the WireGuard interface
-// in the custom routing table (51820). This keeps WG routes out of the main
-// table so fwmarked WG socket packets bypass them.
+// in the WireKube routing table. This keeps WG routes out of the main table
+// so fwmarked WG socket packets bypass them.
 func (m *Manager) AddRoute(dst string) error {
 	link, err := netlink.LinkByName(m.ifaceName)
 	if err != nil {
@@ -295,7 +320,7 @@ func (m *Manager) AddRoute(dst string) error {
 	route := &netlink.Route{
 		LinkIndex: link.Attrs().Index,
 		Dst:       ipnet,
-		Table:     wgRouteTable,
+		Table:     wkRouteTable,
 		Src:       m.preferredSrc,
 	}
 	if addErr := netlink.RouteAdd(route); addErr != nil {
@@ -326,8 +351,7 @@ func (m *Manager) SyncRoutes(desired []string) error {
 		desiredSet[ipnet.String()] = struct{}{}
 	}
 
-	// Get current routes in the WG custom table
-	routeFilter := &netlink.Route{Table: wgRouteTable, LinkIndex: link.Attrs().Index}
+	routeFilter := &netlink.Route{Table: wkRouteTable, LinkIndex: link.Attrs().Index}
 	current, err := netlink.RouteListFiltered(syscall.AF_INET, routeFilter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
 	if err != nil {
 		return fmt.Errorf("listing routes: %w", err)
@@ -365,7 +389,7 @@ func (m *Manager) DelRoute(dst string) error {
 	route := &netlink.Route{
 		LinkIndex: link.Attrs().Index,
 		Dst:       ipnet,
-		Table:     wgRouteTable,
+		Table:     wkRouteTable,
 	}
 	return netlink.RouteDel(route)
 }
