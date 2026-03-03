@@ -89,8 +89,8 @@ make init-mesh          # Apply default WireKubeMesh CR
 ### Routing Design
 
 - Only `/32` node IPs are added as routes — pod CIDRs are never touched (CNI owns those)
-- fwmark `0x4000` on WireGuard socket packets → main routing table (avoids WG route loop)
-- All other packets → table 51820 (WG routes apply)
+- fwmark `0x574B` on WireGuard socket packets → main routing table (avoids WG route loop)
+- All other packets → table 0x574B / 22347 (WG routes apply)
 - Route metric 200 (above CNI default ~100, so node traffic prefers WG interface)
 
 ### NAT Traversal
