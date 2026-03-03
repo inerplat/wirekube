@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
@@ -14,6 +15,13 @@ import (
 
 // Client manages a TCP connection to the relay server and routes packets
 // between local UDP proxies and remote peers via the relay.
+//
+// Connection lifecycle:
+//   - Connect() dials the relay and starts a background reconnect loop.
+//   - If the TCP connection drops, the client automatically reconnects
+//     with exponential backoff (1s → 30s cap).
+//   - Proxies survive reconnections — they are bound to the Client, not the
+//     TCP connection, and resume forwarding once the new connection is up.
 type Client struct {
 	relayAddr string
 	myPubKey  [relayproto.PubKeySize]byte
@@ -23,55 +31,91 @@ type Client struct {
 	conn    net.Conn
 	writer  *bufio.Writer
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
-	cancel  context.CancelFunc
+
+	connected   atomic.Bool
+	reconnectCh chan struct{} // signalled by readLoop on disconnect
+	cancel      context.CancelFunc
 }
 
 func NewClient(relayAddr string, myPubKey [relayproto.PubKeySize]byte, wgPort int) *Client {
 	return &Client{
-		relayAddr: relayAddr,
-		myPubKey:  myPubKey,
-		wgPort:    wgPort,
-		proxies:   make(map[[relayproto.PubKeySize]byte]*UDPProxy),
+		relayAddr:   relayAddr,
+		myPubKey:    myPubKey,
+		wgPort:      wgPort,
+		proxies:     make(map[[relayproto.PubKeySize]byte]*UDPProxy),
+		reconnectCh: make(chan struct{}, 1),
 	}
 }
 
-// Connect establishes TCP connection to relay and registers.
+// IsConnected returns whether the relay TCP connection is alive.
+func (c *Client) IsConnected() bool {
+	return c.connected.Load()
+}
+
+// Connect establishes a TCP connection to the relay and starts the background
+// reconnect loop. If the initial dial fails the error is returned, but the
+// reconnect loop still runs so the client will eventually come online.
 func (c *Client) Connect(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
 
+	err := c.dial(ctx)
+	if err != nil {
+		// Seed the reconnect loop so it starts retrying immediately.
+		c.signalReconnect()
+	}
+
+	go c.reconnectLoop(ctx)
+
+	return err
+}
+
+// dial performs a single TCP connect + register handshake.
+func (c *Client) dial(ctx context.Context) error {
 	conn, err := net.DialTimeout("tcp", c.relayAddr, 10*time.Second)
 	if err != nil {
-		cancel()
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
 
-	c.mu.Lock()
-	c.conn = conn
-	c.writer = bufio.NewWriterSize(conn, 64*1024)
-	c.mu.Unlock()
-
+	writer := bufio.NewWriterSize(conn, 64*1024)
 	regFrame := relayproto.MakeRegisterFrame(c.myPubKey)
-	if err := relayproto.WriteFrame(c.writer, regFrame); err != nil {
+	if err := relayproto.WriteFrame(writer, regFrame); err != nil {
 		conn.Close()
-		cancel()
 		return fmt.Errorf("sending register: %w", err)
 	}
-	if err := c.writer.Flush(); err != nil {
+	if err := writer.Flush(); err != nil {
 		conn.Close()
-		cancel()
 		return fmt.Errorf("flushing register: %w", err)
 	}
 
+	c.mu.Lock()
+	old := c.conn
+	c.conn = conn
+	c.writer = writer
+	c.mu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+
+	c.connected.Store(true)
+
 	go c.readLoop(ctx)
-	go c.keepaliveLoop(ctx)
+	go c.keepaliveLoop(ctx, conn)
 
 	log.Printf("relay-client: connected to %s", c.relayAddr)
 	return nil
 }
 
 func (c *Client) readLoop(ctx context.Context) {
-	reader := bufio.NewReader(c.conn)
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+
+	reader := bufio.NewReader(conn)
 	for {
 		select {
 		case <-ctx.Done():
@@ -83,6 +127,7 @@ func (c *Client) readLoop(ctx context.Context) {
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Printf("relay-client: read error: %v", err)
+				c.signalReconnect()
 			}
 			return
 		}
@@ -114,7 +159,9 @@ func (c *Client) readLoop(ctx context.Context) {
 	}
 }
 
-func (c *Client) keepaliveLoop(ctx context.Context) {
+// keepaliveLoop is scoped to a single TCP connection. It exits when the
+// connection changes or the context is cancelled.
+func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -122,12 +169,68 @@ func (c *Client) keepaliveLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			c.mu.RLock()
+			sameConn := c.conn == forConn
+			w := c.writer
+			c.mu.RUnlock()
+			if !sameConn || w == nil {
+				return
+			}
 			c.mu.Lock()
 			if c.writer != nil {
 				_ = relayproto.WriteFrame(c.writer, relayproto.MakeKeepaliveFrame())
 				_ = c.writer.Flush()
 			}
 			c.mu.Unlock()
+		}
+	}
+}
+
+func (c *Client) signalReconnect() {
+	c.connected.Store(false)
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.writer = nil
+	}
+	c.mu.Unlock()
+	select {
+	case c.reconnectCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) reconnectLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.reconnectCh:
+		}
+
+		backoff := time.Second
+		const maxBackoff = 30 * time.Second
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			if err := c.dial(ctx); err != nil {
+				log.Printf("relay-client: reconnect failed: %v (retry in %v)", err, backoff)
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			log.Printf("relay-client: reconnected")
+			break
 		}
 	}
 }
