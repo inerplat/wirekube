@@ -312,6 +312,13 @@ func (in *WireKubePeerStatus) DeepCopyInto(out *WireKubePeerStatus) {
 		in, out := &in.LastHandshake, &out.LastHandshake
 		*out = (*in).DeepCopy()
 	}
+	if in.PeerTransports != nil {
+		in, out := &in.PeerTransports, &out.PeerTransports
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

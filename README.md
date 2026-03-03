@@ -2,7 +2,7 @@
 
 Serverless P2P WireGuard mesh VPN for Kubernetes.
 
-Uses Kubernetes CRDs as the coordination plane — no external etcd, relay server, or coordination server is required by default. Nodes discover each other via `WireKubePeer` CRDs and establish direct WireGuard tunnels. When NAT prevents direct P2P (e.g., Symmetric NAT behind cloud gateways), traffic is automatically routed through a TCP relay while preserving WireGuard's end-to-end encryption.
+Uses Kubernetes CRDs as the coordination plane — no external etcd, relay server, or coordination server is required by default. Nodes discover each other via `WireKubePeer` CRDs and establish direct WireGuard tunnels. Direct P2P works between Cone NAT peers and even between Cone and Symmetric NAT peers (the Cone side's stable mapping allows handshake initiation). Only when both peers are behind Symmetric NAT is traffic routed through a TCP relay, preserving WireGuard's end-to-end encryption.
 
 The NAT traversal strategy is inspired by [Tailscale's approach](https://tailscale.com/blog/how-nat-traversal-works): start with a relay path for immediate connectivity, probe for direct paths in parallel, and transparently upgrade when a better path is found.
 
@@ -25,10 +25,9 @@ flowchart LR
     end
     R[wirekube-relay]
     N1 <-->|direct| N2
-    N1 -.->|relay| R
-    R -.->|relay| N3
-    N1 -.->|relay| R
-    R -.->|relay| N4
+    N1 -.->|relay| R -.->|relay| N3
+    N4 <-->|direct P2P| N1
+    N4 <-->|direct P2P| N3
     N4 <-->|direct P2P| N5
 ```
 
@@ -60,13 +59,13 @@ WireKube consists of four components:
 
 **WireKubeMesh** (cluster-scoped, singleton) — Cluster-wide VPN configuration: listen port, interface name, MTU, STUN servers, relay settings.
 
-**WireKubePeer** (cluster-scoped, one per node) — Per-node state: public key, endpoint, allowedIPs. Status reflects connection health, transport mode (`direct`/`relay`/`mixed`), and discovery method.
+**WireKubePeer** (cluster-scoped, one per node) — Per-node state: public key, endpoint, allowedIPs. Status includes `natType` (`cone`/`symmetric`), per-peer `peerTransports` map, aggregate `transportMode` (`direct`/`relay`/`mixed`), and discovery method.
 
 ### NAT Traversal
 
 1. **STUN discovery** — Agent queries two or more STUN servers to discover its public `ip:port`. If the mapped ports differ between servers, the node is classified as Symmetric NAT (RFC 5780).
 
-2. **Direct P2P** — Nodes within the same network or between Cone NAT peers can handshake directly using STUN-discovered endpoints. Since Symmetric NAT nodes proactively enable relay, any peer involving a Symmetric NAT node routes through relay.
+2. **Direct P2P** — Nodes within the same network, between Cone NAT peers, or between Cone and Symmetric NAT peers can handshake directly. A Symmetric NAT node initiates the handshake to the Cone peer's stable STUN endpoint — the Cone NAT accepts the incoming packet, and WireGuard replies to the Symmetric side's actual source address. Only Symmetric ↔ Symmetric pairs require relay (neither side has a predictable port).
 
 3. **Relay fallback** — If no handshake completes within `handshakeTimeoutSeconds` (default 30s), or if Symmetric NAT is detected, traffic routes through the relay. The relay uses a simple binary frame protocol (`[4B length][1B type][body]`) over TCP. WireGuard encryption is preserved end-to-end.
 

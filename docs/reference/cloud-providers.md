@@ -8,7 +8,9 @@ relevant to NAT traversal and relay deployment.
 ## NAT Behavior Summary
 
 All major cloud NAT gateways use Symmetric NAT (Endpoint-Dependent Mapping).
-Cross-VPC direct P2P is impossible; relay is required.
+Cross-VPC Symmetric ↔ Symmetric direct P2P is impossible; relay is required.
+However, Cone ↔ Symmetric pairs can achieve direct P2P — the Symmetric side
+initiates a handshake to the Cone peer's stable STUN-mapped endpoint.
 
 | Provider | NAT Product | NAT Type | Direct P2P (cross-VPC) |
 |----------|------------|----------|------------------------|
@@ -155,6 +157,6 @@ kubectl annotate node <node-name> wirekube.io/endpoint="203.0.113.5:51820"
 | Cross VPC (Symmetric ↔ Symmetric) | Relay | Both behind Symmetric NAT |
 | Cross VPC (one has public IP) | Direct P2P | Public IP reachable |
 | On-premises (Cone) ↔ Cloud (public IP) | Direct P2P | Public IP reachable |
-| On-premises (Cone) ↔ Cloud (Symmetric NAT) | Relay | Symmetric side proactively uses relay |
+| On-premises (Cone) ↔ Cloud (Symmetric NAT) | Direct P2P | Symmetric initiates to Cone's stable endpoint |
 | On-premises (Cone) ↔ On-premises (Cone) | Direct P2P | Both Cone, STUN stable |
 | On-premises ↔ On-premises (same LAN) | Direct | Same network |

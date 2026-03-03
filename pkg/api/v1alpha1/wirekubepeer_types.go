@@ -54,12 +54,18 @@ type WireKubePeerStatus struct {
 	// +optional
 	EndpointDiscoveryMethod string `json:"endpointDiscoveryMethod,omitempty"`
 
-	// TransportMode indicates the current transport path to this peer.
-	// "direct": WireGuard P2P connection using discovered endpoint.
-	// "relay": traffic routed through a relay server.
-	// "mixed": some peers direct, some relayed.
+	// TransportMode is the aggregate transport state across all peers.
+	// "direct": all peers reachable via P2P.
+	// "relay": all peers via relay.
+	// "mixed": some direct, some relayed.
+	// Derived from PeerTransports; retained for kubectl column convenience.
 	// +optional
 	TransportMode string `json:"transportMode,omitempty"`
+
+	// PeerTransports records per-peer transport mode as seen by this node.
+	// Key is the peer CRD name (e.g. "node-worker7"), value is "direct" or "relay".
+	// +optional
+	PeerTransports map[string]string `json:"peerTransports,omitempty"`
 
 	// NATType indicates the NAT mapping behavior detected on this node via STUN.
 	// "cone": Endpoint-Independent Mapping — stable mapped port, direct P2P capable.
@@ -84,6 +90,8 @@ type WireKubePeerStatus struct {
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.spec.endpoint`
 // +kubebuilder:printcolumn:name="AllowedIPs",type=string,JSONPath=`.spec.allowedIPs`
 // +kubebuilder:printcolumn:name="Connected",type=boolean,JSONPath=`.status.connected`
+// +kubebuilder:printcolumn:name="NAT",type=string,JSONPath=`.status.natType`
+// +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.status.transportMode`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // WireKubePeer represents a WireGuard peer in the mesh.

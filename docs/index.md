@@ -2,7 +2,7 @@
 
 **Serverless P2P WireGuard Mesh VPN for Kubernetes**
 
-WireKube creates a WireGuard mesh network between Kubernetes nodes using CRDs as the coordination plane. No central VPN server, no external etcd, no coordination service. Nodes discover each other through `WireKubePeer` CRDs and establish direct WireGuard tunnels, with automatic TCP relay fallback for peers behind Symmetric NAT.
+WireKube creates a WireGuard mesh network between Kubernetes nodes using CRDs as the coordination plane. No central VPN server, no external etcd, no coordination service. Nodes discover each other through `WireKubePeer` CRDs and establish direct WireGuard tunnels. Cone ↔ Symmetric NAT pairs achieve direct P2P (the Cone side's stable mapping enables handshake). Only Symmetric ↔ Symmetric pairs fall back to TCP relay.
 
 The NAT traversal design draws from [Tailscale's architecture](https://tailscale.com/blog/how-nat-traversal-works): relay-first for immediate connectivity, parallel direct path probing, and transparent upgrade when a better path is found.
 
@@ -14,7 +14,7 @@ Kubernetes clusters increasingly span multiple clouds, VPCs, and on-premises net
 
 - **No central VPN server** — Kubernetes API itself is the control plane
 - **Works everywhere** — AWS, GCP, Azure, OCI, bare metal, home labs behind NAT
-- **Handles Symmetric NAT** — RFC 5780 detection + automatic relay fallback with reconnect
+- **Handles Symmetric NAT** — RFC 5780 detection, Cone ↔ Symmetric direct P2P, Symmetric ↔ Symmetric relay with reconnect
 - **Relay resilience** — Auto-reconnect with exponential backoff, multi-instance pool, direct path recovery
 - **IPSec coexistence** — xfrm bypass prevents conflicts with existing site-to-site tunnels
 - **CNI compatible** — Routes only node IPs (`/32`), never touches pod CIDRs
@@ -37,10 +37,9 @@ flowchart LR
     end
     R[relay]
     N1 <-->|direct| N2
-    N1 -.->|relay| R
-    R -.->|relay| N3
-    N1 -.->|relay| R
-    R -.->|relay| N4
+    N1 -.->|relay| R -.->|relay| N3
+    N4 <-->|direct P2P| N1
+    N4 <-->|direct P2P| N3
     N4 <-->|direct P2P| N5
 ```
 

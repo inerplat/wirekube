@@ -38,9 +38,10 @@ type Agent struct {
 	relayTimeout time.Duration
 	relayRetry   time.Duration
 	// isSymmetricNAT is set during endpoint discovery when STUN detects
-	// endpoint-dependent mapping. When true, relay is preferred for all peers
-	// because STUN-discovered endpoints are unusable for direct P2P.
+	// endpoint-dependent mapping. When true, relay is preferred for symmetric peers.
 	isSymmetricNAT bool
+	// detectedNATType stores the exact NAT type detected during STUN discovery.
+	detectedNATType string
 	// peerFirstSeen tracks when we first observed a peer without handshake,
 	// used to decide when to trigger relay fallback.
 	peerFirstSeen map[string]time.Time
@@ -134,9 +135,14 @@ func (a *Agent) setup(ctx context.Context) error {
 	if err != nil {
 		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
 	}
-	if epResult != nil && epResult.NATType == nat.NATSymmetric {
-		a.isSymmetricNAT = true
-		fmt.Printf("[setup] symmetric NAT detected — relay for symmetric peers, direct for cone/public peers\n")
+	if epResult != nil {
+		a.detectedNATType = string(epResult.NATType)
+		if epResult.NATType == nat.NATSymmetric {
+			a.isSymmetricNAT = true
+			fmt.Printf("[setup] symmetric NAT detected — relay for symmetric peers, direct for cone/public peers\n")
+		} else if epResult.NATType == nat.NATCone {
+			fmt.Printf("[setup] cone NAT detected — direct P2P for all peers\n")
+		}
 	}
 
 	if err := a.wgMgr.EnsureInterface(); err != nil {
@@ -222,10 +228,8 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 	}
 	patch := client.MergeFrom(peer.DeepCopy())
 	peer.Status.EndpointDiscoveryMethod = method
-	if a.isSymmetricNAT {
-		peer.Status.NATType = "symmetric"
-	} else if method == string(MethodSTUN) {
-		peer.Status.NATType = "cone"
+	if a.detectedNATType != "" {
+		peer.Status.NATType = a.detectedNATType
 	}
 	return a.client.Status().Patch(ctx, peer, patch)
 }
@@ -252,6 +256,8 @@ func (a *Agent) sync(ctx context.Context) error {
 		}
 	}
 
+	remotePeerNames := []string{}
+
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if p.Name == myPeerName {
@@ -269,6 +275,7 @@ func (a *Agent) sync(ctx context.Context) error {
 		}
 
 		endpoint := a.resolveEndpointForPeer(p, statsByKey)
+		remotePeerNames = append(remotePeerNames, p.Name)
 
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
@@ -300,8 +307,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 
 	// Update own peer status
-	remotePeerCount := len(wgPeers)
-	if err := a.updateOwnStatus(ctx, myPeerName, remotePeerCount); err != nil {
+	if err := a.updateOwnStatus(ctx, myPeerName, remotePeerNames); err != nil {
 		fmt.Printf("warning: updating own peer status: %v\n", err)
 	}
 
@@ -377,7 +383,7 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 }
 
 // updateOwnStatus reads WireGuard stats and updates this node's WireKubePeer status.
-func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeerCount int) error {
+func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeerNames []string) error {
 	peer := &wirekubev1alpha1.WireKubePeer{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: peerName}, peer); err != nil {
 		return err
@@ -410,10 +416,24 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeer
 		t := metav1.NewTime(lastHandshake)
 		peer.Status.LastHandshake = &t
 	}
-	relayedCount := len(a.relayedPeers)
+
+	// Build per-peer transport map
+	peerTransports := make(map[string]string, len(remotePeerNames))
+	relayedCount := 0
+	for _, name := range remotePeerNames {
+		if a.relayedPeers[name] {
+			peerTransports[name] = "relay"
+			relayedCount++
+		} else {
+			peerTransports[name] = "direct"
+		}
+	}
+	peer.Status.PeerTransports = peerTransports
+
+	// Derive aggregate mode from per-peer data
 	if relayedCount == 0 {
 		peer.Status.TransportMode = "direct"
-	} else if remotePeerCount > 0 && relayedCount >= remotePeerCount {
+	} else if len(remotePeerNames) > 0 && relayedCount >= len(remotePeerNames) {
 		peer.Status.TransportMode = "relay"
 	} else {
 		peer.Status.TransportMode = "mixed"
