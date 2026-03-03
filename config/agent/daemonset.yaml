@@ -58,7 +58,7 @@ spec:
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
-      dnsPolicy: Default
+      dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: system-node-critical
       tolerations:
         - operator: Exists
@@ -88,7 +88,7 @@ spec:
               memory: 16Mi
       containers:
         - name: agent
-          image: inerplat/wirekube:v0.0.2
+          image: inerplat/wirekube:latest
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)

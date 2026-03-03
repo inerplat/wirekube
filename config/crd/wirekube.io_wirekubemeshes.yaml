@@ -1,0 +1,303 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: wirekubemeshes.wirekube.io
+spec:
+  group: wirekube.io
+  names:
+    kind: WireKubeMesh
+    listKind: WireKubeMeshList
+    plural: wirekubemeshes
+    shortNames:
+    - wkmesh
+    singular: wirekubemesh
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.listenPort
+      name: Port
+      type: integer
+    - jsonPath: .spec.interfaceName
+      name: Interface
+      type: string
+    - jsonPath: .status.readyPeers
+      name: Ready
+      type: integer
+    - jsonPath: .status.totalPeers
+      name: Total
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          WireKubeMesh defines the cluster-wide WireGuard mesh configuration.
+          Create one instance per cluster. The agent on each node reads this
+          to configure the WireGuard interface parameters.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WireKubeMeshSpec defines the desired state of WireKubeMesh
+            properties:
+              apiServerURL:
+                description: |-
+                  APIServerURL is the URL of the Kubernetes API server (e.g. "https://10.0.0.1:6443").
+                  When set, the agent uses this directly instead of in-cluster discovery.
+                type: string
+              interfaceName:
+                default: wire_kube
+                description: InterfaceName is the name of the WireGuard network interface
+                  on each node.
+                type: string
+              listenPort:
+                default: 51820
+                description: ListenPort is the UDP port WireGuard listens on for incoming
+                  connections.
+                format: int32
+                maximum: 65535
+                minimum: 1024
+                type: integer
+              mtu:
+                default: 1420
+                description: MTU is the MTU for the WireGuard interface.
+                format: int32
+                maximum: 65535
+                minimum: 576
+                type: integer
+              relay:
+                description: |-
+                  Relay configures the relay fallback for peers behind Symmetric NAT.
+                  When direct P2P and STUN fail, traffic is forwarded through a relay server.
+                properties:
+                  directRetryIntervalSeconds:
+                    default: 120
+                    description: |-
+                      DirectRetryIntervalSeconds is how often to re-attempt direct P2P
+                      while using relay, to upgrade back to direct when possible.
+                    format: int32
+                    minimum: 30
+                    type: integer
+                  external:
+                    description: |-
+                      External configures a user-provided relay server.
+                      Required when provider is "external".
+                    properties:
+                      authSecretRef:
+                        description: |-
+                          AuthSecretRef references a Kubernetes Secret containing the relay auth key.
+                          The Secret must have a "token" key.
+                        properties:
+                          name:
+                            description: Name of the Secret.
+                            type: string
+                          namespace:
+                            description: Namespace of the Secret. Defaults to wirekube-system.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      endpoint:
+                        description: |-
+                          Endpoint is the relay server address (host:port).
+                          Example: "relay.example.com:3478" or "203.0.113.10:3478"
+                        type: string
+                      transport:
+                        default: tcp
+                        description: Transport is the protocol used to connect to
+                          the relay.
+                        enum:
+                        - tcp
+                        - ws
+                        type: string
+                    required:
+                    - endpoint
+                    type: object
+                  handshakeTimeoutSeconds:
+                    default: 30
+                    description: |-
+                      HandshakeTimeoutSeconds is how long to wait for a direct WireGuard
+                      handshake before falling back to relay (only used in "auto" mode).
+                    format: int32
+                    maximum: 300
+                    minimum: 5
+                    type: integer
+                  managed:
+                    description: |-
+                      Managed configures the operator-managed relay (Pod + LB).
+                      Required when provider is "managed".
+                    properties:
+                      image:
+                        description: Image overrides the relay container image.
+                        type: string
+                      port:
+                        default: 3478
+                        description: Port is the TCP port the relay listens on.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      replicas:
+                        default: 1
+                        description: Replicas is the number of relay pod replicas.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      resources:
+                        description: Resources sets resource requests/limits for the
+                          relay pod.
+                        properties:
+                          cpuLimit:
+                            description: CPULimit e.g. "500m"
+                            type: string
+                          cpuRequest:
+                            description: CPURequest e.g. "100m"
+                            type: string
+                          memoryLimit:
+                            description: MemoryLimit e.g. "128Mi"
+                            type: string
+                          memoryRequest:
+                            description: MemoryRequest e.g. "64Mi"
+                            type: string
+                        type: object
+                      serviceType:
+                        default: LoadBalancer
+                        description: |-
+                          ServiceType is the Kubernetes Service type for the relay.
+                          "LoadBalancer" creates an external LB (recommended for cloud).
+                          "NodePort" uses a fixed node port (for bare metal or environments without LB).
+                        enum:
+                        - LoadBalancer
+                        - NodePort
+                        type: string
+                    type: object
+                  mode:
+                    default: auto
+                    description: |-
+                      Mode controls when the relay is used.
+                      "auto": try direct P2P first, fall back to relay on handshake timeout.
+                      "always": always route through relay (useful for testing or strict NAT).
+                      "never": disable relay entirely.
+                    enum:
+                    - auto
+                    - always
+                    - never
+                    type: string
+                  provider:
+                    description: |-
+                      Provider selects how the relay server is provisioned.
+                      "external": user provides a pre-existing relay endpoint (public IP server, third-party).
+                      "managed": operator deploys and manages the relay as a Pod + LoadBalancer Service.
+                    enum:
+                    - external
+                    - managed
+                    type: string
+                required:
+                - provider
+                type: object
+              stunServers:
+                description: |-
+                  STUNServers is a list of STUN server addresses used for public endpoint discovery.
+                  At least two servers are recommended for Symmetric NAT detection (RFC 5780).
+                  If omitted, built-in defaults (Google + Cloudflare STUN) are used.
+                items:
+                  type: string
+                minItems: 2
+                type: array
+            type: object
+          status:
+            description: WireKubeMeshStatus defines the observed state of WireKubeMesh
+            properties:
+              conditions:
+                description: Conditions reflect the current state of the WireKubeMesh.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              readyPeers:
+                description: ReadyPeers is the number of peers with an active WireGuard
+                  handshake.
+                format: int32
+                type: integer
+              totalPeers:
+                description: TotalPeers is the total number of WireKubePeer resources
+                  in the cluster.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

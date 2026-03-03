@@ -55,10 +55,16 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	var detectedNATType nat.NATType
 	if stunResult, err := nat.DiscoverPublicEndpointWithNATType(stunCtx, listenPort, stunServers); err == nil {
 		detectedNATType = stunResult.NATType
-		if stunResult.NATType != nat.NATSymmetric {
-			return &EndpointResult{Endpoint: stunResult.Endpoint, Method: MethodSTUN, NATType: stunResult.NATType}, nil
+		if stunResult.NATType == nat.NATSymmetric {
+			// Symmetric NAT: mapped port is unreliable, but the public IP is still valid.
+			// Use STUN-discovered IP with the configured listen port for the CRD endpoint.
+			if host, _, err := net.SplitHostPort(stunResult.Endpoint); err == nil {
+				ep := fmt.Sprintf("%s:%d", host, listenPort)
+				fmt.Printf("[endpoint] symmetric NAT: using STUN public IP with listen port → %s\n", ep)
+				return &EndpointResult{Endpoint: ep, Method: MethodSTUN, NATType: nat.NATSymmetric}, nil
+			}
 		}
-		fmt.Printf("[endpoint] symmetric NAT detected via STUN, skipping STUN endpoint (unusable for P2P)\n")
+		return &EndpointResult{Endpoint: stunResult.Endpoint, Method: MethodSTUN, NATType: stunResult.NATType}, nil
 	}
 
 	// 4. AWS EC2 Instance Metadata Service
