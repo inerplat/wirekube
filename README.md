@@ -1,46 +1,99 @@
 # WireKube
 
-A serverless P2P WireGuard mesh VPN for Kubernetes.
+Serverless P2P WireGuard mesh VPN for Kubernetes.
 
-Kubernetes API (CRDs) acts as the coordination plane — no central VPN server required.
-Works universally across AWS, GCP, NCloud, bare metal, and home labs.
+Uses Kubernetes CRDs as the coordination plane — no external etcd, relay server, or coordination server is required by default. Nodes discover each other via `WireKubePeer` CRDs and establish direct WireGuard tunnels. When NAT prevents direct P2P (e.g., Symmetric NAT behind cloud gateways), traffic is automatically routed through a TCP relay while preserving WireGuard's end-to-end encryption.
+
+The NAT traversal strategy is inspired by [Tailscale's approach](https://tailscale.com/blog/how-nat-traversal-works): start with a relay path for immediate connectivity, probe for direct paths in parallel, and transparently upgrade when a better path is found.
 
 **[Documentation](https://inerplat.github.io/wirekube/)**
 
 ```mermaid
 flowchart LR
-    subgraph VPC1["Private VPC-1"]
-        N1[node-1 NAT]
+    subgraph VPC-A["Cloud VPC A"]
+        N1[node-1]
+        N2[node-2]
     end
-    subgraph VPC2["Private VPC-2"]
-        N2[node-2 NAT]
+    subgraph VPC-B["Cloud VPC B"]
+        N3[node-3]
+        N4[node-4]
     end
-    subgraph Home["Home Lab"]
-        N3[node-3 Cone NAT]
+    subgraph OnPrem["On-Premises"]
+        N5[node-5]
     end
-    N1 <-->|relay| N2
-    N2 <-->|relay| N3
-    N2 <-->|direct P2P| N3
+    subgraph Relay
+        R[wirekube-relay]
+    end
+    N1 <-->|direct P2P| N2
+    N3 <-->|direct P2P| N4
+    N1 <-->|relay| R
+    R <-->|relay| N3
+    N5 <-->|relay| R
 ```
 
 ## Features
 
-- **Serverless** — No VPN server; Kubernetes CRDs handle coordination
-- **Universal NAT Traversal** — STUN discovery + automatic TCP relay fallback for Symmetric NAT
-- **CNI Compatible** — Works alongside Cilium, Calico, AWS VPC CNI without modifications
-- **Multi-Architecture** — amd64 / arm64
-- **Minimal Privileges** — Only `NET_ADMIN` + `SYS_MODULE` capabilities required
+- **Serverless coordination** — No VPN server; Kubernetes CRDs are the only coordination plane
+- **Three-tier NAT traversal** — STUN endpoint discovery → direct P2P → TCP relay fallback
+- **Symmetric NAT detection** — RFC 5780 multi-server STUN probing identifies endpoint-dependent mapping
+- **Relay auto-reconnect** — Exponential backoff reconnection (1s–30s) with proxy persistence across TCP drops
+- **Relay pool scaling** — DNS-based multi-instance discovery; agents register on all replicas for seamless failover
+- **Direct path recovery** — Periodic probing upgrades relayed peers back to direct when NAT conditions change
+- **IPSec coexistence** — `disable_xfrm` + `disable_policy` on the WireGuard interface bypasses existing xfrm policies
+- **CNI compatible** — Routes only node IPs (`/32`, metric 200) through WireGuard; pod CIDRs are never touched
+- **Crash recovery** — initContainer cleans stale routing rules and interfaces from previous runs
+- **Multi-architecture** — `linux/amd64` and `linux/arm64`
+
+## Architecture
+
+WireKube consists of four components:
+
+| Component | Runs as | Purpose |
+|-----------|---------|---------|
+| **Agent** | DaemonSet (`hostNetwork: true`) | Manages WireGuard interface, discovers endpoints, syncs peers, handles relay failover |
+| **Operator** | Deployment | Reconciles `WireKubeMesh` and `WireKubePeer` CRDs, manages defaults |
+| **Relay** | Deployment + Service | Bridges WireGuard UDP over TCP for peers behind Symmetric NAT |
+| **wirekubectl** | CLI | Status inspection and peer management |
+
+### CRDs
+
+**WireKubeMesh** (cluster-scoped, singleton) — Cluster-wide VPN configuration: listen port, interface name, MTU, STUN servers, relay settings.
+
+**WireKubePeer** (cluster-scoped, one per node) — Per-node state: public key, endpoint, allowedIPs. Status reflects connection health, transport mode (`direct`/`relay`/`mixed`), and discovery method.
+
+### NAT Traversal
+
+1. **STUN discovery** — Agent queries two or more STUN servers to discover its public `ip:port`. If the mapped ports differ between servers, the node is classified as Symmetric NAT (RFC 5780).
+
+2. **Direct P2P** — For nodes within the same network or behind Cone NAT, WireGuard handshakes succeed directly using STUN-discovered endpoints. Most cloud VPC NAT gateways are Symmetric NAT, so cross-VPC traffic typically falls through to relay.
+
+3. **Relay fallback** — If no handshake completes within `handshakeTimeoutSeconds` (default 30s), or if Symmetric NAT is detected, traffic routes through the relay. The relay uses a simple binary frame protocol (`[4B length][1B type][body]`) over TCP. WireGuard encryption is preserved end-to-end.
+
+4. **Direct recovery** — Every `directRetryIntervalSeconds` (default 120s), the agent temporarily switches a relayed peer's endpoint to direct and checks for a successful handshake on the next sync. If it works, the relay proxy is removed.
+
+### Routing
+
+- Only `/32` node IPs are added as routes — pod CIDRs (CNI-managed) are never modified
+- fwmark `0x574B` prevents WireGuard's own UDP packets from being re-routed into the tunnel
+- Custom routing table `22347` (`0x574B`) isolates WireGuard routes from the main table
+- Route metric 200 (higher than CNI default ~100) ensures CNI routes take precedence
+- `disable_xfrm=1` and `disable_policy=1` on the WireGuard interface bypass IPSec xfrm policies
 
 ## Quick Start
 
-### 1. Install CRDs and RBAC
+### 1. Install CRDs
 
 ```bash
 kubectl apply -f config/crd/
-kubectl apply -f config/rbac/
 ```
 
 ### 2. Create a WireKubeMesh
+
+```bash
+kubectl apply -f config/wirekubemesh-default.yaml
+```
+
+Or customize:
 
 ```yaml
 apiVersion: wirekube.io/v1alpha1
@@ -56,81 +109,93 @@ spec:
     - stun.l.google.com:19302
   relay:
     mode: auto
-    provider: external
+    provider: managed
     handshakeTimeoutSeconds: 30
-    external:
-      endpoint: "relay.example.com:3478"
-      transport: tcp
+    directRetryIntervalSeconds: 120
+    managed:
+      replicas: 1
+      serviceType: LoadBalancer
+      port: 3478
 ```
 
-```bash
-kubectl apply -f config/operator/wirekubemesh-default.yaml
-```
-
-### 3. Label Nodes
-
-```bash
-kubectl label node <node-name> wirekube.io/vpn-enabled=true
-```
-
-### 4. Deploy Agent DaemonSet
+### 3. Deploy the Agent
 
 ```bash
 kubectl apply -f config/agent/daemonset.yaml
 ```
 
-### 5. Verify
+### 4. (Optional) Deploy the Relay
 
+For managed relay:
 ```bash
-kubectl get wirekubepeers -o wide
+kubectl apply -f config/relay/deployment.yaml
 ```
 
-## How It Works
-
-1. The agent DaemonSet runs on every labeled node with `hostNetwork: true`
-2. Each agent creates a WireGuard interface (`wire_kube`) and generates a key pair
-3. Agents register as WireKubePeer CRDs and watch for peer changes
-4. Endpoint discovery finds the best reachable address (STUN, annotation, etc.)
-5. Direct WireGuard P2P handshake is attempted first
-6. If handshake times out (e.g., Symmetric NAT), traffic routes through a TCP relay
-
-WireKube routes **only node IPs** (/32) through the WireGuard interface (metric 200).
-Pod CIDR routes managed by the CNI are never modified.
-
-## Relay Server
-
-For environments with Symmetric NAT (all major cloud NAT gateways), deploy a relay:
-
+For external relay on a public server:
 ```bash
-# On a server with a public IP (or behind a TCP load balancer)
 wirekube-relay --addr :3478
 ```
 
-The relay bridges WireGuard UDP packets over TCP. It cannot decrypt traffic —
-WireGuard's end-to-end encryption is preserved.
+### 5. Define Peer AllowedIPs
 
-## Node Annotations
+AllowedIPs are intentionally user-managed (site-to-site style). Set them on each WireKubePeer:
 
 ```bash
-# Manual endpoint override (highest priority)
+kubectl patch wirekubepeer <node-name> --type=merge -p '{"spec":{"allowedIPs":["<node-ip>/32"]}}'
+```
+
+### 6. Verify
+
+```bash
+kubectl get wirekubepeers -o wide
+kubectl get wirekubemesh
+```
+
+## Relay Modes
+
+| Mode | Behavior |
+|------|----------|
+| `auto` | Try direct P2P first; fall back to relay after handshake timeout |
+| `always` | Route all traffic through relay |
+| `never` | Disable relay entirely |
+
+| Provider | Description |
+|----------|-------------|
+| `managed` | Operator deploys relay as a Deployment + Service in the cluster |
+| `external` | User provides a pre-existing relay endpoint |
+
+The managed relay auto-discovers its externally-reachable address (ExternalIP → LB Ingress → NodePort) so that NAT'd nodes can connect without relying on CNI tunnel connectivity.
+
+## Configuration Reference
+
+### Node Annotations
+
+```bash
+# Override endpoint discovery (highest priority)
 kubectl annotate node <node> wirekube.io/endpoint="1.2.3.4:51820"
 ```
+
+### Agent Environment
+
+The agent runs as a DaemonSet with `hostNetwork: true` and requires `NET_ADMIN` + `SYS_MODULE` capabilities. The initContainer performs cleanup of stale routes and interfaces from previous runs.
 
 ## Container Image
 
 ```bash
-docker pull inerplat/wirekube:v0.0.1
+docker pull inerplat/wirekube:latest
 ```
 
-Multi-arch: `linux/amd64` and `linux/arm64`.
+Multi-arch: `linux/amd64` and `linux/arm64`. Images are built and pushed automatically on tagged releases.
 
-## Documentation
-
-Full documentation is available at `docs/` (built with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)):
+## Building from Source
 
 ```bash
-pip install mkdocs-material
-mkdocs serve
+make build          # Build all binaries
+make docker-build   # Build multi-arch Docker image
+make docker-push    # Build and push (IMG=inerplat/wirekube VERSION=v0.0.4)
+make test           # Run tests
+make generate       # Regenerate deepcopy (after CRD type changes)
+make manifests      # Regenerate CRD YAML
 ```
 
 ## Uninstall
