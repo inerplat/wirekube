@@ -75,7 +75,7 @@ make init-mesh          # Apply default WireKubeMesh CR
 | `pkg/api/v1alpha1/` | CRD type definitions (`WireKubeMesh`, `WireKubePeer`) |
 | `pkg/agent/` | Agent main logic, endpoint discovery, relay orchestration |
 | `pkg/agent/nat/` | STUN (`stun.go`) and UPnP (`upnp.go`) endpoint discovery |
-| `pkg/agent/relay/` | Relay TCP client (`client.go`) and UDP proxy (`proxy.go`) |
+| `pkg/agent/relay/` | Relay TCP client (`client.go`), UDP proxy (`proxy.go`), multi-instance pool (`pool.go`) |
 | `pkg/relay/` | Relay server and wire protocol |
 | `pkg/wireguard/` | WireGuard kernel interface management and keypair I/O |
 | `pkg/controller/` | Kubernetes controller-runtime reconcilers |
@@ -95,10 +95,13 @@ make init-mesh          # Apply default WireKubeMesh CR
 
 ### NAT Traversal
 
-Three-tier fallback:
+Inspired by [Tailscale's NAT traversal](https://tailscale.com/blog/how-nat-traversal-works):
+
 1. Direct P2P via STUN-discovered public endpoint
 2. TCP relay after 30s handshake timeout (WireGuard encryption preserved end-to-end)
-3. Periodic direct-upgrade retry every 120s (no flip-flopping: stays relayed until retry succeeds)
+3. Periodic direct-upgrade probe every 120s (skips peers that self-report as relay-only/symmetric NAT)
+4. Relay auto-reconnect with exponential backoff (1s–30s)
+5. Relay pool: DNS-based multi-instance discovery, agents register on all replicas
 
 ## Config Layout
 
