@@ -33,7 +33,7 @@ type Agent struct {
 	nodeName  string
 	syncEvery time.Duration
 
-	relayClient  *agentrelay.Client
+	relayPool    *agentrelay.Pool
 	relayMode    string
 	relayTimeout time.Duration
 	relayRetry   time.Duration
@@ -97,8 +97,8 @@ func (a *Agent) Run(ctx context.Context) error {
 // cleanup removes WireGuard routes and interface on shutdown.
 func (a *Agent) cleanup() {
 	fmt.Printf("[cleanup] removing routes and WireGuard interface %s\n", a.wgMgr.InterfaceName())
-	if a.relayClient != nil {
-		a.relayClient.Close()
+	if a.relayPool != nil {
+		a.relayPool.Close()
 	}
 	if err := a.wgMgr.SyncRoutes(nil); err != nil {
 		fmt.Printf("[cleanup] warning: flushing routes: %v\n", err)
@@ -239,7 +239,7 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	// Build stats map for relay fallback decisions
 	statsByKey := make(map[string]wireguard.PeerStats)
-	if a.relayClient != nil {
+	if a.relayPool != nil {
 		if stats, err := a.wgMgr.GetStats(); err == nil {
 			for _, s := range stats {
 				statsByKey[s.PublicKeyB64] = s
@@ -302,38 +302,10 @@ func (a *Agent) sync(ctx context.Context) error {
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
 
-	// Update transport mode status on relayed peers
-	a.updateTransportStatus(ctx, peerList)
-
 	// Reflect NAT-mapped endpoints back to CRDs (only for direct peers)
 	a.reflectNATEndpoints(ctx, peerList)
 
 	return nil
-}
-
-// updateTransportStatus patches WireKubePeer status with current transport mode.
-func (a *Agent) updateTransportStatus(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
-	for i := range peerList.Items {
-		p := &peerList.Items[i]
-		if p.Name == "node-"+a.nodeName {
-			continue
-		}
-
-		mode := "direct"
-		if a.relayedPeers[p.Name] {
-			mode = "relay"
-		}
-
-		if p.Status.TransportMode == mode {
-			continue
-		}
-
-		patch := client.MergeFrom(p.DeepCopy())
-		p.Status.TransportMode = mode
-		if err := a.client.Status().Patch(ctx, p, patch); err != nil {
-			fmt.Printf("warning: updating transport status for %s: %v\n", p.Name, err)
-		}
-	}
 }
 
 // reflectNATEndpoints detects when WireGuard has learned a different endpoint
@@ -434,6 +406,10 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string) error {
 	}
 	if a.isSymmetricNAT {
 		peer.Status.TransportMode = "relay"
+	} else if len(a.relayedPeers) > 0 {
+		peer.Status.TransportMode = "mixed"
+	} else {
+		peer.Status.TransportMode = "direct"
 	}
 	return a.client.Status().Patch(ctx, peer, patch)
 }
@@ -467,9 +443,13 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		}
 		endpoint = relay.External.Endpoint
 	case "managed":
-		endpoint = "wirekube-relay.wirekube-system.svc.cluster.local:3478"
+		port := int32(3478)
 		if relay.Managed != nil && relay.Managed.Port != 0 {
-			endpoint = fmt.Sprintf("wirekube-relay.wirekube-system.svc.cluster.local:%d", relay.Managed.Port)
+			port = relay.Managed.Port
+		}
+		endpoint = a.discoverManagedRelay(ctx, port)
+		if endpoint == "" {
+			endpoint = fmt.Sprintf("wirekube-relay.wirekube-system.svc.cluster.local:%d", port)
 		}
 	default:
 		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
@@ -482,10 +462,8 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	}
 	copy(pubKey[:], keyBytes)
 
-	a.relayClient = agentrelay.NewClient(endpoint, pubKey, int(mesh.Spec.ListenPort))
-	if err := a.relayClient.Connect(ctx); err != nil {
-		// Connect starts the reconnect loop even on initial failure, so keep
-		// the client around — it will come online once the relay is reachable.
+	a.relayPool = agentrelay.NewPool(endpoint, pubKey, int(mesh.Spec.ListenPort))
+	if err := a.relayPool.Connect(ctx); err != nil {
 		fmt.Printf("[relay] initial connect to %s failed (will retry in background): %v\n", endpoint, err)
 		return nil
 	}
@@ -501,7 +479,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 // endpoint temporarily. If the probe succeeds (handshake appears), tryDirectUpgrade
 // finalises the switch. Otherwise the next sync reverts to relay.
 func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stats map[string]wireguard.PeerStats) string {
-	if a.relayClient == nil || a.relayMode == "never" {
+	if a.relayPool == nil || a.relayMode == "never" {
 		return peer.Spec.Endpoint
 	}
 
@@ -509,8 +487,6 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 		return a.enableRelayForPeer(peer)
 	}
 
-	// Symmetric NAT: direct P2P is impossible (STUN port ≠ WG peer port),
-	// so use relay immediately instead of waiting for handshake timeout.
 	if a.isSymmetricNAT {
 		return a.enableRelayForPeer(peer)
 	}
@@ -560,13 +536,19 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 //     - Handshake succeeded on non-proxy endpoint → finalise upgrade.
 //     - No handshake or proxy endpoint → cancel probe, resume relay.
 func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, stats map[string]wireguard.PeerStats) {
-	if a.isSymmetricNAT || a.relayClient == nil {
+	if a.isSymmetricNAT || a.relayPool == nil {
 		return
 	}
 
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if !a.relayedPeers[p.Name] {
+			continue
+		}
+
+		// Don't probe peers that self-report as relay-only (symmetric NAT).
+		// Their agent knows best — probing would always fail and waste cycles.
+		if p.Status.TransportMode == "relay" {
 			continue
 		}
 
@@ -608,14 +590,11 @@ func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, st
 }
 
 func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
-	if a.relayClient == nil {
+	if a.relayPool == nil {
 		return peer.Spec.Endpoint
 	}
 
-	// If the relay TCP connection is currently down, fall back to trying the
-	// direct endpoint. The reconnect loop will restore the connection and the
-	// next sync will switch to relay.
-	if !a.relayClient.IsConnected() {
+	if !a.relayPool.IsConnected() {
 		return peer.Spec.Endpoint
 	}
 
@@ -626,7 +605,7 @@ func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	}
 	copy(pubKey[:], keyBytes)
 
-	proxy, err := a.relayClient.GetOrCreateProxy(pubKey)
+	proxy, err := a.relayPool.GetOrCreateProxy(pubKey)
 	if err != nil {
 		fmt.Printf("[relay] failed to create proxy for %s: %v\n", peer.Name, err)
 		return peer.Spec.Endpoint
@@ -642,7 +621,7 @@ func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 }
 
 func (a *Agent) disableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
-	if a.relayClient == nil {
+	if a.relayPool == nil {
 		return
 	}
 
@@ -653,9 +632,75 @@ func (a *Agent) disableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
 	}
 	copy(pubKey[:], keyBytes)
 
-	a.relayClient.RemoveProxy(pubKey)
+	a.relayPool.RemoveProxy(pubKey)
 	delete(a.relayedPeers, peer.Name)
 	delete(a.directEndpoints, peer.Name)
+}
+
+// discoverManagedRelay queries the wirekube-relay Service to find an externally
+// reachable address. This avoids the chicken-and-egg problem where the ClusterIP
+// is only reachable through the CNI — which might not work yet for NAT'd nodes.
+//
+// Priority: LoadBalancer externalIP → LoadBalancer ingress → NodePort via node public IP → "" (fallback to ClusterIP DNS).
+func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
+	svc := &corev1.Service{}
+	if err := a.client.Get(ctx, client.ObjectKey{
+		Name:      "wirekube-relay",
+		Namespace: "wirekube-system",
+	}, svc); err != nil {
+		return ""
+	}
+
+	// 1. ExternalIPs (manually configured public IPs)
+	for _, ip := range svc.Spec.ExternalIPs {
+		parsed := net.ParseIP(ip)
+		if parsed != nil && !parsed.IsPrivate() {
+			ep := fmt.Sprintf("%s:%d", ip, port)
+			fmt.Printf("[relay] using externalIP: %s\n", ep)
+			return ep
+		}
+	}
+
+	// 2. LoadBalancer Ingress (cloud-assigned external IP/hostname)
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		if ing.IP != "" {
+			ep := fmt.Sprintf("%s:%d", ing.IP, port)
+			fmt.Printf("[relay] using LB ingress IP: %s\n", ep)
+			return ep
+		}
+		if ing.Hostname != "" {
+			ep := fmt.Sprintf("%s:%d", ing.Hostname, port)
+			fmt.Printf("[relay] using LB ingress hostname: %s\n", ep)
+			return ep
+		}
+	}
+
+	// 3. NodePort — find a cluster node with a public IP and use NodePort
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer || svc.Spec.Type == corev1.ServiceTypeNodePort {
+		var nodePort int32
+		for _, p := range svc.Spec.Ports {
+			if p.Port == port && p.NodePort != 0 {
+				nodePort = p.NodePort
+				break
+			}
+		}
+		if nodePort != 0 {
+			nodeList := &corev1.NodeList{}
+			if err := a.client.List(ctx, nodeList); err == nil {
+				for _, n := range nodeList.Items {
+					for _, addr := range n.Status.Addresses {
+						if addr.Type == corev1.NodeExternalIP {
+							ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
+							fmt.Printf("[relay] using NodePort: %s\n", ep)
+							return ep
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 func (a *Agent) getMesh(ctx context.Context) (*wirekubev1alpha1.WireKubeMesh, error) {
