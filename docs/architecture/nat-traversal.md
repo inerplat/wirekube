@@ -1,7 +1,9 @@
 # NAT Traversal
 
-WireKube implements a multi-stage NAT traversal strategy that works across
-all major cloud providers and on-premises environments.
+WireKube implements a multi-stage NAT traversal strategy inspired by
+[Tailscale's approach](https://tailscale.com/blog/how-nat-traversal-works).
+The core idea: establish relay connectivity immediately, probe for direct paths
+in parallel, and transparently upgrade when a better path is found.
 
 ## NAT Types
 
@@ -31,24 +33,30 @@ flowchart TB
     NAT --> B
 ```
 
-In Symmetric NAT, the NAT gateway assigns a **different external port for each destination**.
-STUN discovers `1.2.3.4:50001` when talking to server A, but a peer trying to send to
-`1.2.3.4:50001` gets a different mapping — the packet never arrives.
+In Symmetric NAT, the NAT gateway assigns a **different external port for each
+destination**. STUN discovers `1.2.3.4:50001` when talking to server A, but a
+peer trying to send to `1.2.3.4:50001` gets a different mapping — the packet
+never arrives.
 
 ### Cloud Provider NAT Behavior
 
 All major cloud NAT gateways use Symmetric NAT:
 
-| Provider | NAT Product | NAT Type | Verified |
-|----------|------------|----------|----------|
-| AWS | NAT Gateway | Symmetric | RFC confirmed |
-| GCP | Cloud NAT | Symmetric | RFC confirmed |
-| Azure | Azure NAT Gateway | Symmetric | RFC confirmed |
-| NCloud | NAT Gateway | Symmetric | STUN-tested |
+| Provider | NAT Product | NAT Type |
+|----------|------------|----------|
+| AWS | NAT Gateway | Symmetric |
+| GCP | Cloud NAT | Symmetric |
+| Azure | Azure NAT Gateway | Symmetric |
+| OCI | NAT Gateway | Symmetric |
 
-!!! info "This is a universal problem"
-    WireKube's relay system is not a workaround for a single cloud provider.
-    It is a fundamental requirement for any cross-VPC WireGuard mesh.
+Most home/ISP routers use Cone NAT (STUN-based P2P works).
+
+!!! info "When is relay needed?"
+    Relay is needed when **any** peer in the pair is behind Symmetric NAT.
+    WireKube's Symmetric NAT nodes proactively enable relay for all peers
+    (they don't attempt direct handshake). Only Cone-to-Cone or same-network
+    pairs achieve direct P2P. Since most cloud NAT gateways are Symmetric,
+    cross-cloud and cloud-to-home traffic typically routes through relay.
 
 ## Traversal Strategy
 
@@ -57,22 +65,23 @@ graph TD
     A[Agent starts] --> B[Endpoint Discovery]
     B --> C{Manual annotation?}
     C -->|Yes| D[Use annotated endpoint]
-    C -->|No| E{Public IPv6?}
-    E -->|Yes| F[Use IPv6 address]
-    E -->|No| G[STUN binding request]
-    G --> H{Same mapped addr<br/>from multiple servers?}
-    H -->|Yes: Cone NAT| I[Use STUN endpoint]
-    H -->|No: Symmetric NAT| J[Flag as symmetric]
-    J --> K[Register with Internal IP]
-    I --> L[Register WireKubePeer]
-    D --> L
-    F --> L
-    K --> L
-    L --> M[Configure WireGuard peers]
-    M --> N{Handshake within<br/>timeout?}
-    N -->|Yes| O[Direct P2P ✓]
-    N -->|No| P[Activate relay]
-    P --> Q[Relay mode ✓]
+    C -->|No| E[STUN binding to 2+ servers]
+    E --> F{Same mapped port<br/>from all servers?}
+    F -->|Yes: Cone NAT| G[Use STUN public IP:port]
+    F -->|No: Symmetric NAT| H[Flag isSymmetricNAT=true<br/>Use STUN public IP with listen port]
+    G --> I[Register WireKubePeer]
+    D --> I
+    H --> I
+    I --> J[Configure WireGuard peers]
+    J --> K{Symmetric NAT?}
+    K -->|Yes| L[Proactively enable relay]
+    K -->|No| M{Handshake within<br/>timeout?}
+    M -->|Yes| N[Direct P2P]
+    M -->|No| L
+    L --> O[Relay mode]
+    O --> P[Periodic direct probe]
+    P -->|Success| N
+    P -->|Fail| O
 ```
 
 ### Stage 1: Endpoint Discovery
@@ -80,45 +89,79 @@ graph TD
 The agent runs through the discovery chain on startup:
 
 1. **Manual annotation** (`wirekube.io/endpoint`) — Highest priority, no network calls
-2. **Public IPv6** — Global unicast address from node status
-3. **STUN** — Binding request to configured STUN servers
-4. **AWS IMDSv2** — EC2 metadata service for Elastic IP lookup
-5. **UPnP / NAT-PMP** — Request port mapping from gateway router
-6. **Node InternalIP** — Last resort fallback
+2. **STUN** — Binding request to 2+ configured STUN servers. If mapped ports differ between servers, the node is classified as Symmetric NAT.
+3. **AWS IMDSv2** — EC2 metadata service for Elastic IP lookup
+4. **UPnP / NAT-PMP** — Request port mapping from gateway router
+5. **Node InternalIP** — Last resort fallback
 
-### Stage 2: Direct P2P Attempt
+For Symmetric NAT nodes, the agent uses the STUN-discovered public IP combined
+with the configured WireGuard listen port as its registered endpoint. The port
+won't match the actual NAT mapping, but it provides a valid public IP for peers
+to attempt direct connections (which will fail, triggering relay).
 
-After endpoint discovery, the agent configures WireGuard with the peer's
-discovered endpoint. WireGuard attempts a handshake.
+### Stage 2: Direct P2P or Proactive Relay
+
+After endpoint discovery:
+
+- **Cone NAT / Public IP**: Agent configures WireGuard with the peer's discovered
+  endpoint and waits for a handshake.
+- **Symmetric NAT**: Agent proactively activates relay for all peers immediately,
+  without waiting for handshake timeout. This avoids a 30-second delay.
+- **Handshake timeout**: If a Cone NAT peer's handshake doesn't complete within
+  `handshakeTimeoutSeconds` (default 30s), relay is activated for that peer.
 
 ### Stage 3: Relay Fallback
 
-If the handshake does not complete within `handshakeTimeoutSeconds` (default: 30s),
-the agent activates relay mode for that peer:
+When relay is activated for a peer:
 
-1. Establishes TCP connection to the relay server
-2. Registers its WireGuard public key
-3. Creates a local UDP proxy (`127.0.0.1:random → 127.0.0.1:51820`)
+1. Agent connects to the relay server (or relay pool) via TCP
+2. Registers its WireGuard public key with the relay
+3. Creates a local UDP proxy (`127.0.0.1:random → 127.0.0.1:<wg-port>`)
 4. Sets the peer's WireGuard endpoint to the proxy's local address
 5. All subsequent WireGuard traffic for this peer routes through the relay
 
-!!! warning "Anti-flip-flop"
-    Once a peer enters relay mode, it stays in relay mode. A successful
-    handshake through the relay is not interpreted as proof of direct
-    reachability. This prevents unstable mode switching.
+The relay connection auto-reconnects with exponential backoff (1s–30s) if the
+TCP connection drops. Existing UDP proxies are preserved across reconnections.
+
+### Stage 4: Direct Path Recovery
+
+Every `directRetryIntervalSeconds` (default 120s), the agent probes relayed
+peers to check if direct connectivity has become available:
+
+1. Temporarily set the peer's WireGuard endpoint back to the direct address
+2. Wait for the next sync cycle to check WireGuard stats
+3. If a successful handshake is detected on the non-proxy endpoint → upgrade to direct
+4. If no handshake → cancel probe, resume relay, wait for next retry interval
+
+!!! note "Skipping futile probes"
+    The agent skips direct probes for peers whose `WireKubePeer.Status.TransportMode`
+    is `relay`. This indicates the peer itself knows it's behind Symmetric NAT —
+    probing would always fail.
+
+## Transport Modes
+
+Each agent sets its own `transportMode` in its WireKubePeer status:
+
+| Mode | Meaning |
+|------|---------|
+| `direct` | All peers are connected via direct P2P |
+| `relay` | Node is behind Symmetric NAT; all traffic routes through relay |
+| `mixed` | Some peers are direct, some are relayed |
+
+Each agent only updates its **own** node's transport mode. This prevents
+conflicting updates from multiple agents and eliminates status flapping.
 
 ## Relay Protocol
 
 See [Relay System](relay.md) for the full relay protocol specification.
 
-## Performance Impact
+## Performance
 
 | Scenario | Typical Latency | Notes |
 |----------|----------------|-------|
-| Direct P2P (same region) | 0.5 - 2 ms | WireGuard overhead only |
-| Relay (same region) | 1.5 - 3 ms | Added TCP hop through relay |
-| Relay (cross-region) | 40 - 60 ms | Dominated by geographic distance |
+| Direct P2P (same VPC) | 0.5 – 2 ms | WireGuard overhead only |
+| Relay (same region) | 1.5 – 3 ms | Added TCP hop through relay |
+| Relay (cross-region) | 40 – 60 ms | Dominated by geographic distance |
 
 The relay adds minimal latency within the same region because it only
-introduces one additional TCP hop on localhost (agent ↔ proxy) plus the
-TCP path to the relay server.
+introduces one additional TCP hop (agent ↔ relay ↔ agent).
