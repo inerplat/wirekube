@@ -2,58 +2,77 @@
 
 **Serverless P2P WireGuard Mesh VPN for Kubernetes**
 
-WireKube creates a WireGuard mesh network between Kubernetes nodes using CRDs as the coordination plane. No central VPN server required.
+WireKube creates a WireGuard mesh network between Kubernetes nodes using CRDs as the coordination plane. No central VPN server, no external etcd, no coordination service. Nodes discover each other through `WireKubePeer` CRDs and establish direct WireGuard tunnels, with automatic TCP relay fallback for peers behind Symmetric NAT.
+
+The NAT traversal design draws from [Tailscale's architecture](https://tailscale.com/blog/how-nat-traversal-works): relay-first for immediate connectivity, parallel direct path probing, and transparent upgrade when a better path is found.
 
 ---
 
 ## Why WireKube?
 
-Kubernetes nodes often span multiple VPCs, clouds, or on-premises data centers.
-Traditional approaches require VPC peering, dedicated VPN appliances, or complex
-overlay networks. WireKube takes a different approach:
+Kubernetes clusters increasingly span multiple clouds, VPCs, and on-premises networks. Traditional solutions (VPC peering, dedicated VPN appliances, complex overlays) are expensive, rigid, or vendor-locked. WireKube takes a different approach:
 
 - **No central VPN server** — Kubernetes API itself is the control plane
-- **Works everywhere** — AWS, GCP, Azure, NCloud, bare metal, home labs
-- **Handles Symmetric NAT** — Automatic relay fallback for restrictive NAT environments
-- **CNI compatible** — Works alongside Cilium, Calico, AWS VPC CNI without modifications
-- **Lightweight** — Single Go binary, ~10MB memory per node
+- **Works everywhere** — AWS, GCP, Azure, OCI, bare metal, home labs behind NAT
+- **Handles Symmetric NAT** — RFC 5780 detection + automatic relay fallback with reconnect
+- **Relay resilience** — Auto-reconnect with exponential backoff, multi-instance pool, direct path recovery
+- **IPSec coexistence** — xfrm bypass prevents conflicts with existing site-to-site tunnels
+- **CNI compatible** — Routes only node IPs (`/32`), never touches pod CIDRs
+- **Crash-safe** — initContainer cleanup + routing table isolation survives pod crashes and node reboots
 
 ```mermaid
 flowchart LR
-    subgraph Cloud["Cloud VPC"]
-        N1[node-1 private]
-        N2[node-2 public]
+    subgraph VPC-A["Cloud VPC A"]
+        N1[node-1]
+        N2[node-2]
+    end
+    subgraph VPC-B["Cloud VPC B"]
+        N3[node-3]
+        N4[node-4]
     end
     subgraph OnPrem["On-Premises"]
-        N3[node-3 firewall]
-        N4[node-4 direct]
+        N5[node-5]
     end
-    Cloud <-->|mesh<br/>WireGuard P2P or Relay| OnPrem
+    subgraph Relay
+        R[relay]
+    end
+    N1 <-->|direct P2P| N2
+    N3 <-->|direct P2P| N4
+    N1 <-->|relay| R
+    R <-->|relay| N3
+    N5 <-->|relay| R
 ```
 
 ## Key Features
 
 | Feature | Description |
 |---------|-------------|
-| **Serverless Mesh** | No dedicated VPN server — uses K8s CRDs for coordination |
-| **Universal NAT Traversal** | STUN discovery + TCP relay for Symmetric NAT |
-| **Multi-Cloud** | Works across any Kubernetes cluster, any provider |
-| **CNI Safe** | Routes only node IPs (/32), never touches pod CIDRs |
-| **Multi-Arch** | amd64 and arm64 support |
-| **Minimal Privileges** | Only needs `NET_ADMIN` + `SYS_MODULE` capabilities |
+| **Serverless Mesh** | K8s CRDs for coordination — no VPN server needed |
+| **Three-tier NAT Traversal** | STUN discovery → direct P2P → TCP relay fallback |
+| **Symmetric NAT Detection** | RFC 5780 multi-server STUN identifies endpoint-dependent mapping |
+| **Relay Auto-Reconnect** | Exponential backoff (1s–30s), proxy persistence across reconnections |
+| **Relay Pool Scaling** | DNS-based multi-instance discovery with failover |
+| **Direct Path Recovery** | Periodic probing upgrades relayed peers back to direct |
+| **IPSec Bypass** | `disable_xfrm` + `disable_policy` on WireGuard interface |
+| **Multi-Cloud / Multi-Arch** | Any K8s cluster, `amd64` + `arm64` |
+| **CNI Safe** | Routes only node IPs, pod CIDRs untouched |
 
 ## How It Works
 
-1. **Agent DaemonSet** runs on each labeled node
-2. Agent creates a WireGuard interface (`wire_kube`) and generates a key pair
-3. Agent registers itself as a **WireKubePeer** CRD
-4. Agent watches all WireKubePeer CRDs and configures WireGuard peers
-5. Endpoint discovery determines the best reachable address
-6. If direct P2P fails (Symmetric NAT), traffic routes through a **TCP relay**
+1. The **Agent DaemonSet** runs on each node with `hostNetwork: true`
+2. Each agent creates a WireGuard interface (`wire_kube`) and generates a key pair
+3. STUN discovery finds the node's public endpoint and detects NAT type
+4. The agent registers itself as a **WireKubePeer** CRD with its public key and endpoint
+5. All agents watch all WireKubePeer CRDs and configure WireGuard peers
+6. Direct P2P handshake is attempted first; if it times out, traffic routes through the **TCP relay**
+7. The relay preserves WireGuard end-to-end encryption — it cannot decrypt traffic
+8. Periodically, the agent re-probes direct paths and upgrades back from relay when possible
 
 ## Quick Links
 
 - [Quick Start](getting-started/quickstart.md) — Get a mesh running in 5 minutes
 - [Architecture](architecture/overview.md) — How WireKube works under the hood
+- [NAT Traversal](architecture/nat-traversal.md) — STUN, relay, and direct recovery
+- [Relay Design](architecture/relay.md) — Protocol, failover, and scaling
 - [Troubleshooting](operations/troubleshooting.md) — Common issues and fixes
 - [CRD Reference](reference/crds.md) — Complete CRD specification
