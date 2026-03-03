@@ -109,8 +109,8 @@ spec:
           volumeMounts:
             - name: wireguard-keys
               mountPath: /var/lib/wirekube
-            - name: proc-sys-net
-              mountPath: /proc/sys/net
+            - name: host-proc-sys-net
+              mountPath: /host/proc/sys/net
           resources:
             limits:
               cpu: 200m
@@ -123,7 +123,7 @@ spec:
           hostPath:
             path: /var/lib/wirekube
             type: DirectoryOrCreate
-        - name: proc-sys-net
+        - name: host-proc-sys-net
           hostPath:
             path: /proc/sys/net
             type: Directory
