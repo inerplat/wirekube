@@ -12,6 +12,12 @@ import (
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 )
 
+// Sender can deliver a UDP payload to a remote peer via the relay network.
+// Both Client and Pool implement this interface.
+type Sender interface {
+	SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte) error
+}
+
 // UDPProxy bridges between kernel WireGuard and the relay TCP connection
 // for a single peer. Uses a connected UDP socket (DialUDP) for port
 // consistency. Writing adaptively selects between Go's conn.Write and raw
@@ -19,7 +25,7 @@ import (
 // (cil_sock4_sendmsg) which returns EPERM in some container environments.
 type UDPProxy struct {
 	peerPubKey [relayproto.PubKeySize]byte
-	client     *Client
+	sender     Sender
 	wgPort     int
 
 	conn     *net.UDPConn
@@ -29,7 +35,7 @@ type UDPProxy struct {
 	stopCh   chan struct{}
 }
 
-func NewUDPProxy(peerPubKey [relayproto.PubKeySize]byte, client *Client, wgPort int) (*UDPProxy, error) {
+func NewUDPProxy(peerPubKey [relayproto.PubKeySize]byte, sender Sender, wgPort int) (*UDPProxy, error) {
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: wgPort}
 
@@ -59,7 +65,7 @@ func NewUDPProxy(peerPubKey [relayproto.PubKeySize]byte, client *Client, wgPort 
 
 	return &UDPProxy{
 		peerPubKey: peerPubKey,
-		client:     client,
+		sender:     sender,
 		wgPort:     wgPort,
 		conn:       conn,
 		writeFD:    writeFD,
@@ -94,7 +100,7 @@ func (p *UDPProxy) Run() {
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 
-		if err := p.client.SendToPeer(p.peerPubKey, payload); err != nil {
+		if err := p.sender.SendToPeer(p.peerPubKey, payload); err != nil {
 			log.Printf("relay-proxy: send to relay: %v", err)
 		}
 	}

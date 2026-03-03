@@ -22,6 +22,11 @@ import (
 //     with exponential backoff (1s → 30s cap).
 //   - Proxies survive reconnections — they are bound to the Client, not the
 //     TCP connection, and resume forwarding once the new connection is up.
+// DataHandler is called when a Data frame arrives. If nil, the Client falls
+// back to its own proxy map. Pool sets this to route data through its own
+// proxy map instead.
+type DataHandler func(srcKey [relayproto.PubKeySize]byte, payload []byte)
+
 type Client struct {
 	relayAddr string
 	myPubKey  [relayproto.PubKeySize]byte
@@ -32,6 +37,7 @@ type Client struct {
 	writer  *bufio.Writer
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
+	onData      DataHandler
 	connected   atomic.Bool
 	reconnectCh chan struct{} // signalled by readLoop on disconnect
 	cancel      context.CancelFunc
@@ -137,6 +143,11 @@ func (c *Client) readLoop(ctx context.Context) {
 			srcKey, payload, err := relayproto.ParseDataFrame(frame.Body)
 			if err != nil {
 				log.Printf("relay-client: bad data frame: %v", err)
+				continue
+			}
+
+			if c.onData != nil {
+				c.onData(srcKey, payload)
 				continue
 			}
 
