@@ -36,6 +36,10 @@ type Agent struct {
 	relayMode    string
 	relayTimeout time.Duration
 	relayRetry   time.Duration
+	// isSymmetricNAT is set during endpoint discovery when STUN detects
+	// endpoint-dependent mapping. When true, relay is preferred for all peers
+	// because STUN-discovered endpoints are unusable for direct P2P.
+	isSymmetricNAT bool
 	// peerFirstSeen tracks when we first observed a peer without handshake,
 	// used to decide when to trigger relay fallback.
 	peerFirstSeen map[string]time.Time
@@ -128,6 +132,10 @@ func (a *Agent) setup(ctx context.Context) error {
 	epResult, err := DiscoverEndpoint(ctx, node, int(mesh.Spec.ListenPort), mesh.Spec.STUNServers)
 	if err != nil {
 		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
+	}
+	if epResult != nil && epResult.NATType == "symmetric" {
+		a.isSymmetricNAT = true
+		fmt.Printf("[setup] symmetric NAT detected — will prefer relay for all peers\n")
 	}
 
 	if err := a.wgMgr.EnsureInterface(); err != nil {
@@ -332,7 +340,6 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 
-		// Never reflect relay proxy addresses back to CRD
 		if a.relayedPeers[p.Name] {
 			continue
 		}
@@ -347,10 +354,20 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 		if s.ActualEndpoint == p.Spec.Endpoint {
 			continue
 		}
-		// Skip if the actual endpoint is a localhost address (relay proxy)
-		if len(s.ActualEndpoint) > 0 && s.ActualEndpoint[:10] == "127.0.0.1:" {
+		if len(s.ActualEndpoint) > 10 && s.ActualEndpoint[:10] == "127.0.0.1:" {
 			continue
 		}
+
+		// If only the port differs (same IP), skip the update. With Symmetric NAT,
+		// each observer sees a different mapped port for the same peer. Allowing
+		// port-only updates causes a race where multiple agents patch the CRD with
+		// different ports, resulting in rapid endpoint flapping.
+		crdHost, _, crdErr := net.SplitHostPort(p.Spec.Endpoint)
+		actualHost, _, actualErr := net.SplitHostPort(s.ActualEndpoint)
+		if crdErr == nil && actualErr == nil && crdHost == actualHost {
+			continue
+		}
+
 		fmt.Printf("[nat-reflect] peer %s: CRD=%s actual=%s → patching\n",
 			p.Name, p.Spec.Endpoint, s.ActualEndpoint)
 		patch := client.MergeFrom(p.DeepCopy())
@@ -460,6 +477,12 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 	}
 
 	if a.relayMode == "always" {
+		return a.enableRelayForPeer(peer)
+	}
+
+	// Symmetric NAT: direct P2P is impossible (STUN port ≠ WG peer port),
+	// so use relay immediately instead of waiting for handshake timeout.
+	if a.isSymmetricNAT {
 		return a.enableRelayForPeer(peer)
 	}
 

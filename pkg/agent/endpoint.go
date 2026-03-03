@@ -31,6 +31,7 @@ const (
 type EndpointResult struct {
 	Endpoint string
 	Method   DiscoveryMethod
+	NATType  nat.NATType
 }
 
 // DiscoverEndpoint attempts to find the public WireGuard endpoint for this node.
@@ -46,16 +47,23 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 		return &EndpointResult{Endpoint: ep, Method: MethodIPv6}, nil
 	}
 
-	// 3. STUN-based discovery (works for Full Cone and Address Restricted NAT)
+	// 3. STUN-based discovery with Symmetric NAT detection (RFC 5780).
+	// Queries two STUN servers from the same socket; if mapped ports differ,
+	// the node is behind Symmetric NAT and STUN endpoint is unusable for P2P.
 	stunCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if ep, err := nat.DiscoverPublicEndpoint(stunCtx, listenPort, stunServers); err == nil {
-		return &EndpointResult{Endpoint: ep, Method: MethodSTUN}, nil
+	var detectedNATType nat.NATType
+	if stunResult, err := nat.DiscoverPublicEndpointWithNATType(stunCtx, listenPort, stunServers); err == nil {
+		detectedNATType = stunResult.NATType
+		if stunResult.NATType != nat.NATSymmetric {
+			return &EndpointResult{Endpoint: stunResult.Endpoint, Method: MethodSTUN, NATType: stunResult.NATType}, nil
+		}
+		fmt.Printf("[endpoint] symmetric NAT detected via STUN, skipping STUN endpoint (unusable for P2P)\n")
 	}
 
 	// 4. AWS EC2 Instance Metadata Service
 	if ep := getAWSPublicIP(listenPort); ep != "" {
-		return &EndpointResult{Endpoint: ep, Method: MethodAWSMetadata}, nil
+		return &EndpointResult{Endpoint: ep, Method: MethodAWSMetadata, NATType: detectedNATType}, nil
 	}
 
 	// 5. UPnP / NAT-PMP port forwarding
@@ -63,14 +71,14 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	defer cancel2()
 	if res, err := nat.ForwardPortUPnP(upnpCtx, listenPort); err == nil {
 		ep := fmt.Sprintf("%s:%d", res.ExternalIP, res.ExternalPort)
-		return &EndpointResult{Endpoint: ep, Method: MethodUPnP}, nil
+		return &EndpointResult{Endpoint: ep, Method: MethodUPnP, NATType: detectedNATType}, nil
 	}
 
 	// 6. Fallback: use ExternalIP from Node status
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeExternalIP {
 			ep := fmt.Sprintf("%s:%d", addr.Address, listenPort)
-			return &EndpointResult{Endpoint: ep, Method: MethodInternalIP}, nil
+			return &EndpointResult{Endpoint: ep, Method: MethodInternalIP, NATType: detectedNATType}, nil
 		}
 	}
 
@@ -78,7 +86,7 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP {
 			ep := fmt.Sprintf("%s:%d", addr.Address, listenPort)
-			return &EndpointResult{Endpoint: ep, Method: MethodInternalIP}, nil
+			return &EndpointResult{Endpoint: ep, Method: MethodInternalIP, NATType: detectedNATType}, nil
 		}
 	}
 
