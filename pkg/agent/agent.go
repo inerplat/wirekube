@@ -369,14 +369,20 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 			continue
 		}
 
-		// If only the port differs (same IP), skip the update. With Symmetric NAT,
-		// each observer sees a different mapped port for the same peer. Allowing
-		// port-only updates causes a race where multiple agents patch the CRD with
-		// different ports, resulting in rapid endpoint flapping.
 		crdHost, _, crdErr := net.SplitHostPort(p.Spec.Endpoint)
 		actualHost, _, actualErr := net.SplitHostPort(s.ActualEndpoint)
-		if crdErr == nil && actualErr == nil && crdHost == actualHost {
-			continue
+		if crdErr == nil && actualErr == nil {
+			// Same IP, different port → skip (Symmetric NAT flapping prevention)
+			if crdHost == actualHost {
+				continue
+			}
+			// Never downgrade a public IP to a private IP. The kernel may hold
+			// a stale private endpoint from before the peer switched to relay.
+			actualIP := net.ParseIP(actualHost)
+			crdIP := net.ParseIP(crdHost)
+			if actualIP != nil && crdIP != nil && !crdIP.IsPrivate() && actualIP.IsPrivate() {
+				continue
+			}
 		}
 
 		fmt.Printf("[nat-reflect] peer %s: CRD=%s actual=%s → patching\n",
