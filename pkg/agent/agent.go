@@ -299,6 +299,9 @@ func (a *Agent) sync(ctx context.Context) error {
 		fmt.Printf("warning: updating own peer status: %v\n", err)
 	}
 
+	// Try upgrading relayed peers back to direct when conditions allow.
+	a.tryDirectUpgrade(peerList, statsByKey)
+
 	// Update transport mode status on relayed peers
 	a.updateTransportStatus(ctx, peerList)
 
@@ -481,8 +484,10 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	a.relayClient = agentrelay.NewClient(endpoint, pubKey, int(mesh.Spec.ListenPort))
 	if err := a.relayClient.Connect(ctx); err != nil {
-		a.relayClient = nil
-		return fmt.Errorf("connecting to relay: %w", err)
+		// Connect starts the reconnect loop even on initial failure, so keep
+		// the client around — it will come online once the relay is reachable.
+		fmt.Printf("[relay] initial connect to %s failed (will retry in background): %v\n", endpoint, err)
+		return nil
 	}
 
 	fmt.Printf("[relay] connected to %s (mode=%s)\n", endpoint, a.relayMode)
@@ -491,6 +496,10 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 // resolveEndpointForPeer determines the effective WireGuard endpoint for a peer,
 // applying relay fallback if the peer is unreachable directly.
+//
+// When a relayed peer is being probed for direct upgrade, this returns the direct
+// endpoint temporarily. If the probe succeeds (handshake appears), tryDirectUpgrade
+// finalises the switch. Otherwise the next sync reverts to relay.
 func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stats map[string]wireguard.PeerStats) string {
 	if a.relayClient == nil || a.relayMode == "never" {
 		return peer.Spec.Endpoint
@@ -506,16 +515,22 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 		return a.enableRelayForPeer(peer)
 	}
 
+	// If peer is currently being probed for direct upgrade, hand the direct
+	// endpoint to WireGuard so it can attempt a handshake.
+	if a.directProbing[peer.Name] {
+		if ep := a.directEndpoints[peer.Name]; ep != "" {
+			return ep
+		}
+	}
+
 	// auto mode: check handshake freshness
 	s, hasStats := stats[peer.Spec.PublicKey]
 	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < 3*time.Minute
 
 	if hasRecentHandshake {
 		if a.relayedPeers[peer.Name] {
-			// Handshake succeeded through relay. Stay on relay to ensure stability.
 			return a.enableRelayForPeer(peer)
 		}
-		// Not on relay — handshake is genuinely direct.
 		delete(a.peerFirstSeen, peer.Name)
 		return peer.Spec.Endpoint
 	}
@@ -531,12 +546,76 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 		return peer.Spec.Endpoint
 	}
 
-	// Timeout exceeded: enable relay
 	return a.enableRelayForPeer(peer)
+}
+
+// tryDirectUpgrade periodically probes whether relayed peers can be reached
+// directly again. A successful probe removes the relay proxy and lets WireGuard
+// talk to the peer's real endpoint.
+//
+// Lifecycle per relayed peer:
+//  1. Wait relayRetry since last attempt.
+//  2. Set directProbing[name] = true → next sync sends WG the direct endpoint.
+//  3. On the following sync, check WG stats:
+//     - Handshake succeeded on non-proxy endpoint → finalise upgrade.
+//     - No handshake or proxy endpoint → cancel probe, resume relay.
+func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, stats map[string]wireguard.PeerStats) {
+	if a.isSymmetricNAT || a.relayClient == nil {
+		return
+	}
+
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+		if !a.relayedPeers[p.Name] {
+			continue
+		}
+
+		directEp := a.directEndpoints[p.Name]
+		if directEp == "" {
+			continue
+		}
+
+		if a.directProbing[p.Name] {
+			// Probe was active since last sync. Evaluate result.
+			s, ok := stats[p.Spec.PublicKey]
+			probeOK := ok && !s.LastHandshake.IsZero() &&
+				time.Since(s.LastHandshake) < 3*time.Minute &&
+				s.ActualEndpoint != "" &&
+				(len(s.ActualEndpoint) < 10 || s.ActualEndpoint[:10] != "127.0.0.1:")
+
+			delete(a.directProbing, p.Name)
+
+			if probeOK {
+				a.disableRelayForPeer(p)
+				delete(a.peerFirstSeen, p.Name)
+				fmt.Printf("[relay] peer %s: upgraded to direct (%s)\n", p.Name, directEp)
+			} else {
+				a.directRetryTime[p.Name] = time.Now()
+				fmt.Printf("[relay] peer %s: direct probe failed, staying on relay\n", p.Name)
+			}
+			continue
+		}
+
+		// Decide whether to start a new probe.
+		lastRetry := a.directRetryTime[p.Name]
+		if !lastRetry.IsZero() && time.Since(lastRetry) < a.relayRetry {
+			continue
+		}
+
+		a.directProbing[p.Name] = true
+		fmt.Printf("[relay] peer %s: probing direct endpoint %s\n", p.Name, directEp)
+	}
 }
 
 func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	if a.relayClient == nil {
+		return peer.Spec.Endpoint
+	}
+
+	// If the relay TCP connection is currently down, fall back to trying the
+	// direct endpoint. The reconnect loop will restore the connection and the
+	// next sync will switch to relay.
+	if !a.relayClient.IsConnected() {
 		return peer.Spec.Endpoint
 	}
 
