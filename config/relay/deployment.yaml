@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: relay
-          image: inerplat/wirekube:v0.0.1
+          image: inerplat/wirekube:latest
           command: ["wirekube-relay"]
           args:
             - --addr=:3478
