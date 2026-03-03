@@ -9,24 +9,26 @@
 ## Build Binaries
 
 ```bash
-export PATH="$PATH:/usr/local/go/bin"
-go mod tidy
+make build
+```
 
-# Agent (native)
-go build -o bin/wirekube-agent ./cmd/agent/
+Or build individual components:
 
-# Relay (native)
-go build -o bin/wirekube-relay ./cmd/relay/
+```bash
+make build-agent
+make build-relay
+make build-wirekubectl
 ```
 
 ### Cross-Compilation
 
+The agent uses Linux-specific `netlink` APIs. When building on macOS, always
+cross-compile:
+
 ```bash
-# Linux amd64
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -ldflags="-s -w" -o bin/agent-linux-amd64 ./cmd/agent/
 
-# Linux arm64
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go build -ldflags="-s -w" -o bin/agent-linux-arm64 ./cmd/agent/
 ```
@@ -38,81 +40,88 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 ### Multi-Architecture (Recommended)
 
 ```bash
-podman build --platform linux/amd64,linux/arm64 \
-  --manifest inerplat/wirekube:v0.0.1 .
+make docker-build
+```
 
-podman manifest push inerplat/wirekube:v0.0.1 \
-  docker://docker.io/inerplat/wirekube:v0.0.1
+Or manually:
+
+```bash
+podman build --platform linux/amd64,linux/arm64 \
+  --manifest inerplat/wirekube:latest .
+
+podman manifest push inerplat/wirekube:latest \
+  docker://docker.io/inerplat/wirekube:latest
 ```
 
 ### Single Architecture
 
 ```bash
-docker build -t inerplat/wirekube:v0.0.1 .
-docker push inerplat/wirekube:v0.0.1
+docker build -t inerplat/wirekube:latest .
+docker push inerplat/wirekube:latest
 ```
+
+### CI/CD
+
+Images are built and pushed automatically via GitHub Actions on tag push (`v*`).
+The workflow builds multi-arch images (amd64 + arm64) and pushes both the tagged
+version and `latest`.
 
 ## Dockerfile
 
 The multi-stage Dockerfile:
 
-1. **Builder stage**: Go 1.23 Alpine, builds both agent and relay binaries
+1. **Builder stage**: Go 1.23 Alpine, builds agent, relay, operator, and wirekubectl
 2. **Runtime stage**: Alpine 3.21 with `wireguard-tools`, `iptables`, `iproute2`
-
-```dockerfile
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
-ARG TARGETOS TARGETARCH
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/wirekube-agent ./cmd/agent/
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/wirekube-relay ./cmd/relay/
-
-FROM alpine:3.21
-RUN apk add --no-cache wireguard-tools iptables ip6tables iproute2
-COPY --from=builder /out/wirekube-agent /usr/local/bin/wirekube-agent
-COPY --from=builder /out/wirekube-relay /usr/local/bin/wirekube-relay
-ENTRYPOINT ["wirekube-agent"]
-```
 
 ## Run Tests
 
 ```bash
-# Unit tests
-go test ./...
+make test          # go test ./... -v
+make vet           # go vet ./...
+make fmt           # go fmt ./...
 
-# With verbose output
-go test -v ./...
-
-# Specific package
-go test -v ./pkg/wireguard/
-go test -v ./pkg/agent/
-go test -v ./pkg/relay/
+go test -v ./pkg/agent/...          # specific package
+go test -v -run TestEndpointDiscovery ./pkg/agent/...  # specific test
 ```
+
+## Code Generation
+
+After modifying types in `pkg/api/v1alpha1/` (especially `+kubebuilder:` markers):
+
+```bash
+make generate      # deepcopy functions
+make manifests     # CRD YAML from types
+```
+
+Generated files in `config/crd/` must be committed alongside type changes.
 
 ## Project Structure
 
 ```
 wirekube/
 ├── cmd/
-│   ├── agent/          # Agent entrypoint
-│   └── relay/          # Relay server entrypoint
+│   ├── agent/           # Agent entrypoint
+│   ├── operator/        # Operator entrypoint
+│   ├── relay/           # Relay server entrypoint
+│   └── wirekubectl/     # CLI entrypoint
 ├── pkg/
-│   ├── agent/          # Agent logic (endpoint discovery, peer sync, relay client)
-│   │   └── relay/      # Relay client + UDP proxy
-│   ├── api/v1alpha1/   # CRD types (WireKubeMesh, WireKubePeer)
-│   ├── relay/          # Relay protocol + server
-│   └── wireguard/      # WireGuard interface management
+│   ├── agent/           # Agent logic (endpoint discovery, peer sync)
+│   │   ├── nat/         # STUN and UPnP endpoint discovery
+│   │   └── relay/       # Relay client, UDP proxy, relay pool
+│   │       ├── client.go   # TCP client with auto-reconnect
+│   │       ├── proxy.go    # Per-peer UDP proxy (Sender interface)
+│   │       └── pool.go     # Multi-instance relay pool
+│   ├── api/v1alpha1/    # CRD types (WireKubeMesh, WireKubePeer)
+│   ├── controller/      # Kubernetes controller-runtime reconcilers
+│   ├── relay/           # Relay server and wire protocol
+│   └── wireguard/       # WireGuard interface, routing, xfrm bypass
 ├── config/
-│   ├── agent/          # DaemonSet manifests
-│   ├── crd/            # CustomResourceDefinition YAMLs
-│   ├── operator/       # WireKubeMesh default configuration
-│   ├── rbac/           # ServiceAccount, ClusterRole, ClusterRoleBinding
-│   └── relay/          # Relay deployment manifests
-├── docs/               # Documentation (MkDocs)
+│   ├── agent/           # DaemonSet manifest (includes RBAC)
+│   ├── crd/             # CustomResourceDefinition YAMLs (generated)
+│   ├── relay/           # Relay deployment + service examples
+│   └── wirekubemesh-default.yaml
+├── docs/                # Documentation (MkDocs Material)
+├── .github/workflows/   # CI (tag-triggered build + test)
 ├── Dockerfile
 ├── Makefile
 ├── mkdocs.yml

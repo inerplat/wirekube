@@ -22,25 +22,26 @@ Kubernetes clusters increasingly span multiple clouds, VPCs, and on-premises net
 
 ```mermaid
 flowchart LR
-    subgraph VPC-A["Cloud VPC A"]
+    subgraph VPC-A["Cloud VPC A (Symmetric NAT)"]
         N1[node-1]
         N2[node-2]
     end
-    subgraph VPC-B["Cloud VPC B"]
+    subgraph VPC-B["Cloud VPC B (Symmetric NAT)"]
         N3[node-3]
+    end
+    subgraph Home-A["Home A (Cone NAT)"]
         N4[node-4]
     end
-    subgraph OnPrem["On-Premises"]
+    subgraph Home-B["Home B (Cone NAT)"]
         N5[node-5]
     end
-    subgraph Relay
-        R[relay]
-    end
-    N1 <-->|direct P2P| N2
-    N3 <-->|direct P2P| N4
-    N1 <-->|relay| R
-    R <-->|relay| N3
-    N5 <-->|relay| R
+    R[relay]
+    N1 <-->|direct| N2
+    N1 -.->|relay| R
+    R -.->|relay| N3
+    N1 -.->|relay| R
+    R -.->|relay| N4
+    N4 <-->|direct P2P| N5
 ```
 
 ## Key Features
