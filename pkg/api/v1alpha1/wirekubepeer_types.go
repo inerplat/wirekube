@@ -57,8 +57,16 @@ type WireKubePeerStatus struct {
 	// TransportMode indicates the current transport path to this peer.
 	// "direct": WireGuard P2P connection using discovered endpoint.
 	// "relay": traffic routed through a relay server.
+	// "mixed": some peers direct, some relayed.
 	// +optional
 	TransportMode string `json:"transportMode,omitempty"`
+
+	// NATType indicates the NAT mapping behavior detected on this node via STUN.
+	// "cone": Endpoint-Independent Mapping — stable mapped port, direct P2P capable.
+	// "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
+	// Empty string means NAT type was not determined (e.g., only one STUN server responded).
+	// +optional
+	NATType string `json:"natType,omitempty"`
 
 	// RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
 	// Only set when TransportMode is "relay".
