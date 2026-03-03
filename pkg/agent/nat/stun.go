@@ -16,30 +16,95 @@ var defaultSTUNServers = []string{
 	"stun:stun.cloudflare.com:3478",
 }
 
+// NATType describes the NAT mapping behavior detected via STUN.
+type NATType string
+
+const (
+	NATUnknown   NATType = ""
+	NATCone      NATType = "cone"
+	NATSymmetric NATType = "symmetric"
+)
+
+// STUNResult holds the outcome of a STUN-based endpoint discovery,
+// including NAT type detection.
+type STUNResult struct {
+	Endpoint string
+	NATType  NATType
+}
+
+// ErrSymmetricNAT is returned when Symmetric NAT is detected.
+// The STUN-mapped port differs per destination, making direct P2P impossible.
+var ErrSymmetricNAT = fmt.Errorf("symmetric NAT detected: STUN-mapped port varies per destination")
+
 // DiscoverPublicEndpoint queries STUN servers to discover the public IP:port
-// for the given local UDP port. Returns the endpoint as "ip:port".
+// for the given local UDP port. It queries at least two servers from the same
+// socket and compares mapped ports to detect Symmetric NAT (RFC 5780).
+// Returns ErrSymmetricNAT if endpoint-dependent mapping is detected.
 func DiscoverPublicEndpoint(ctx context.Context, localPort int, stunServers []string) (string, error) {
+	result, err := DiscoverPublicEndpointWithNATType(ctx, localPort, stunServers)
+	if err != nil {
+		return "", err
+	}
+	if result.NATType == NATSymmetric {
+		return "", ErrSymmetricNAT
+	}
+	return result.Endpoint, nil
+}
+
+// DiscoverPublicEndpointWithNATType is like DiscoverPublicEndpoint but returns
+// the full STUNResult including detected NAT type instead of an error for
+// Symmetric NAT. The caller can decide how to handle Symmetric NAT.
+func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunServers []string) (*STUNResult, error) {
 	if len(stunServers) == 0 {
 		stunServers = defaultSTUNServers
 	}
 
-	// Bind a local UDP socket on the given port
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: localPort})
 	if err != nil {
-		return "", fmt.Errorf("binding UDP port %d: %w", localPort, err)
+		return nil, fmt.Errorf("binding UDP port %d: %w", localPort, err)
 	}
 	defer conn.Close()
 
+	// Query multiple STUN servers from the same socket for NAT type detection.
+	type stunResponse struct {
+		endpoint string
+		ip       string
+		port     string
+	}
+	var results []stunResponse
 	var lastErr error
+
 	for _, server := range stunServers {
 		endpoint, err := querySTUN(ctx, conn, server)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return endpoint, nil
+		ip, port, _ := net.SplitHostPort(endpoint)
+		results = append(results, stunResponse{endpoint: endpoint, ip: ip, port: port})
+		if len(results) >= 2 {
+			break
+		}
 	}
-	return "", fmt.Errorf("all STUN servers failed, last error: %w", lastErr)
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("all STUN servers failed, last error: %w", lastErr)
+	}
+
+	if len(results) == 1 {
+		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATUnknown}, nil
+	}
+
+	// Compare mapped ports from two different STUN servers.
+	// Same port → Endpoint-Independent Mapping (Cone NAT) → direct P2P possible.
+	// Different port → Endpoint-Dependent Mapping (Symmetric NAT) → direct P2P impossible.
+	if results[0].port != results[1].port {
+		fmt.Printf("[stun] symmetric NAT detected: %s (server 1) vs %s (server 2)\n",
+			results[0].endpoint, results[1].endpoint)
+		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATSymmetric}, nil
+	}
+
+	return &STUNResult{Endpoint: results[0].endpoint, NATType: NATCone}, nil
 }
 
 func querySTUN(ctx context.Context, conn *net.UDPConn, server string) (string, error) {
