@@ -25,7 +25,7 @@ spec:
     - stun.l.google.com:19302
   relay:
     mode: auto
-    provider: external
+    provider: managed
     handshakeTimeoutSeconds: 30
     directRetryIntervalSeconds: 120
     external:
@@ -34,6 +34,7 @@ spec:
     managed:
       replicas: 1
       serviceType: LoadBalancer
+      port: 3478
 ```
 
 ### Field Descriptions
@@ -44,17 +45,17 @@ spec:
 |-------|------|----------|---------|-------------|
 | `listenPort` | int | No | `51820` | WireGuard UDP listen port on each node |
 | `interfaceName` | string | No | `wire_kube` | Name of the WireGuard network interface |
-| `mtu` | int | No | `1420` | Interface MTU. 1420 accounts for WireGuard overhead |
-| `stunServers` | []string | No | - | STUN servers for public endpoint discovery |
+| `mtu` | int | No | `1420` | Interface MTU. 1420 accounts for WireGuard overhead (40B IPv6 or 20B IPv4 + 8B UDP + 32B WG) |
+| `stunServers` | []string | No | - | STUN servers for public endpoint discovery. **Minimum 2 required** — the agent compares mapped ports across servers to detect Symmetric NAT (RFC 5780). |
 
 #### `spec.relay`
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `mode` | string | No | `auto` | `auto`: try direct first, fallback to relay. `always`: always relay. `never`: direct only |
-| `provider` | string | No | - | `external`: user-provided relay. `managed`: operator-deployed |
-| `handshakeTimeoutSeconds` | int | No | `30` | Seconds to wait for direct handshake before relay |
-| `directRetryIntervalSeconds` | int | No | `120` | Seconds between attempts to re-establish direct P2P from relay |
+| `provider` | string | No | - | `external`: user-provided relay. `managed`: deployed within the cluster |
+| `handshakeTimeoutSeconds` | int | No | `30` | Seconds to wait for direct handshake before activating relay |
+| `directRetryIntervalSeconds` | int | No | `120` | Seconds between attempts to upgrade a relayed peer back to direct P2P |
 
 #### `spec.relay.external`
 
@@ -71,8 +72,12 @@ spec:
 | `serviceType` | string | No | `LoadBalancer` | Kubernetes Service type |
 | `port` | int | No | `3478` | Relay service port |
 
-When `provider: managed`, the agent connects to `wirekube-relay.wirekube-system.svc.cluster.local:<port>`.
-You must deploy the relay Deployment and Service separately (see `config/relay/`).
+When `provider: managed`, the agent discovers the relay's externally reachable
+address by querying the Service (ExternalIP → LB Ingress → NodePort). If no
+external address is found, it falls back to `wirekube-relay.wirekube-system.svc.cluster.local:<port>`.
+
+For multi-instance scaling, use a Headless Service. The relay pool re-resolves
+DNS every 30s to track replica changes.
 
 ---
 
@@ -96,9 +101,9 @@ metadata:
     wirekube.io/node: my-node
 spec:
   publicKey: "base64-encoded-wireguard-public-key"
-  endpoint: "1.2.3.4:51820"
+  endpoint: "203.0.113.5:51820"
   allowedIPs:
-    - "172.20.1.6/32"
+    - "10.0.0.5/32"
   persistentKeepalive: 25
 ```
 
@@ -109,18 +114,26 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `publicKey` | string | Yes | Base64-encoded WireGuard public key |
-| `endpoint` | string | No | Public endpoint (`ip:port`) discovered by the agent |
-| `allowedIPs` | []string | No | WireGuard AllowedIPs (typically `[nodeIP/32]`) |
+| `endpoint` | string | No | Public endpoint (`ip:port`) discovered by the agent. For Symmetric NAT nodes, this is the STUN-discovered public IP with the configured listen port. |
+| `allowedIPs` | []string | No | WireGuard AllowedIPs (typically `[nodeIP/32]`). When empty, the agent enters passive mode — no routes or WireGuard peer config for this node. User-managed. |
 | `persistentKeepalive` | int | No | WireGuard PersistentKeepalive interval (seconds) |
 
 #### `status`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `connected` | bool | Whether the WireGuard handshake has completed |
-| `transportMode` | string | `direct` or `relay` |
-| `endpointDiscoveryMethod` | string | How the endpoint was discovered (`stun`, `annotation`, `ipv6`, `aws-imds`, `upnp`, `internal`) |
-| `lastHandshakeTime` | string | Timestamp of the last successful handshake |
+| `connected` | bool | Whether a recent WireGuard handshake has been observed |
+| `transportMode` | string | `direct`, `relay`, or `mixed`. Each agent sets only its own node's mode. |
+| `endpointDiscoveryMethod` | string | How the endpoint was discovered: `stun`, `annotation`, `ipv6`, `aws-imds`, `upnp`, `internal` |
+| `lastHandshakeTime` | string | Timestamp of the last successful WireGuard handshake |
+
+Transport mode values:
+
+| Value | Meaning |
+|-------|---------|
+| `direct` | All peers are connected via direct P2P |
+| `relay` | Node is behind Symmetric NAT; traffic routes through relay |
+| `mixed` | Some peers are direct, some are relayed |
 
 ### Labels
 

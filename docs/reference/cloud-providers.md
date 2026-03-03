@@ -1,7 +1,25 @@
 # Cloud Provider Notes
 
 WireKube is cloud-agnostic. This page documents provider-specific behaviors
-and configurations discovered during testing.
+relevant to NAT traversal and relay deployment.
+
+---
+
+## NAT Behavior Summary
+
+All major cloud NAT gateways use Symmetric NAT (Endpoint-Dependent Mapping).
+Cross-VPC direct P2P is impossible; relay is required.
+
+| Provider | NAT Product | NAT Type | Direct P2P (cross-VPC) |
+|----------|------------|----------|------------------------|
+| AWS | NAT Gateway | Symmetric | No — relay required |
+| GCP | Cloud NAT | Symmetric | No — relay required |
+| Azure | Azure NAT Gateway | Symmetric | No — relay required |
+| OCI | NAT Gateway | Symmetric | No — relay required |
+| Home/ISP Router | Varies | Usually Cone | Yes — STUN works |
+
+Nodes with public IPs (Elastic IP, External IP, etc.) behave like 1:1 NAT and
+support direct P2P regardless of the cloud provider.
 
 ---
 
@@ -9,8 +27,8 @@ and configurations discovered during testing.
 
 ### NAT Gateway
 
-- **NAT Type:** Symmetric (Endpoint-Dependent Mapping)
-- **Impact:** Direct P2P impossible between nodes behind NAT Gateway
+- **NAT Type:** Symmetric (per-destination port allocation)
+- **Impact:** Direct P2P fails between nodes behind NAT Gateway
 - **Solution:** Relay fallback
 
 ### Elastic IP
@@ -23,18 +41,16 @@ http://169.254.169.254/latest/meta-data/public-ipv4
 
 ### Security Groups
 
-Required rules:
-
 | Direction | Protocol | Port | Source | Purpose |
 |-----------|----------|------|--------|---------|
 | Inbound | UDP | 51820 | Mesh peers | WireGuard (direct P2P) |
-| Inbound | TCP | 3478 | Mesh peers | Relay (if relay on this node) |
+| Inbound | TCP | 3478 | Mesh peers | Relay (if hosted here) |
 | Outbound | UDP | 51820 | 0.0.0.0/0 | WireGuard |
 | Outbound | TCP | 3478 | Relay IP | Relay connection |
 
 ### Network Load Balancer
 
-- **UDP NLB:** Supported — can expose WireGuard directly
+- **UDP NLB:** Supported — can expose WireGuard or relay directly
 - **TCP NLB:** Supported — for relay server
 
 ---
@@ -43,9 +59,8 @@ Required rules:
 
 ### Cloud NAT
 
-- **NAT Type:** Symmetric
-- **Impact:** Same as AWS NAT Gateway
-- **Solution:** Relay fallback
+- **NAT Type:** Symmetric (per unique destination 3-tuple)
+- **Solution:** Relay fallback for cross-VPC
 
 ### External IP
 
@@ -67,54 +82,11 @@ gcloud compute firewall-rules create wirekube-relay \
 
 ---
 
-## NCloud (Naver Cloud)
-
-### NAT Gateway
-
-- **NAT Type:** Symmetric (verified via STUN testing)
-- **Impact:** Direct P2P impossible between private subnet nodes
-
-### Load Balancer Limitations
-
-!!! warning "UDP Load Balancer"
-    **NCloud JPN region does not support UDP Load Balancers.**
-    API returns error code `1200053: The protocol type is invalid.`
-    
-    TCP NLB works correctly for the relay server.
-
-### Public IP
-
-- Public IPs can only be assigned to servers in **public subnets**
-- Private subnet servers cannot have public IPs
-- Use TCP NLB for relay access
-
-### Access Control Group (ACG)
-
-Required rules:
-
-| Direction | Protocol | Port | Source | Purpose |
-|-----------|----------|------|--------|---------|
-| Inbound | UDP | 51820 | Mesh peers | WireGuard |
-| Inbound | TCP | 3478 | 0.0.0.0/0 | Relay |
-| Inbound | TCP | 6443 | 0.0.0.0/0 | Kubernetes API |
-
-### Tested Configuration
-
-Successfully tested with:
-
-- VPC1: CP (private) + W1 (private) + W2 (public subnet, direct IP)
-- VPC3: W3 (private, separate VPC with own NAT GW)
-- Local: Multipass VM (macOS ARM64)
-- All 20 paths: 100% success (direct + relay mix)
-
----
-
 ## Azure
 
 ### Azure NAT Gateway
 
-- **NAT Type:** Symmetric
-- **Impact:** Same as other cloud providers
+- **NAT Type:** Symmetric (five-tuple hash for SNAT)
 - **Solution:** Relay fallback
 
 ### Network Security Group
@@ -131,11 +103,28 @@ az network nsg rule create \
 
 ---
 
+## OCI (Oracle Cloud Infrastructure)
+
+### NAT Gateway
+
+- **NAT Type:** Symmetric
+- **Solution:** Relay fallback for cross-VCN traffic
+
+### Security Lists / NSGs
+
+| Direction | Protocol | Port | Purpose |
+|-----------|----------|------|---------|
+| Ingress | UDP | 51820 | WireGuard |
+| Ingress | TCP | 3478 | Relay |
+| Egress | All | All | Allow outbound |
+
+---
+
 ## Bare Metal / On-Premises
 
 ### Typical NAT
 
-Most enterprise firewalls and residential routers use Cone NAT (Full or Restricted).
+Most enterprise firewalls and residential routers use Cone NAT.
 STUN-based P2P usually works.
 
 ### Port Forwarding
@@ -144,7 +133,7 @@ If UPnP/NAT-PMP is available, the agent can request port mappings automatically.
 Otherwise, use manual annotation:
 
 ```bash
-kubectl annotate node on-prem-node wirekube.io/endpoint="203.0.113.5:51820"
+kubectl annotate node <node-name> wirekube.io/endpoint="203.0.113.5:51820"
 ```
 
 ### Firewall Requirements
@@ -157,23 +146,15 @@ kubectl annotate node on-prem-node wirekube.io/endpoint="203.0.113.5:51820"
 
 ---
 
-## Home Lab / Multipass
+## Expected Transport Modes by Topology
 
-### Multipass VMs (macOS)
-
-Multipass VMs on macOS use a shared NAT network:
-
-```
-macOS host --- NAT --- Multipass VM (192.168.x.x)
-```
-
-This is typically **Cone NAT**, so STUN-based direct P2P works to public IP
-peers. For reaching peers behind Symmetric NAT (cloud), relay is needed.
-
-### Mixed Home + Cloud
-
-| Path | Expected Mode |
-|------|--------------|
-| Home ↔ Cloud (public IP node) | Direct P2P |
-| Home ↔ Cloud (private, Symmetric NAT) | Relay |
-| Home ↔ Home (same LAN) | Direct |
+| Path | Expected Mode | Why |
+|------|--------------|-----|
+| Same VPC (private ↔ private) | Direct | Same subnet, no NAT |
+| Same VPC (private ↔ public) | Direct | Same subnet |
+| Cross VPC (Symmetric ↔ Symmetric) | Relay | Both behind Symmetric NAT |
+| Cross VPC (one has public IP) | Direct P2P | Public IP reachable |
+| On-premises (Cone) ↔ Cloud (public IP) | Direct P2P | Public IP reachable |
+| On-premises (Cone) ↔ Cloud (Symmetric NAT) | Relay | Symmetric side proactively uses relay |
+| On-premises (Cone) ↔ On-premises (Cone) | Direct P2P | Both Cone, STUN stable |
+| On-premises ↔ On-premises (same LAN) | Direct | Same network |

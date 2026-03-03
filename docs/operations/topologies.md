@@ -9,13 +9,13 @@ All nodes are in private subnets behind NAT gateways.
 
 ```mermaid
 flowchart TB
-    subgraph VPC1["VPC-1 (Private)"]
-        CP[CP]
-        W1[W1]
+    subgraph VPC1["VPC A (Private)"]
+        N1[node-1]
+        N2[node-2]
         NAT1[NAT GW]
     end
-    subgraph VPC2["VPC-2 (Private)"]
-        W3[W3]
+    subgraph VPC2["VPC B (Private)"]
+        N3[node-3]
         NAT2[NAT GW]
     end
     subgraph Relay["Relay Server (TCP 3478)"]
@@ -27,9 +27,9 @@ flowchart TB
 
 | Path | Mode | Why |
 |------|------|-----|
-| CP ↔ W1 (same VPC) | Direct | Same subnet, no NAT |
-| CP ↔ W3 (cross VPC) | Relay | Both behind Symmetric NAT |
-| W1 ↔ W3 (cross VPC) | Relay | Both behind Symmetric NAT |
+| node-1 ↔ node-2 (same VPC) | Direct | Same subnet, no NAT between them |
+| node-1 ↔ node-3 (cross VPC) | Relay | Both behind Symmetric NAT |
+| node-2 ↔ node-3 (cross VPC) | Relay | Both behind Symmetric NAT |
 
 **Relay is essential.** Without it, cross-VPC communication is impossible
 when both sides are behind Symmetric NAT.
@@ -40,43 +40,43 @@ Some nodes have public IPs, others are behind NAT.
 
 ```mermaid
 flowchart LR
-    subgraph VPC1["VPC-1"]
-        CP[CP priv]
-        W2[W2 public]
+    subgraph VPC1["VPC A"]
+        N1[node-1 private]
+        N2[node-2 public IP]
         NAT1[NAT GW]
     end
-    subgraph VPC2["VPC-2 (Private)"]
-        W3[W3 priv]
+    subgraph VPC2["VPC B (Private)"]
+        N3[node-3 private]
         NAT2[NAT GW]
     end
 ```
 
 | Path | Mode | Why |
 |------|------|-----|
-| CP ↔ W2 (same VPC) | Direct | Same subnet |
-| W2 ↔ W3 (cross VPC) | Direct | W2 has public IP, W3 can reach it directly |
-| CP ↔ W3 (cross VPC) | Relay | Both behind Symmetric NAT |
+| node-1 ↔ node-2 (same VPC) | Direct | Same subnet |
+| node-2 ↔ node-3 (cross VPC) | Direct | node-2 has public IP; node-3 can reach it |
+| node-1 ↔ node-3 (cross VPC) | Relay | Both behind Symmetric NAT |
 
 **Public IP nodes act as anchor points.** Any peer can reach them directly
 via their public endpoint. This reduces relay dependency.
 
 ## Topology 3: Multi-Cloud
 
-Nodes span multiple cloud providers.
+Nodes span multiple cloud providers, all behind Symmetric NAT.
 
 ```mermaid
 flowchart LR
-    AWS[AWS VPC NAT GW] <--> R1[Relay]
-    R1 <--> GCP[GCP VPC Cloud NAT]
-    GCP <--> R2[Relay]
-    R2 <--> OP[On-Prem Firewall]
+    VPC-A[Cloud A<br/>Symmetric NAT] -.->|relay| R[Relay]
+    R -.->|relay| VPC-B[Cloud B<br/>Symmetric NAT]
+    R -.->|relay| OnPrem[On-Premises<br/>Cone NAT]
 ```
 
 | Path | Mode | Why |
 |------|------|-----|
-| AWS ↔ GCP | Relay | Both behind Symmetric NAT (cloud NAT) |
-| AWS ↔ On-Prem (public) | Direct | On-prem has public IP |
-| GCP ↔ On-Prem (public) | Direct | On-prem has public IP |
+| Cloud A ↔ Cloud B | Relay | Both behind Symmetric NAT |
+| On-Prem (Cone) ↔ Cloud A (Symmetric) | Relay | Symmetric side proactively uses relay |
+| On-Prem (Cone) ↔ Cloud B (Symmetric) | Relay | Same reason |
+| On-Prem ↔ On-Prem (Cone ↔ Cone) | Direct P2P | Both Cone NAT, STUN endpoints stable |
 
 WireKube works identically across clouds. The relay server can be deployed
 anywhere with TCP reachability from all nodes.
@@ -87,27 +87,34 @@ Mix of home network nodes and cloud nodes.
 
 ```mermaid
 flowchart LR
-    subgraph Home["Home Lab"]
-        N1[node-1 Cone NAT]
-        UPnP[Router: UPnP enabled]
+    subgraph Home["Home Lab (Cone NAT)"]
+        N1[node-1]
     end
-    subgraph Cloud["Cloud VPC"]
-        N2[node-2 Symmetric NAT]
-        NAT[NAT GW]
+    subgraph Cloud["Cloud VPC (Symmetric NAT)"]
+        N2[node-2 private]
+        N3[node-3 public IP]
     end
+    subgraph Relay
+        R[relay]
+    end
+    N1 -.->|relay| R
+    R -.->|relay| N2
+    N1 <-->|direct P2P| N3
 ```
 
 | Path | Mode | Why |
 |------|------|-----|
-| Home ↔ Cloud (private) | Relay | Cloud node is Symmetric NAT |
-| Home ↔ Cloud (public IP) | Direct | Cloud node has public IP |
+| Home (Cone) ↔ Cloud (Symmetric NAT) | Relay | Symmetric side proactively enables relay |
+| Home (Cone) ↔ Cloud (public IP) | Direct P2P | Public IP always reachable |
 | Home ↔ Home (same LAN) | Direct | Same network |
+| Cloud (Symmetric) ↔ Cloud (Symmetric, different VPC) | Relay | Both behind Symmetric NAT |
 
-Home routers typically use Cone NAT, which supports STUN-based endpoint
-discovery. However, if the remote peer is behind Symmetric NAT, direct
-P2P still fails — relay is needed.
+Home routers typically use Cone NAT (Endpoint-Independent Mapping).
+In WireKube, Symmetric NAT nodes proactively enable relay for all
+peers — so Cone-to-Symmetric pairs also use relay. Direct P2P only
+works between Cone-to-Cone peers or when the remote has a public IP.
 
-## Topology 5: Air-Gapped with Bastion
+## Topology 5: Air-Gapped with Outbound TCP
 
 Nodes behind a strict firewall with only outbound TCP allowed.
 
@@ -138,5 +145,5 @@ graph TD
     C -->|Yes| E[Deploy relay<br/>mode: auto]
     E --> F{Where to deploy relay?}
     F -->|Public server| G[External relay]
-    F -->|In-cluster| H[Managed relay<br/>+ LoadBalancer]
+    F -->|In-cluster| H[Managed relay<br/>+ LoadBalancer or NodePort]
 ```

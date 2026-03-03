@@ -10,25 +10,26 @@ The NAT traversal strategy is inspired by [Tailscale's approach](https://tailsca
 
 ```mermaid
 flowchart LR
-    subgraph VPC-A["Cloud VPC A"]
+    subgraph VPC-A["Cloud VPC A (Symmetric NAT)"]
         N1[node-1]
         N2[node-2]
     end
-    subgraph VPC-B["Cloud VPC B"]
+    subgraph VPC-B["Cloud VPC B (Symmetric NAT)"]
         N3[node-3]
+    end
+    subgraph Home-A["Home A (Cone NAT)"]
         N4[node-4]
     end
-    subgraph OnPrem["On-Premises"]
+    subgraph Home-B["Home B (Cone NAT)"]
         N5[node-5]
     end
-    subgraph Relay
-        R[wirekube-relay]
-    end
-    N1 <-->|direct P2P| N2
-    N3 <-->|direct P2P| N4
-    N1 <-->|relay| R
-    R <-->|relay| N3
-    N5 <-->|relay| R
+    R[wirekube-relay]
+    N1 <-->|direct| N2
+    N1 -.->|relay| R
+    R -.->|relay| N3
+    N1 -.->|relay| R
+    R -.->|relay| N4
+    N4 <-->|direct P2P| N5
 ```
 
 ## Features
@@ -65,7 +66,7 @@ WireKube consists of four components:
 
 1. **STUN discovery** — Agent queries two or more STUN servers to discover its public `ip:port`. If the mapped ports differ between servers, the node is classified as Symmetric NAT (RFC 5780).
 
-2. **Direct P2P** — For nodes within the same network or behind Cone NAT, WireGuard handshakes succeed directly using STUN-discovered endpoints. Most cloud VPC NAT gateways are Symmetric NAT, so cross-VPC traffic typically falls through to relay.
+2. **Direct P2P** — Nodes within the same network or between Cone NAT peers can handshake directly using STUN-discovered endpoints. Since Symmetric NAT nodes proactively enable relay, any peer involving a Symmetric NAT node routes through relay.
 
 3. **Relay fallback** — If no handshake completes within `handshakeTimeoutSeconds` (default 30s), or if Symmetric NAT is detected, traffic routes through the relay. The relay uses a simple binary frame protocol (`[4B length][1B type][body]`) over TCP. WireGuard encryption is preserved end-to-end.
 
