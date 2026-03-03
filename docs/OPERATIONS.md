@@ -448,14 +448,14 @@ kubectl get wirekubepeer node-xxx -o yaml
 - Check routes:
   ```bash
   ip rule show
-  ip route show table 51820
+  ip route show table 22347
   ```
 
 **Fix:**
-- WireKube uses `fwmark` 0x4000 to mark WireGuard's own UDP packets
+- WireKube uses `fwmark` 0x574B to mark WireGuard's own UDP packets
 - A routing rule skips the wire_kube interface for marked packets:
   ```bash
-  ip rule add fwmark 0x4000 lookup main priority 100
+  ip rule add fwmark 0x574B lookup main priority 100
   ```
 - Verify the rule exists on both nodes
 

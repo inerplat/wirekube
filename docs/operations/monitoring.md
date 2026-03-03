@@ -106,10 +106,10 @@ nc -zv relay.example.com 3478
 
 ```bash
 # Verify anti-loop rule exists
-ip rule show | grep 0x4000
+ip rule show | grep 0x574B
 
 # Expected:
-# 100: from all fwmark 0x4000 lookup main
+# 100: from all fwmark 0x574B lookup main
 ```
 
 ## Health Check Script
@@ -127,7 +127,7 @@ echo -e "\n--- Routes ---"
 ip route show dev wire_kube 2>/dev/null || echo "ERROR: no routes"
 
 echo -e "\n--- fwmark Rule ---"
-ip rule show | grep -q 0x4000 && echo "OK: fwmark rule present" || echo "ERROR: fwmark rule missing"
+ip rule show | grep -q 0x574B && echo "OK: fwmark rule present" || echo "ERROR: fwmark rule missing"
 
 echo -e "\n--- Peer Connectivity ---"
 for peer in $(wg show wire_kube peers 2>/dev/null); do

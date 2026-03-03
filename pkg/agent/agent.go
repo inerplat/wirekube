@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	"github.com/wirekube/wirekube/pkg/agent/nat"
 	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 	"github.com/wirekube/wirekube/pkg/wireguard"
@@ -133,7 +134,7 @@ func (a *Agent) setup(ctx context.Context) error {
 	if err != nil {
 		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
 	}
-	if epResult != nil && epResult.NATType == "symmetric" {
+	if epResult != nil && epResult.NATType == nat.NATSymmetric {
 		a.isSymmetricNAT = true
 		fmt.Printf("[setup] symmetric NAT detected — will prefer relay for all peers\n")
 	}
@@ -234,6 +235,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	myPeerName := "node-" + a.nodeName
 	wgPeers := make([]wireguard.PeerConfig, 0, len(peerList.Items))
 	allRoutes := []string{}
+	ownAllowedIPsSet := false
 
 	// Build stats map for relay fallback decisions
 	statsByKey := make(map[string]wireguard.PeerStats)
@@ -248,9 +250,8 @@ func (a *Agent) sync(ctx context.Context) error {
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if p.Name == myPeerName {
-			// Update preferred source IP from own allowedIPs so outgoing packets use
-			// the node's private IP as source (required for WireGuard AllowedIPs filter).
 			if len(p.Spec.AllowedIPs) > 0 {
+				ownAllowedIPsSet = true
 				ip, _, _ := net.ParseCIDR(p.Spec.AllowedIPs[0])
 				if ip != nil {
 					a.wgMgr.SetPreferredSrc(ip.String())
@@ -272,6 +273,16 @@ func (a *Agent) sync(ctx context.Context) error {
 		})
 
 		allRoutes = append(allRoutes, p.Spec.AllowedIPs...)
+	}
+
+	// When own allowedIPs is empty, this node has no identity in the mesh.
+	// Remote peers will drop all packets from us (WG inbound filter).
+	// Adding routes would hijack outgoing traffic (including SSH, kubelet)
+	// into wire_kube where it gets silently dropped.
+	if !ownAllowedIPsSet {
+		allRoutes = nil
+		a.wgMgr.SetPreferredSrc("")
+		fmt.Printf("[sync] own allowedIPs empty — passive mode (handshake only, no routes)\n")
 	}
 
 	if err := a.wgMgr.SyncPeers(wgPeers); err != nil {

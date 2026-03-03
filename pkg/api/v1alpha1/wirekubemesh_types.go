@@ -23,7 +23,10 @@ type WireKubeMeshSpec struct {
 	MTU int32 `json:"mtu,omitempty"`
 
 	// STUNServers is a list of STUN server addresses used for public endpoint discovery.
+	// At least two servers are recommended for Symmetric NAT detection (RFC 5780).
+	// If omitted, built-in defaults (Google + Cloudflare STUN) are used.
 	// +optional
+	// +kubebuilder:validation:MinItems=2
 	STUNServers []string `json:"stunServers,omitempty"`
 
 	// APIServerURL is the URL of the Kubernetes API server (e.g. "https://10.0.0.1:6443").
