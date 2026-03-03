@@ -68,14 +68,15 @@ Nodes span multiple cloud providers, all behind Symmetric NAT.
 flowchart LR
     VPC-A[Cloud A<br/>Symmetric NAT] -.->|relay| R[Relay]
     R -.->|relay| VPC-B[Cloud B<br/>Symmetric NAT]
-    R -.->|relay| OnPrem[On-Premises<br/>Cone NAT]
+    OnPrem[On-Premises<br/>Cone NAT] <-->|direct P2P| VPC-A
+    OnPrem <-->|direct P2P| VPC-B
 ```
 
 | Path | Mode | Why |
 |------|------|-----|
 | Cloud A ↔ Cloud B | Relay | Both behind Symmetric NAT |
-| On-Prem (Cone) ↔ Cloud A (Symmetric) | Relay | Symmetric side proactively uses relay |
-| On-Prem (Cone) ↔ Cloud B (Symmetric) | Relay | Same reason |
+| On-Prem (Cone) ↔ Cloud A (Symmetric) | Direct P2P | Symmetric side initiates to Cone's stable endpoint |
+| On-Prem (Cone) ↔ Cloud B (Symmetric) | Direct P2P | Same mechanism |
 | On-Prem ↔ On-Prem (Cone ↔ Cone) | Direct P2P | Both Cone NAT, STUN endpoints stable |
 
 WireKube works identically across clouds. The relay server can be deployed
@@ -94,25 +95,22 @@ flowchart LR
         N2[node-2 private]
         N3[node-3 public IP]
     end
-    subgraph Relay
-        R[relay]
-    end
-    N1 -.->|relay| R
-    R -.->|relay| N2
+    N1 <-->|direct P2P| N2
     N1 <-->|direct P2P| N3
 ```
 
 | Path | Mode | Why |
 |------|------|-----|
-| Home (Cone) ↔ Cloud (Symmetric NAT) | Relay | Symmetric side proactively enables relay |
+| Home (Cone) ↔ Cloud (Symmetric NAT) | Direct P2P | Symmetric initiates to Cone's stable STUN endpoint |
 | Home (Cone) ↔ Cloud (public IP) | Direct P2P | Public IP always reachable |
 | Home ↔ Home (same LAN) | Direct | Same network |
 | Cloud (Symmetric) ↔ Cloud (Symmetric, different VPC) | Relay | Both behind Symmetric NAT |
 
 Home routers typically use Cone NAT (Endpoint-Independent Mapping).
-In WireKube, Symmetric NAT nodes proactively enable relay for all
-peers — so Cone-to-Symmetric pairs also use relay. Direct P2P only
-works between Cone-to-Cone peers or when the remote has a public IP.
+In WireKube, Cone ↔ Symmetric pairs achieve direct P2P: the Symmetric
+side initiates a WireGuard handshake to the Cone peer's stable STUN
+endpoint. Relay is only needed when **both** peers are behind Symmetric
+NAT, which happens in cross-VPC cloud-to-cloud communication.
 
 ## Topology 5: Air-Gapped with Outbound TCP
 
