@@ -429,6 +429,9 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string) error {
 		t := metav1.NewTime(lastHandshake)
 		peer.Status.LastHandshake = &t
 	}
+	if a.isSymmetricNAT {
+		peer.Status.TransportMode = "relay"
+	}
 	return a.client.Status().Patch(ctx, peer, patch)
 }
 
