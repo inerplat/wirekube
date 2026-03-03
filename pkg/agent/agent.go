@@ -136,7 +136,7 @@ func (a *Agent) setup(ctx context.Context) error {
 	}
 	if epResult != nil && epResult.NATType == nat.NATSymmetric {
 		a.isSymmetricNAT = true
-		fmt.Printf("[setup] symmetric NAT detected — will prefer relay for all peers\n")
+		fmt.Printf("[setup] symmetric NAT detected — relay for symmetric peers, direct for cone/public peers\n")
 	}
 
 	if err := a.wgMgr.EnsureInterface(); err != nil {
@@ -222,6 +222,11 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 	}
 	patch := client.MergeFrom(peer.DeepCopy())
 	peer.Status.EndpointDiscoveryMethod = method
+	if a.isSymmetricNAT {
+		peer.Status.NATType = "symmetric"
+	} else if method == string(MethodSTUN) {
+		peer.Status.NATType = "cone"
+	}
 	return a.client.Status().Patch(ctx, peer, patch)
 }
 
@@ -295,7 +300,8 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 
 	// Update own peer status
-	if err := a.updateOwnStatus(ctx, myPeerName); err != nil {
+	remotePeerCount := len(wgPeers)
+	if err := a.updateOwnStatus(ctx, myPeerName, remotePeerCount); err != nil {
 		fmt.Printf("warning: updating own peer status: %v\n", err)
 	}
 
@@ -371,7 +377,7 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 }
 
 // updateOwnStatus reads WireGuard stats and updates this node's WireKubePeer status.
-func (a *Agent) updateOwnStatus(ctx context.Context, peerName string) error {
+func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeerCount int) error {
 	peer := &wirekubev1alpha1.WireKubePeer{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: peerName}, peer); err != nil {
 		return err
@@ -404,12 +410,13 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string) error {
 		t := metav1.NewTime(lastHandshake)
 		peer.Status.LastHandshake = &t
 	}
-	if a.isSymmetricNAT {
-		peer.Status.TransportMode = "relay"
-	} else if len(a.relayedPeers) > 0 {
-		peer.Status.TransportMode = "mixed"
-	} else {
+	relayedCount := len(a.relayedPeers)
+	if relayedCount == 0 {
 		peer.Status.TransportMode = "direct"
+	} else if remotePeerCount > 0 && relayedCount >= remotePeerCount {
+		peer.Status.TransportMode = "relay"
+	} else {
+		peer.Status.TransportMode = "mixed"
 	}
 	return a.client.Status().Patch(ctx, peer, patch)
 }
@@ -487,7 +494,9 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 		return a.enableRelayForPeer(peer)
 	}
 
-	if a.isSymmetricNAT {
+	// Symmetric ↔ Symmetric: both sides change ports per destination,
+	// direct P2P is impossible → relay immediately.
+	if a.isSymmetricNAT && peer.Status.NATType == "symmetric" {
 		return a.enableRelayForPeer(peer)
 	}
 
@@ -536,7 +545,7 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 //     - Handshake succeeded on non-proxy endpoint → finalise upgrade.
 //     - No handshake or proxy endpoint → cancel probe, resume relay.
 func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, stats map[string]wireguard.PeerStats) {
-	if a.isSymmetricNAT || a.relayPool == nil {
+	if a.relayPool == nil {
 		return
 	}
 
@@ -546,9 +555,14 @@ func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, st
 			continue
 		}
 
-		// Don't probe peers that self-report as relay-only (symmetric NAT).
-		// Their agent knows best — probing would always fail and waste cycles.
-		if p.Status.TransportMode == "relay" {
+		// Skip direct probe for Symmetric ↔ Symmetric: neither side has
+		// a stable mapped port, so direct P2P is impossible.
+		if a.isSymmetricNAT && p.Status.NATType == "symmetric" {
+			continue
+		}
+
+		// Don't probe peers that are also Symmetric NAT — probing would fail.
+		if !a.isSymmetricNAT && p.Status.NATType == "symmetric" {
 			continue
 		}
 
