@@ -148,3 +148,97 @@ The `natType` and `transportMode` fields are shown as `NAT` and `Mode` columns i
 ### Naming Convention
 
 Peer resources are named `node-<node-name>` (e.g., `node-my-node`).
+
+---
+
+## WireKubeGateway
+
+**API Version:** `wirekube.io/v1alpha1`
+**Kind:** `WireKubeGateway`
+**Scope:** Cluster
+**Short Name:** `wkgw`
+
+WireKubeGateway defines a virtual gateway that enables mesh nodes to reach
+networks behind a designated gateway node. Similar to a VGW in AWS Site-to-Site
+VPN. See [Virtual Gateway](../architecture/gateway.md) for the architecture.
+
+### Spec
+
+```yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeGateway
+metadata:
+  name: vpc-b-gateway
+spec:
+  peerRefs:
+    - node-b1
+    - node-b2
+  clientRefs:
+    - node-a1
+  routes:
+    - cidr: "172.20.0.0/16"
+      description: "VPC-B subnet"
+  snat:
+    enabled: true
+    sourceIP: ""
+  healthCheck:
+    enabled: true
+    target: "172.20.1.254:443"
+    intervalSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+```
+
+### Field Descriptions
+
+#### `spec`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `peerRefs` | []string | Yes | Ordered list of WireKubePeer names serving as gateway. First healthy peer is elected active (HA failover). Min 1. |
+| `clientRefs` | []string | No | WireKubePeer names that should route through this gateway. If empty, all mesh peers (except gateway peers and same-CIDR peers) are clients. |
+| `routes` | []GatewayRoute | Yes | CIDR ranges reachable through the gateway. Injected into active peer's AllowedIPs. Min 1. |
+| `snat` | GatewaySNAT | No | Source NAT configuration for return traffic routing. |
+| `healthCheck` | GatewayHealthCheck | No | Probe configuration for HA failover. |
+
+#### `spec.routes[]`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cidr` | string | Yes | Network CIDR (e.g. `172.20.0.0/16`). Pattern: `^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$` |
+| `description` | string | No | Human-readable label |
+
+#### `spec.snat`
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | bool | Yes | - | Activates iptables MASQUERADE for forwarded traffic |
+| `sourceIP` | string | No | (gateway's first AllowedIP) | Override SNAT source address |
+
+#### `spec.healthCheck`
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | bool | Yes | - | Activates periodic health checking |
+| `target` | string | Yes | - | Probe address. TCP connect when port specified, ICMP otherwise. |
+| `intervalSeconds` | int | No | `30` | Probe interval (min 5) |
+| `timeoutSeconds` | int | No | `5` | Probe timeout (min 1) |
+| `failureThreshold` | int | No | `3` | Consecutive failures before marking unhealthy (min 1) |
+
+#### `status`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `activePeer` | string | WireKubePeer currently serving as active gateway |
+| `ready` | bool | Gateway is healthy and forwarding traffic |
+| `routesInjected` | int | Number of CIDR routes injected into the active peer |
+| `peerHealth` | map[string]string | Per-peerRef health status (`healthy` or `unhealthy`) |
+| `lastHealthCheck` | time | Timestamp of last health probe |
+| `conditions` | []Condition | Standard Kubernetes conditions (Ready) |
+
+### Print Columns
+
+```
+NAME             ACTIVE      READY   ROUTES   AGE
+vpc-b-gateway    node-b1     true    1        5m
+```

@@ -1,0 +1,42 @@
+---
+# WireKubeGateway: routes traffic to a VPC's private link endpoint
+# through a designated gateway node, similar to AWS VGW in Site-to-Site VPN.
+#
+# In this example, node-b1 (primary) and node-b2 (backup) serve as gateways
+# to the VPC-B network (172.20.0.0/16) where the API server private link lives.
+#
+# Usage:
+#   kubectl apply -f config/gateway/example-gateway.yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeGateway
+metadata:
+  name: vpc-b-gateway
+spec:
+  # HA: first healthy peer is elected active; others are standby.
+  peerRefs:
+    - node-b1    # primary gateway
+    - node-b2    # backup gateway
+
+  # Only these peers route traffic through the gateway.
+  # Peers in the same VPC as the gateway should NOT be listed here.
+  # If omitted, all mesh peers (except gateway and same-CIDR peers) are clients.
+  clientRefs:
+    - node-a1
+    - node-a2
+
+  # Network CIDRs reachable through this gateway.
+  routes:
+    - cidr: "172.20.0.0/16"
+      description: "VPC-B subnet (private link)"
+
+  # SNAT ensures return traffic routes back through the gateway.
+  snat:
+    enabled: true
+
+  # Health check: TCP probe to the API server private link endpoint.
+  healthCheck:
+    enabled: true
+    target: "172.20.1.254:443"
+    intervalSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3

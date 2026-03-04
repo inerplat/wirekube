@@ -75,9 +75,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Read WireKubeMesh CR for settings (apiServerURL, interfaceName, listenPort, mtu)
+	// Read WireKubeMesh CR for settings (apiServerURL, interfaceName, listenPort, mtu).
+	// On failure (e.g. CNI not ready, API unreachable) we proceed with defaults;
+	// the agent's setup retry loop will re-read mesh config once available.
 	meshList := &wirekubev1alpha1.WireKubeMeshList{}
-	if listErr := k8sClient.List(context.Background(), meshList); listErr == nil && len(meshList.Items) > 0 {
+	if listErr := k8sClient.List(context.Background(), meshList); listErr != nil {
+		log.Info("WireKubeMesh read failed (will retry in agent loop)", "error", listErr)
+	} else if len(meshList.Items) > 0 {
 		mesh := &meshList.Items[0]
 
 		if apiServer == "" && mesh.Spec.APIServerURL != "" {
