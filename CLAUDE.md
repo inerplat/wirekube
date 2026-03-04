@@ -54,9 +54,11 @@ make init-mesh          # Apply default WireKubeMesh CR
 - Creates/updates its own `WireKubePeer` CR; watches all peers and syncs to kernel WireGuard
 - Adds `/32` node routes with metric 200 (higher than CNI, lower priority = less preferred)
 - Falls back to TCP relay after 30s handshake timeout; retries direct every 120s
+- Gateway: if elected as active gateway, enables IP forwarding + SNAT for cross-VPC routing
+- Startup retry: exponential backoff loop (2s–60s) for API connectivity issues (e.g. CNI delay)
 
 **Operator** (`cmd/operator/`) — Cluster-scoped deployment
-- Reconciles `WireKubeMesh` (cluster config) and `WireKubePeer` (per-node state/status)
+- Reconciles `WireKubeMesh` (cluster config), `WireKubePeer` (per-node state/status), and `WireKubeGateway` (VGW)
 - Default values: port 51820, interface `wire_kube`, MTU 1420, keepalive 25s
 - Metrics on `:8080`, health probes on `:8081`
 
@@ -72,7 +74,7 @@ make init-mesh          # Apply default WireKubeMesh CR
 
 | Package | Purpose |
 |---|---|
-| `pkg/api/v1alpha1/` | CRD type definitions (`WireKubeMesh`, `WireKubePeer`) |
+| `pkg/api/v1alpha1/` | CRD type definitions (`WireKubeMesh`, `WireKubePeer`, `WireKubeGateway`) |
 | `pkg/agent/` | Agent main logic, endpoint discovery, relay orchestration |
 | `pkg/agent/nat/` | STUN (`stun.go`) and UPnP (`upnp.go`) endpoint discovery |
 | `pkg/agent/relay/` | Relay TCP client (`client.go`), UDP proxy (`proxy.go`), multi-instance pool (`pool.go`) |
@@ -85,6 +87,8 @@ make init-mesh          # Apply default WireKubeMesh CR
 **WireKubeMesh** (cluster-scoped singleton) — cluster-wide VPN config including relay settings (`mode: auto|always|never`, `provider: external|managed`).
 
 **WireKubePeer** (cluster-scoped, one per node) — holds public key, endpoint, allowedIPs; status reflects `connected`, `lastHandshake`, `transportMode: direct|relay`.
+
+**WireKubeGateway** (cluster-scoped) — Virtual Gateway for cross-VPC routing. Defines `peerRefs` (HA ordered list), `clientRefs` (authorized client peers), `routes` (CIDR ranges), SNAT and health check config. Agent-side election: first healthy peer becomes active, gets routes injected into AllowedIPs, enables IP forwarding + MASQUERADE.
 
 ### Routing Design
 

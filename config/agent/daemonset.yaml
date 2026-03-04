@@ -19,6 +19,12 @@ rules:
   - apiGroups: ["wirekube.io"]
     resources: ["wirekubemeshes"]
     verbs: ["get", "list"]
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubegateways"]
+    verbs: ["get", "list"]
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubegateways/status"]
+    verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
@@ -61,7 +67,7 @@ spec:
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      dnsPolicy: Default
       priorityClassName: system-node-critical
       tolerations:
         - operator: Exists

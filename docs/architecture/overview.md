@@ -29,8 +29,8 @@ WireKube consists of four binaries:
 
 | Component | Runs as | Purpose |
 |-----------|---------|---------|
-| **Agent** | DaemonSet (`hostNetwork: true`) | Manages WireGuard interface, discovers endpoints, syncs peers, handles relay failover and direct recovery |
-| **Operator** | Deployment | Reconciles `WireKubeMesh` and `WireKubePeer` CRDs, applies defaults |
+| **Agent** | DaemonSet (`hostNetwork: true`) | Manages WireGuard interface, discovers endpoints, syncs peers, handles relay failover, direct recovery, and gateway forwarding |
+| **Operator** | Deployment | Reconciles `WireKubeMesh`, `WireKubePeer`, and `WireKubeGateway` CRDs, applies defaults |
 | **Relay** | Deployment + Service | Bridges WireGuard UDP over TCP for peers behind Symmetric NAT |
 | **wirekubectl** | CLI | Status inspection and peer management |
 
@@ -78,6 +78,14 @@ It is a stateless packet forwarder that:
 - Discovered endpoint (ip:port)
 - AllowedIPs (typically node IP `/32`)
 - Status: connected, transport mode (`direct`/`relay`/`mixed`), discovery method
+
+**WireKubeGateway** — Virtual gateway for cross-VPC routing:
+
+- PeerRefs: ordered list of gateway peers (HA failover)
+- ClientRefs: peers that route through this gateway
+- Routes: CIDR ranges reachable through the gateway
+- SNAT and health check configuration
+- See [Virtual Gateway](gateway.md) for the full design.
 
 ## Traffic Flow
 

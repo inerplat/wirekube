@@ -1,0 +1,249 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: wirekubegateways.wirekube.io
+spec:
+  group: wirekube.io
+  names:
+    kind: WireKubeGateway
+    listKind: WireKubeGatewayList
+    plural: wirekubegateways
+    shortNames:
+    - wkgw
+    singular: wirekubegateway
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.activePeer
+      name: Active
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .status.routesInjected
+      name: Routes
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          WireKubeGateway defines a virtual gateway in the WireKube mesh.
+          It enables mesh nodes to reach networks (VPC CIDRs, private link endpoints)
+          behind a designated gateway node, similar to a VGW in AWS Site-to-Site VPN.
+          Multiple PeerRefs provide HA with automatic failover on health check failure.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              WireKubeGatewaySpec defines the desired state of WireKubeGateway.
+              A gateway acts as a Virtual Gateway (VGW) in the mesh, enabling other nodes
+              to access networks behind the gateway node via its WireGuard tunnel.
+            properties:
+              clientRefs:
+                description: |-
+                  ClientRefs lists WireKubePeer names that should route traffic through this gateway.
+                  Only these peers will get kernel routes for the gateway's CIDRs.
+                  If empty, all mesh peers (except gateway peers and peers already in the CIDR) are clients.
+                items:
+                  type: string
+                type: array
+              healthCheck:
+                description: |-
+                  HealthCheck verifies that the target network is reachable through the gateway.
+                  When the health check fails, traffic is rerouted to the next peer in PeerRefs.
+                properties:
+                  enabled:
+                    description: Enabled activates periodic health checking.
+                    type: boolean
+                  failureThreshold:
+                    default: 3
+                    description: FailureThreshold is the number of consecutive failures
+                      before marking unhealthy.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  intervalSeconds:
+                    default: 30
+                    description: IntervalSeconds is the probe interval.
+                    format: int32
+                    minimum: 5
+                    type: integer
+                  target:
+                    description: |-
+                      Target is the address to probe (e.g. "172.20.1.254:443").
+                      TCP connect is used when a port is specified, ICMP ping otherwise.
+                    type: string
+                  timeoutSeconds:
+                    default: 5
+                    description: TimeoutSeconds is the probe timeout.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                - target
+                type: object
+              peerRefs:
+                description: |-
+                  PeerRefs references WireKubePeer resources that serve as gateway nodes.
+                  The first healthy peer is elected as the active gateway (HA failover).
+                  Each entry is a WireKubePeer name (e.g. "node-worker1").
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              routes:
+                description: |-
+                  Routes defines the CIDR ranges accessible through this gateway.
+                  These CIDRs are injected into each gateway peer's AllowedIPs and
+                  kernel routing table entries on all mesh nodes.
+                items:
+                  description: GatewayRoute defines a network CIDR reachable through
+                    the gateway.
+                  properties:
+                    cidr:
+                      description: CIDR is the network range (e.g. "172.20.0.0/16").
+                      pattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
+                      type: string
+                    description:
+                      description: Description is a human-readable label for this
+                        route.
+                      type: string
+                  required:
+                  - cidr
+                  type: object
+                minItems: 1
+                type: array
+              snat:
+                description: |-
+                  SNAT configures source NAT on the gateway node so that return traffic
+                  from the target network routes back through the gateway.
+                properties:
+                  enabled:
+                    description: Enabled activates iptables MASQUERADE for traffic
+                      forwarded through the gateway.
+                    type: boolean
+                  sourceIP:
+                    description: |-
+                      SourceIP overrides the SNAT source address.
+                      When empty, the gateway node's first AllowedIP is used.
+                    type: string
+                required:
+                - enabled
+                type: object
+            required:
+            - peerRefs
+            - routes
+            type: object
+          status:
+            description: WireKubeGatewayStatus defines the observed state of WireKubeGateway.
+            properties:
+              activePeer:
+                description: ActivePeer is the WireKubePeer name currently serving
+                  as the active gateway.
+                type: string
+              conditions:
+                description: Conditions reflect the current state of the gateway.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastHealthCheck:
+                description: LastHealthCheck is the timestamp of the last health check
+                  probe.
+                format: date-time
+                type: string
+              peerHealth:
+                additionalProperties:
+                  type: string
+                description: PeerHealth maps each peerRef to its health status ("healthy"
+                  or "unhealthy").
+                type: object
+              ready:
+                description: Ready indicates the gateway is healthy and forwarding
+                  traffic.
+                type: boolean
+              routesInjected:
+                description: RoutesInjected is the number of CIDR routes injected
+                  into the active peer.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
