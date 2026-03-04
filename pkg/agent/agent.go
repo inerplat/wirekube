@@ -53,6 +53,11 @@ type Agent struct {
 	directRetryTime map[string]time.Time
 	// directProbing tracks peers currently being probed for direct connectivity.
 	directProbing map[string]bool
+	// gwState tracks gateway configuration when this node serves as a VGW.
+	gwState *gatewayState
+	// gwClientCache maps gateway CIDR → set of authorized client peer names.
+	// Rebuilt every sync cycle. nil means not yet built.
+	gwClientCache map[string]map[string]bool
 }
 
 // NewAgent creates a new Agent.
@@ -71,12 +76,31 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName string
 }
 
 // Run starts the agent loop. Blocks until ctx is cancelled.
+// Setup is retried with exponential backoff to handle transient failures
+// such as CNI not yet installed (DNS/API server unreachable).
 func (a *Agent) Run(ctx context.Context) error {
 	// Clean up stale interface from previous runs
 	_ = a.wgMgr.DeleteInterface()
 
-	if err := a.setup(ctx); err != nil {
-		return fmt.Errorf("agent setup: %w", err)
+	backoff := 2 * time.Second
+	const maxBackoff = 60 * time.Second
+	for {
+		if err := a.setup(ctx); err != nil {
+			fmt.Printf("[agent] setup failed (retrying in %s): %v\n", backoff, err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+		break
 	}
 	defer a.cleanup()
 
@@ -98,6 +122,7 @@ func (a *Agent) Run(ctx context.Context) error {
 // cleanup removes WireGuard routes and interface on shutdown.
 func (a *Agent) cleanup() {
 	fmt.Printf("[cleanup] removing routes and WireGuard interface %s\n", a.wgMgr.InterfaceName())
+	a.cleanupGateway()
 	if a.relayPool != nil {
 		a.relayPool.Close()
 	}
@@ -236,6 +261,9 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 
 // sync reconciles WireGuard peer config and kernel routes with current WireKubePeer CRDs.
 func (a *Agent) sync(ctx context.Context) error {
+	// Invalidate gateway client cache so it's rebuilt with fresh data this cycle
+	a.gwClientCache = nil
+
 	peerList := &wirekubev1alpha1.WireKubePeerList{}
 	if err := a.client.List(ctx, peerList); err != nil {
 		return fmt.Errorf("listing peers: %w", err)
@@ -258,6 +286,7 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	remotePeerNames := []string{}
 
+	var ownIP net.IP
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if p.Name == myPeerName {
@@ -265,6 +294,7 @@ func (a *Agent) sync(ctx context.Context) error {
 				ownAllowedIPsSet = true
 				ip, _, _ := net.ParseCIDR(p.Spec.AllowedIPs[0])
 				if ip != nil {
+					ownIP = ip
 					a.wgMgr.SetPreferredSrc(ip.String())
 				}
 			}
@@ -277,14 +307,21 @@ func (a *Agent) sync(ctx context.Context) error {
 		endpoint := a.resolveEndpointForPeer(p, statsByKey)
 		remotePeerNames = append(remotePeerNames, p.Name)
 
+		filteredAllowedIPs := make([]string, 0, len(p.Spec.AllowedIPs))
+		for _, cidr := range p.Spec.AllowedIPs {
+			if a.shouldSkipGatewayRoute(ctx, cidr, myPeerName, ownIP) {
+				continue
+			}
+			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
+			allRoutes = append(allRoutes, cidr)
+		}
+
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
 			Endpoint:         endpoint,
-			AllowedIPs:       p.Spec.AllowedIPs,
+			AllowedIPs:       filteredAllowedIPs,
 			KeepaliveSeconds: int(p.Spec.PersistentKeepalive),
 		})
-
-		allRoutes = append(allRoutes, p.Spec.AllowedIPs...)
 	}
 
 	// When own allowedIPs is empty, this node has no identity in the mesh.
@@ -316,6 +353,11 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	// Reflect NAT-mapped endpoints back to CRDs (only for direct peers)
 	a.reflectNATEndpoints(ctx, peerList)
+
+	// Configure gateway networking if this node is an active VGW
+	if err := a.setupGateway(ctx); err != nil {
+		fmt.Printf("[gateway] setup error: %v\n", err)
+	}
 
 	return nil
 }

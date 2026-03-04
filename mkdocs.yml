@@ -61,6 +61,7 @@ nav:
     - Overview: architecture/overview.md
     - NAT Traversal: architecture/nat-traversal.md
     - Relay System: architecture/relay.md
+    - Virtual Gateway: architecture/gateway.md
     - CNI Compatibility: architecture/cni-compatibility.md
   - Operations:
     - Deployment Topologies: operations/topologies.md
