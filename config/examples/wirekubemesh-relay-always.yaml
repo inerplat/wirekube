@@ -1,0 +1,31 @@
+---
+# WireKubeMesh with relay-always mode
+# Use case: testing relay path explicitly, or environments where direct P2P is
+# known to be impossible (strict firewall, no STUN reachability).
+#
+# In "always" mode, traffic goes through relay regardless of NAT type.
+# Direct retry is still attempted every directRetryIntervalSeconds to upgrade
+# to direct if the network situation changes.
+#
+# kubectl apply -f config/examples/wirekubemesh-relay-always.yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51822
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
+
+  relay:
+    mode: always
+    provider: external
+    external:
+      endpoint: "relay.example.com:3478"
+      transport: tcp
+      # authSecretRef:
+      #   name: wirekube-relay-token
+      #   namespace: wirekube-system

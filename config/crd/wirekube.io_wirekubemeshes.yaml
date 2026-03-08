@@ -65,6 +65,24 @@ spec:
                   APIServerURL is the URL of the Kubernetes API server (e.g. "https://10.0.0.1:6443").
                   When set, the agent uses this directly instead of in-cluster discovery.
                 type: string
+              autoAllowedIPs:
+                description: |-
+                  AutoAllowedIPs configures automatic AllowedIPs detection for each node's own WireKubePeer.
+                  When enabled, the agent sets its own AllowedIPs from Node.Status.InternalIP if the field
+                  is currently empty. This simplifies initial node onboarding without manual kubectl patch.
+                properties:
+                  strategy:
+                    default: disabled
+                    description: |-
+                      Strategy controls how the agent automatically sets AllowedIPs for its own WireKubePeer
+                      when the field is currently empty.
+                      "disabled" (default): AllowedIPs must be set manually by the user.
+                      "node-internal-ip": use Node.Status.InternalIP/32 (the node's primary cluster IP).
+                    enum:
+                    - disabled
+                    - node-internal-ip
+                    type: string
+                type: object
               interfaceName:
                 default: wire_kube
                 description: InterfaceName is the name of the WireGuard network interface
@@ -85,6 +103,42 @@ spec:
                 maximum: 65535
                 minimum: 576
                 type: integer
+              natTraversal:
+                description: NATTraversal configures advanced NAT traversal options.
+                properties:
+                  birthdayAttack:
+                    default: disabled
+                    description: |-
+                      BirthdayAttack controls the symmetric-to-symmetric NAT hole punching strategy.
+                      This technique opens many UDP sockets simultaneously to find a matching port pair.
+                      Some NAT gateways may interpret this as malicious traffic and block the node.
+                      "disabled" (default): never attempt birthday attack; symmetric↔symmetric peers stay on relay.
+                      "enabled": attempt birthday attack for symmetric↔symmetric NAT pairs.
+                      Individual peers can override this via the "wirekube.io/birthday-attack" annotation
+                      (values: "enabled" or "disabled").
+                    enum:
+                    - enabled
+                    - disabled
+                    type: string
+                type: object
+              podCIDRRouting:
+                description: |-
+                  PodCIDRRouting enables automatic pod CIDR advertisement via AllowedIPs.
+                  When enabled, the agent appends Node.Spec.PodCIDR to its own AllowedIPs each sync cycle.
+                  Designed for hybrid environments where on-premises nodes use Cilium/Calico (which set
+                  Node.Spec.PodCIDR), enabling direct pod-to-pod routing across the mesh tunnel.
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      Enabled controls whether the agent appends Node.Spec.PodCIDR to its own AllowedIPs.
+                      When true, pods on each node become directly reachable by other mesh nodes.
+                      Only effective when the node's CNI sets Node.Spec.PodCIDR (e.g. Cilium, Calico, Flannel).
+                      VPC CNI (EKS cloud nodes) typically does not set Node.Spec.PodCIDR and will be skipped.
+                    type: boolean
+                required:
+                - enabled
+                type: object
               relay:
                 description: |-
                   Relay configures the relay fallback for peers behind Symmetric NAT.
@@ -285,6 +339,17 @@ spec:
                   - type
                   type: object
                 type: array
+              nodeConnections:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  type: object
+                description: |-
+                  NodeConnections maps each node's name to its view of peer transport modes.
+                  Each agent writes only its own entry (key = node's own name).
+                  Inner key is the peer name, value is "direct" or "relay".
+                  Using JSON merge-patch semantics: each agent's write only affects its own key.
+                type: object
               readyPeers:
                 description: ReadyPeers is the number of peers with an active WireGuard
                   handshake.

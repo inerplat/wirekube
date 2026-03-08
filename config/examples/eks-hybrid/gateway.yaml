@@ -1,0 +1,53 @@
+---
+# WireKubeGateway — EC2 Virtual Gateway for hybrid node reachability
+#
+# Enables:
+#   1. kubectl exec/logs/port-forward on hybrid nodes
+#   2. EC2 ↔ hybrid pod networking (with VPC subnet routes)
+#
+# Traffic flow:
+#   kube-apiserver ENI → VPC route → EC2 → WireGuard → hybrid node
+#   EC2 pod → VPC CNI SNAT → WireGuard → hybrid pod (via AllowedIPs)
+#   Hybrid pod → WireGuard → EC2 → VPC → EC2 pod (via gateway routes)
+#
+# Prerequisites (one-time AWS setup):
+#
+#   1. Disable Source/Dest Check on all EC2 ENIs:
+#      aws ec2 modify-network-interface-attribute \
+#        --network-interface-id <ENI_ID> --no-source-dest-check
+#
+#   2. Add VPC route table entries for hybrid node CIDRs:
+#      aws ec2 create-route --route-table-id <RTB_ID> \
+#        --destination-cidr-block <HYBRID_CIDR> \
+#        --network-interface-id <EC2_PRIMARY_ENI>
+#
+# Replace all REPLACE_WITH_* values before applying.
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeGateway
+metadata:
+  name: hybrid-gateway
+spec:
+  peerRefs:
+    - REPLACE_WITH_EC2_NODE_NAME      # e.g. ip-10-100-0-85.us-east-1.compute.internal
+
+  routes:
+    # Hybrid node network CIDRs — enables kube-apiserver → kubelet routing
+    - cidr: "REPLACE_WITH_HYBRID_CIDR_A"   # e.g. 172.20.0.0/16
+      description: "Hybrid node subnet A"
+    - cidr: "REPLACE_WITH_HYBRID_CIDR_B"   # e.g. 10.20.0.0/16
+      description: "Hybrid node subnet B"
+    # VPC subnets — enables hybrid pod → EC2 pod routing
+    - cidr: "REPLACE_WITH_VPC_SUBNET_A"    # e.g. 10.100.0.0/24
+      description: "VPC subnet A (EC2 pods)"
+    - cidr: "REPLACE_WITH_VPC_SUBNET_B"    # e.g. 10.100.1.0/24
+      description: "VPC subnet B"
+
+  snat:
+    enabled: true
+
+  healthCheck:
+    enabled: true
+    target: "REPLACE_WITH_HYBRID_NODE_IP"  # any hybrid node IP for health check
+    intervalSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3

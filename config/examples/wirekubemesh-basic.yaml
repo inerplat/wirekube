@@ -1,0 +1,18 @@
+---
+# Basic WireKubeMesh configuration
+# Use case: all nodes have public IPs or are in the same VPC (no NAT issues).
+# AllowedIPs must be set manually on each WireKubePeer.
+#
+# kubectl apply -f config/examples/wirekubemesh-basic.yaml
+# kubectl patch wkpeer <node-name> --type=merge -p '{"spec":{"allowedIPs":["<node-ip>/32"]}}'
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51822
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
