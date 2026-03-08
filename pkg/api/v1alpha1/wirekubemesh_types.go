@@ -38,6 +38,60 @@ type WireKubeMeshSpec struct {
 	// When direct P2P and STUN fail, traffic is forwarded through a relay server.
 	// +optional
 	Relay *RelaySpec `json:"relay,omitempty"`
+
+	// NATTraversal configures advanced NAT traversal options.
+	// +optional
+	NATTraversal *NATTraversalSpec `json:"natTraversal,omitempty"`
+
+	// AutoAllowedIPs configures automatic AllowedIPs detection for each node's own WireKubePeer.
+	// When enabled, the agent sets its own AllowedIPs from Node.Status.InternalIP if the field
+	// is currently empty. This simplifies initial node onboarding without manual kubectl patch.
+	// +optional
+	AutoAllowedIPs *AutoAllowedIPsSpec `json:"autoAllowedIPs,omitempty"`
+
+	// PodCIDRRouting enables automatic pod CIDR advertisement via AllowedIPs.
+	// When enabled, the agent appends Node.Spec.PodCIDR to its own AllowedIPs each sync cycle.
+	// Designed for hybrid environments where on-premises nodes use Cilium/Calico (which set
+	// Node.Spec.PodCIDR), enabling direct pod-to-pod routing across the mesh tunnel.
+	// +optional
+	PodCIDRRouting *PodCIDRRoutingSpec `json:"podCIDRRouting,omitempty"`
+}
+
+// AutoAllowedIPsSpec configures automatic AllowedIPs detection for the agent's own WireKubePeer.
+type AutoAllowedIPsSpec struct {
+	// Strategy controls how the agent automatically sets AllowedIPs for its own WireKubePeer
+	// when the field is currently empty.
+	// "disabled" (default): AllowedIPs must be set manually by the user.
+	// "node-internal-ip": use Node.Status.InternalIP/32 (the node's primary cluster IP).
+	// +kubebuilder:default=disabled
+	// +kubebuilder:validation:Enum=disabled;node-internal-ip
+	// +optional
+	Strategy string `json:"strategy,omitempty"`
+}
+
+// PodCIDRRoutingSpec enables automatic pod CIDR advertisement via AllowedIPs.
+type PodCIDRRoutingSpec struct {
+	// Enabled controls whether the agent appends Node.Spec.PodCIDR to its own AllowedIPs.
+	// When true, pods on each node become directly reachable by other mesh nodes.
+	// Only effective when the node's CNI sets Node.Spec.PodCIDR (e.g. Cilium, Calico, Flannel).
+	// VPC CNI (EKS cloud nodes) typically does not set Node.Spec.PodCIDR and will be skipped.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled"`
+}
+
+// NATTraversalSpec configures advanced NAT traversal strategies.
+type NATTraversalSpec struct {
+	// BirthdayAttack controls the symmetric-to-symmetric NAT hole punching strategy.
+	// This technique opens many UDP sockets simultaneously to find a matching port pair.
+	// Some NAT gateways may interpret this as malicious traffic and block the node.
+	// "disabled" (default): never attempt birthday attack; symmetric↔symmetric peers stay on relay.
+	// "enabled": attempt birthday attack for symmetric↔symmetric NAT pairs.
+	// Individual peers can override this via the "wirekube.io/birthday-attack" annotation
+	// (values: "enabled" or "disabled").
+	// +kubebuilder:default=disabled
+	// +kubebuilder:validation:Enum=enabled;disabled
+	// +optional
+	BirthdayAttack string `json:"birthdayAttack,omitempty"`
 }
 
 // RelaySpec configures the WireKube relay for NAT traversal fallback.
@@ -158,6 +212,13 @@ type WireKubeMeshStatus struct {
 
 	// TotalPeers is the total number of WireKubePeer resources in the cluster.
 	TotalPeers int32 `json:"totalPeers,omitempty"`
+
+	// NodeConnections maps each node's name to its view of peer transport modes.
+	// Each agent writes only its own entry (key = node's own name).
+	// Inner key is the peer name, value is "direct" or "relay".
+	// Using JSON merge-patch semantics: each agent's write only affects its own key.
+	// +optional
+	NodeConnections map[string]map[string]string `json:"nodeConnections,omitempty"`
 
 	// Conditions reflect the current state of the WireKubeMesh.
 	// +optional

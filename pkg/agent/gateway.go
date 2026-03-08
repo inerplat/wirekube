@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,7 +38,7 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 		return nil
 	}
 
-	myPeerName := "node-" + a.nodeName
+	myPeerName := a.nodeName
 	desiredSNATCIDRs := map[string]bool{}
 	activeGateways := []string{}
 
@@ -104,33 +105,104 @@ func (a *Agent) electActivePeer(ctx context.Context, gw *wirekubev1alpha1.WireKu
 	return ""
 }
 
-// injectGatewayRoutes adds gateway route CIDRs to the active peer's AllowedIPs
-// if not already present.
+// injectGatewayRoutes reconciles gateway route CIDRs in the active peer's AllowedIPs.
+// It adds missing CIDRs and removes stale ones that were previously injected by gateways.
+// Gateway-injected CIDRs are tracked in the "wirekube.io/gateway-cidrs" annotation.
 func (a *Agent) injectGatewayRoutes(ctx context.Context, gw *wirekubev1alpha1.WireKubeGateway, peerName string) {
 	peer := &wirekubev1alpha1.WireKubePeer{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: peerName}, peer); err != nil {
 		return
 	}
 
-	existing := make(map[string]bool, len(peer.Spec.AllowedIPs))
+	// Collect desired gateway CIDRs from ALL gateways for this peer.
+	desiredGW := a.collectGatewayCIDRsForPeer(ctx, peerName)
+
+	// Parse previously-injected CIDRs from annotation.
+	const annKey = "wirekube.io/gateway-cidrs"
+	prevInjected := map[string]bool{}
+	if ann := peer.Annotations[annKey]; ann != "" {
+		for _, c := range strings.Split(ann, ",") {
+			if c != "" {
+				prevInjected[c] = true
+			}
+		}
+	}
+
+	// Build new AllowedIPs: user CIDRs (not gateway-injected) + desired gateway CIDRs.
+	userCIDRs := []string{}
 	for _, ip := range peer.Spec.AllowedIPs {
-		existing[ip] = true
-	}
-
-	changed := false
-	for _, route := range gw.Spec.Routes {
-		if !existing[route.CIDR] {
-			peer.Spec.AllowedIPs = append(peer.Spec.AllowedIPs, route.CIDR)
-			changed = true
-			fmt.Printf("[gateway] injecting route %s into peer %s\n", route.CIDR, peerName)
+		if !prevInjected[ip] && !desiredGW[ip] {
+			userCIDRs = append(userCIDRs, ip)
 		}
 	}
 
-	if changed {
-		if err := a.client.Update(ctx, peer); err != nil {
-			fmt.Printf("[gateway] warning: updating peer %s allowedIPs: %v\n", peerName, err)
+	newAllowed := append(userCIDRs, sortedKeys(desiredGW)...)
+
+	// Check if anything changed.
+	if equalStringSlice(peer.Spec.AllowedIPs, newAllowed) {
+		return
+	}
+
+	for cidr := range desiredGW {
+		if !prevInjected[cidr] {
+			fmt.Printf("[gateway] injecting route %s into peer %s\n", cidr, peerName)
 		}
 	}
+	for cidr := range prevInjected {
+		if !desiredGW[cidr] {
+			fmt.Printf("[gateway] removing stale route %s from peer %s\n", cidr, peerName)
+		}
+	}
+
+	peer.Spec.AllowedIPs = newAllowed
+	if peer.Annotations == nil {
+		peer.Annotations = map[string]string{}
+	}
+	peer.Annotations[annKey] = strings.Join(sortedKeys(desiredGW), ",")
+
+	if err := a.client.Update(ctx, peer); err != nil {
+		fmt.Printf("[gateway] warning: updating peer %s allowedIPs: %v\n", peerName, err)
+	}
+}
+
+// collectGatewayCIDRsForPeer returns all desired CIDRs from gateways where
+// the given peer is the elected active gateway.
+func (a *Agent) collectGatewayCIDRsForPeer(ctx context.Context, peerName string) map[string]bool {
+	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
+	if err := a.client.List(ctx, gwList); err != nil {
+		return nil
+	}
+	result := map[string]bool{}
+	for i := range gwList.Items {
+		gw := &gwList.Items[i]
+		if a.electActivePeer(ctx, gw) == peerName {
+			for _, route := range gw.Spec.Routes {
+				result[route.CIDR] = true
+			}
+		}
+	}
+	return result
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // updateGatewayStatus sets the active peer and ready status on the gateway CR.
@@ -277,7 +349,7 @@ func (a *Agent) listActiveGateways(ctx context.Context) ([]wirekubev1alpha1.Wire
 		return nil, err
 	}
 
-	myPeerName := "node-" + a.nodeName
+	myPeerName := a.nodeName
 	var active []wirekubev1alpha1.WireKubeGateway
 	for _, gw := range gwList.Items {
 		if gw.Status.ActivePeer == myPeerName {
@@ -304,22 +376,26 @@ func (a *Agent) performGatewayHealthCheck(ctx context.Context) {
 }
 
 // shouldSkipGatewayRoute decides if a given CIDR (from a remote peer's AllowedIPs)
-// should be excluded from this node's kernel route table.
+// should be excluded from this node's WireGuard config and kernel route table.
 //
 // A CIDR is skipped when:
-//  1. It's a gateway-injected route AND this node is not a designated client, OR
-//  2. This node's own IP is already within the CIDR (same-VPC optimization).
+//  1. This node's own IP is already within the CIDR (same-VPC optimization).
+//  2. It's a gateway-injected route AND this node is not a designated client.
+//  3. It's a gateway-injected route AND the CIDR contains a non-gateway peer's IP.
+//     Such subnets are reachable via direct WireGuard tunnels; routing them through
+//     the gateway would hairpin traffic and break local network services (e.g. cloud
+//     LB health checks) because the WireKube routing table (priority 200) overrides
+//     the main table's directly-connected routes (priority 32766).
 func (a *Agent) shouldSkipGatewayRoute(ctx context.Context, cidr, myPeerName string, ownIP net.IP) bool {
-	// Same-VPC: skip if our own IP is inside this CIDR
-	if ownIP != nil {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err == nil && ipNet.Contains(ownIP) {
-			return true
-		}
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
 	}
 
-	// Check gateways to see if this CIDR is gateway-managed
-	// and if we're an authorized client
+	if ownIP != nil && ipNet.Contains(ownIP) {
+		return true
+	}
+
 	if a.gwClientCache == nil {
 		a.buildGatewayClientCache(ctx)
 	}
@@ -329,10 +405,44 @@ func (a *Agent) shouldSkipGatewayRoute(ctx context.Context, cidr, myPeerName str
 			if len(clients) > 0 && !clients[myPeerName] {
 				return true
 			}
+			for _, peerIP := range a.nonGwPeerIPs {
+				if ipNet.Contains(peerIP) {
+					return true
+				}
+			}
 		}
 	}
 
 	return false
+}
+
+// collectNonGatewayPeerIPs builds a list of node IPs for all peers that are NOT
+// active gateway peers. Gateway route CIDRs containing these IPs are skipped on
+// non-gateway nodes to prevent routing local-network traffic through the tunnel.
+func (a *Agent) collectNonGatewayPeerIPs(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
+	gwPeers := map[string]bool{}
+	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
+	if err := a.client.List(ctx, gwList); err == nil {
+		for i := range gwList.Items {
+			if ap := gwList.Items[i].Status.ActivePeer; ap != "" {
+				gwPeers[ap] = true
+			}
+		}
+	}
+
+	a.nonGwPeerIPs = make([]net.IP, 0, len(peerList.Items))
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+		if gwPeers[p.Name] {
+			continue
+		}
+		if len(p.Spec.AllowedIPs) > 0 {
+			ip, _, _ := net.ParseCIDR(p.Spec.AllowedIPs[0])
+			if ip != nil {
+				a.nonGwPeerIPs = append(a.nonGwPeerIPs, ip)
+			}
+		}
+	}
 }
 
 // buildGatewayClientCache populates a map of gateway CIDR → allowed client peers.

@@ -7,4 +7,7 @@ terraform.tfstate.backup
 .terraform/
 site/
 /relay
+/agent
+/operator
+/wirekubectl
 internal/

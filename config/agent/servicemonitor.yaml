@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-agent-metrics
+  namespace: wirekube-system
+  labels:
+    app: wirekube-agent
+spec:
+  selector:
+    app: wirekube-agent
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+  clusterIP: None
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: wirekube-agent
+  namespace: wirekube-system
+  labels:
+    app: wirekube-agent
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: wirekube-agent
+  namespaceSelector:
+    matchNames:
+      - wirekube-system
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+      scrapeTimeout: 10s
