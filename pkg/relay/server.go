@@ -53,7 +53,11 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	frame, err := ReadFrame(reader)
 	if err != nil {
-		log.Printf("relay: read register frame: %v", err)
+		// TCP health probes (kubelet liveness/readiness) connect and immediately
+		// close without sending data — suppress the noisy EOF log for these.
+		if err.Error() != "EOF" {
+			log.Printf("relay: read register frame: %v", err)
+		}
 		return
 	}
 	if frame.Type != MsgRegister {
@@ -112,9 +116,11 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.mu.RUnlock()
 
 			if !ok {
+				log.Printf("relay: data from %x to %x: dest not found", pubKey[:8], destKey[:8])
 				continue
 			}
 
+			log.Printf("relay: forwarding %d bytes from %x to %x", len(payload), pubKey[:8], destKey[:8])
 			outFrame := MakeDataFrame(pubKey, payload)
 			dest.mu.Lock()
 			err = WriteFrame(dest.writer, outFrame)

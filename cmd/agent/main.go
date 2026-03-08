@@ -6,8 +6,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -37,6 +39,7 @@ func main() {
 	var listenPort int
 	var mtu int
 	var apiServer string
+	var metricsAddr string
 
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of this Kubernetes node")
 	flag.StringVar(&meshName, "mesh-name", "default", "Name of the WireKubeMesh resource")
@@ -44,6 +47,7 @@ func main() {
 	flag.IntVar(&listenPort, "listen-port", 51820, "WireGuard UDP listen port")
 	flag.IntVar(&mtu, "mtu", 1420, "WireGuard interface MTU")
 	flag.StringVar(&apiServer, "kube-apiserver", os.Getenv("WIREKUBE_KUBE_APISERVER"), "Kubernetes API server URL (overrides in-cluster discovery)")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "Prometheus metrics listen address")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -124,6 +128,19 @@ func main() {
 		os.Exit(1)
 	}
 	defer wgMgr.Close()
+
+	// Start Prometheus metrics HTTP server.
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		log.Info("metrics server", "addr", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			log.Error(err, "metrics server failed")
+		}
+	}()
 
 	a := agentpkg.NewAgent(k8sClient, wgMgr, nodeName)
 	ctx := ctrl.SetupSignalHandler()

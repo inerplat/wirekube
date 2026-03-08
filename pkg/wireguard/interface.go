@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ type Manager struct {
 	kp           *KeyPair
 	wgClient     *wgctrl.Client
 	preferredSrc net.IP // source IP for routes in the WireKube routing table
+	fwmarkClean  bool   // true after first-run duplicate iptables rule cleanup
 }
 
 // SetPreferredSrc sets the source IP used when adding routes to the WireGuard routing table.
@@ -74,6 +76,17 @@ func (m *Manager) EnsureInterface() error {
 	// Without this, xfrm policies (e.g. site-to-site VPN) can hijack
 	// packets routed through wire_kube before WireGuard encrypts them.
 	m.disableXfrm()
+	// Use loose reverse-path filtering so packets arriving via the WireGuard
+	// interface with source IPs from remote pod CIDRs are not dropped.
+	// rp_filter=2 (loose): accept if any route exists for the source IP.
+	m.setRpFilter()
+	// Allow relay proxy to receive WireGuard keepalives on loopback.
+	// WireGuard's fwmark routing causes its UDP socket to use the node's
+	// physical IP as source even when sending to 127.0.0.1 (proxy port).
+	// Linux drops such packets by default (accept_local=0 on lo), so we
+	// must enable it to let the proxy socket receive them.
+	m.setLoAcceptLocal()
+	m.AllowFwmarkLoopback()
 	return nil
 }
 
@@ -107,13 +120,31 @@ func (m *Manager) Configure() error {
 }
 
 // ensureRoutingRules sets up two ip rules:
-//  1. fwmark 0x574B → main table (priority 100): WG socket bypasses tunnel routes
+//  1. fwmark 0x574B → main table: WG socket bypasses tunnel routes
 //  2. all → WireKube table (priority 200): normal traffic uses WG tunnel routes
+//
+// The fwmark rule priority is placed AFTER the kernel's local routing table
+// rule to ensure packets to 127.0.0.0/8 (relay proxy) are delivered via
+// loopback rather than the main table's default route. Some CNIs (notably
+// Cilium) move the local table from its default priority 0 to higher values
+// like 100; we detect the current local table priority and place our rule
+// 10 positions after it (minimum 110).
 func (m *Manager) ensureRoutingRules() error {
+	fwPrio := m.fwmarkRulePriority()
+
+	// Migrate: remove stale fwmark rule at the old hard-coded priority 100.
+	if fwPrio != 100 {
+		old := netlink.NewRule()
+		old.Mark = wkFwMark
+		old.Table = 254
+		old.Priority = 100
+		_ = netlink.RuleDel(old)
+	}
+
 	fwRule := netlink.NewRule()
 	fwRule.Mark = wkFwMark
 	fwRule.Table = 254
-	fwRule.Priority = 100
+	fwRule.Priority = fwPrio
 	if !m.ruleExists(fwRule) {
 		if err := netlink.RuleAdd(fwRule); err != nil {
 			return fmt.Errorf("adding fwmark rule: %w", err)
@@ -129,6 +160,29 @@ func (m *Manager) ensureRoutingRules() error {
 		}
 	}
 	return nil
+}
+
+// fwmarkRulePriority returns the ip rule priority for the fwmark rule.
+// It must be AFTER the local routing table rule so that packets to loopback
+// (127.0.0.0/8) are routed via lo before the fwmark rule can send them to
+// the main table's default route. Returns max(localPriority+10, 110),
+// capped below the WireKube table rule at 200.
+func (m *Manager) fwmarkRulePriority() int {
+	localPrio := 0
+	rules, _ := netlink.RuleList(syscall.AF_INET)
+	for _, r := range rules {
+		if r.Table == 255 && r.Priority > localPrio {
+			localPrio = r.Priority
+		}
+	}
+	prio := localPrio + 10
+	if prio < 110 {
+		prio = 110
+	}
+	if prio >= 200 {
+		prio = 199
+	}
+	return prio
 }
 
 func (m *Manager) ruleExists(target *netlink.Rule) bool {
@@ -165,6 +219,11 @@ func (m *Manager) SetAddress(meshIP string) error {
 // InterfaceName returns the WireGuard interface name.
 func (m *Manager) InterfaceName() string {
 	return m.ifaceName
+}
+
+// ListenPort returns the WireGuard UDP listen port.
+func (m *Manager) ListenPort() int {
+	return m.listenPort
 }
 
 // SyncPeers incrementally updates WireGuard peers.
@@ -208,9 +267,12 @@ func (m *Manager) SyncPeers(peers []PeerConfig) error {
 
 		// If peer has a recent handshake, preserve the WG-learned endpoint
 		// to avoid overwriting NAT-mapped addresses.
-		if existing, ok := activePeers[pubKey]; ok {
-			if time.Since(existing.LastHandshakeTime) < 3*time.Minute && existing.Endpoint != nil {
-				endpoint = existing.Endpoint
+		// Exception: ForceEndpoint overrides this for ICE probing.
+		if !p.ForceEndpoint {
+			if existing, ok := activePeers[pubKey]; ok {
+				if time.Since(existing.LastHandshakeTime) < 3*time.Minute && existing.Endpoint != nil {
+					endpoint = existing.Endpoint
+				}
 			}
 		}
 
@@ -268,11 +330,96 @@ func (m *Manager) GetStats() ([]PeerStats, error) {
 // DeleteInterface removes the WireGuard interface and associated routing rules.
 func (m *Manager) DeleteInterface() error {
 	m.removeRoutingRules()
+	m.removeFwmarkLoopback()
 	link, err := netlink.LinkByName(m.ifaceName)
 	if err != nil {
 		return nil // Already gone
 	}
 	return netlink.LinkDel(link)
+}
+
+func (m *Manager) removeFwmarkLoopback() {
+	mark := fmt.Sprintf("0x%x", wkFwMark)
+	args := []string{"-t", "filter", "-D", "KUBE-FIREWALL",
+		"-m", "mark", "--mark", mark,
+		"-d", "127.0.0.0/8", "-j", "ACCEPT",
+		"-m", "comment", "--comment", "wirekube: allow WG relay proxy on loopback"}
+	for exec.Command("iptables", args...).Run() == nil {
+	}
+}
+
+// setRpFilter sets rp_filter=2 (loose mode) on the WireGuard interface.
+// Loose reverse-path filtering accepts packets whose source IP is reachable
+// via any interface, not just the one the packet arrived on. This is required
+// when remote pod CIDRs (e.g. from Cilium hybrid nodes) arrive via the tunnel
+// with source IPs that are not in the main routing table of this node.
+func (m *Manager) setRpFilter() {
+	paths := []string{
+		fmt.Sprintf("/host/proc/sys/net/ipv4/conf/%s/rp_filter", m.ifaceName),
+		fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", m.ifaceName),
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("2"), 0644); err == nil {
+			fmt.Printf("[wireguard] rp_filter=2 set on %s\n", m.ifaceName)
+			return
+		}
+	}
+	fmt.Printf("[wireguard] warning: could not set rp_filter on %s\n", m.ifaceName)
+}
+
+// setLoAcceptLocal enables accept_local on the loopback interface so that the
+// relay proxy socket can receive WireGuard UDP packets whose source IP is the
+// node's physical IP. WireGuard's fwmark routing causes its socket to choose
+// the physical IP as source even for loopback-destined packets; without this
+// sysctl the kernel silently drops them (local address arriving on wrong iface).
+func (m *Manager) setLoAcceptLocal() {
+	paths := []string{
+		"/host/proc/sys/net/ipv4/conf/lo/accept_local",
+		"/proc/sys/net/ipv4/conf/lo/accept_local",
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("1"), 0644); err == nil {
+			fmt.Printf("[wireguard] accept_local=1 set on lo\n")
+			return
+		}
+	}
+	fmt.Printf("[wireguard] warning: could not set accept_local on lo\n")
+}
+
+// AllowFwmarkLoopback adds an iptables exception in the KUBE-FIREWALL chain
+// so that WireGuard fwmark'd packets can reach the relay proxy on loopback.
+// kube-proxy inserts a blanket DROP for non-loopback-source → loopback-dest
+// traffic, which catches WireGuard packets because the kernel selects the
+// node's physical IP as source even for loopback-destined sends.
+// Safe to call repeatedly; exits immediately if the rule already exists.
+func (m *Manager) AllowFwmarkLoopback() {
+	mark := fmt.Sprintf("0x%x", wkFwMark)
+	ruleArgs := []string{
+		"-m", "mark", "--mark", mark,
+		"-d", "127.0.0.0/8", "-j", "ACCEPT",
+		"-m", "comment", "--comment", "wirekube: allow WG relay proxy on loopback",
+	}
+
+	if !m.fwmarkClean {
+		// First call: purge all duplicates left by older agent versions whose
+		// -C check omitted --comment, causing unbounded rule insertions.
+		delArgs := append([]string{"-t", "filter", "-D", "KUBE-FIREWALL"}, ruleArgs...)
+		for exec.Command("iptables", delArgs...).Run() == nil {
+		}
+		m.fwmarkClean = true
+	} else {
+		checkArgs := append([]string{"-t", "filter", "-C", "KUBE-FIREWALL"}, ruleArgs...)
+		if exec.Command("iptables", checkArgs...).Run() == nil {
+			return
+		}
+	}
+
+	insArgs := append([]string{"-t", "filter", "-I", "KUBE-FIREWALL", "1"}, ruleArgs...)
+	if err := exec.Command("iptables", insArgs...).Run(); err != nil {
+		m.fwmarkClean = false
+		return
+	}
+	fmt.Printf("[wireguard] KUBE-FIREWALL exception added for fwmark %s → loopback\n", mark)
 }
 
 func (m *Manager) disableXfrm() {
@@ -300,11 +447,14 @@ func (m *Manager) disableXfrm() {
 }
 
 func (m *Manager) removeRoutingRules() {
-	fwRule := netlink.NewRule()
-	fwRule.Mark = wkFwMark
-	fwRule.Table = 254
-	fwRule.Priority = 100
-	_ = netlink.RuleDel(fwRule)
+	// Remove fwmark rule at the dynamically chosen priority and the legacy 100.
+	for _, prio := range []int{m.fwmarkRulePriority(), 100} {
+		fwRule := netlink.NewRule()
+		fwRule.Mark = wkFwMark
+		fwRule.Table = 254
+		fwRule.Priority = prio
+		_ = netlink.RuleDel(fwRule)
+	}
 
 	wgRule := netlink.NewRule()
 	wgRule.Table = wkRouteTable
@@ -407,6 +557,10 @@ type PeerConfig struct {
 	Endpoint         string
 	AllowedIPs       []string
 	KeepaliveSeconds int
+	// ForceEndpoint overrides the NAT-preservation logic in SyncPeers.
+	// When true, the configured endpoint is always applied even if the peer
+	// has a recent handshake with a different endpoint. Used for ICE probing.
+	ForceEndpoint bool
 }
 
 // PeerStats holds runtime statistics for a WireGuard peer.

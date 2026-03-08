@@ -173,7 +173,7 @@ func (c *Client) readLoop(ctx context.Context) {
 // keepaliveLoop is scoped to a single TCP connection. It exits when the
 // connection changes or the context is cancelled.
 func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -188,11 +188,18 @@ func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
 				return
 			}
 			c.mu.Lock()
+			var writeErr error
 			if c.writer != nil {
-				_ = relayproto.WriteFrame(c.writer, relayproto.MakeKeepaliveFrame())
-				_ = c.writer.Flush()
+				writeErr = relayproto.WriteFrame(c.writer, relayproto.MakeKeepaliveFrame())
+				if writeErr == nil {
+					writeErr = c.writer.Flush()
+				}
 			}
 			c.mu.Unlock()
+			if writeErr != nil {
+				c.signalReconnect()
+				return
+			}
 		}
 	}
 }

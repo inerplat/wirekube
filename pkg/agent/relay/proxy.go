@@ -2,12 +2,11 @@ package relay
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"syscall"
+	"time"
 
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 )
@@ -19,61 +18,44 @@ type Sender interface {
 }
 
 // UDPProxy bridges between kernel WireGuard and the relay TCP connection
-// for a single peer. Uses a connected UDP socket (DialUDP) for port
-// consistency. Writing adaptively selects between Go's conn.Write and raw
-// syscall.Write — the latter bypasses Cilium's cgroup BPF sendmsg hook
-// (cil_sock4_sendmsg) which returns EPERM in some container environments.
+// for a single peer. Uses an unconnected UDP socket (ListenUDP) so that it
+// accepts packets regardless of source IP — necessary because WireGuard's
+// fwmark routing may cause outgoing packets to use the node's physical IP
+// as source even when the destination is loopback.
 type UDPProxy struct {
 	peerPubKey [relayproto.PubKeySize]byte
 	sender     Sender
 	wgPort     int
+	wgAddr     *net.UDPAddr
 
-	conn     *net.UDPConn
-	writeFD  int          // dup'd fd for raw syscall.Write fallback
-	rawMode  atomic.Bool  // true after EPERM detected → use syscall.Write
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	connMu       sync.RWMutex
+	conn         *net.UDPConn
+	recreateOnce sync.Once
+	stopOnce     sync.Once
+	stopCh       chan struct{}
 }
 
 func NewUDPProxy(peerPubKey [relayproto.PubKeySize]byte, sender Sender, wgPort int) (*UDPProxy, error) {
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-	remoteAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: wgPort}
 
-	conn, err := net.DialUDP("udp4", localAddr, remoteAddr)
+	conn, err := net.ListenUDP("udp4", localAddr)
 	if err != nil {
 		return nil, err
-	}
-
-	// Pre-dup the fd for potential raw syscall.Write fallback.
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("getting raw conn: %w", err)
-	}
-	var writeFD int
-	var fdErr error
-	if err := rawConn.Control(func(fd uintptr) {
-		writeFD, fdErr = syscall.Dup(int(fd))
-	}); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("control: %w", err)
-	}
-	if fdErr != nil {
-		conn.Close()
-		return nil, fmt.Errorf("dup fd: %w", fdErr)
 	}
 
 	return &UDPProxy{
 		peerPubKey: peerPubKey,
 		sender:     sender,
 		wgPort:     wgPort,
+		wgAddr:     &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: wgPort},
 		conn:       conn,
-		writeFD:    writeFD,
 		stopCh:     make(chan struct{}),
 	}, nil
 }
 
 func (p *UDPProxy) ListenAddr() string {
+	p.connMu.RLock()
+	defer p.connMu.RUnlock()
 	return p.conn.LocalAddr().String()
 }
 
@@ -86,13 +68,16 @@ func (p *UDPProxy) Run() {
 		default:
 		}
 
-		n, err := p.conn.Read(buf)
+		p.connMu.RLock()
+		conn := p.conn
+		p.connMu.RUnlock()
+
+		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-p.stopCh:
 				return
 			default:
-				log.Printf("relay-proxy: read from wg: %v", err)
 			}
 			continue
 		}
@@ -107,41 +92,75 @@ func (p *UDPProxy) Run() {
 }
 
 // DeliverToWireGuard sends a relay packet to the local WireGuard interface.
-// Adaptively uses conn.Write (standard) or syscall.Write (raw fd) based on
-// whether cgroup BPF EPERM has been detected.
+//
+// Cilium's cgroup BPF sendmsg hook may reject sendto() with EPERM on sockets
+// created during a brief window after pod restart (before Cilium finishes
+// endpoint registration). The EPERM is bound to the socket, not the cgroup —
+// new sockets created after the window work fine.  On EPERM we wait 3 seconds
+// for the BPF state to settle, then close the tainted socket and bind a fresh
+// one on the same port.  WireGuard's retransmissions cover the gap.
 func (p *UDPProxy) DeliverToWireGuard(payload []byte) {
-	if p.rawMode.Load() {
-		if _, err := syscall.Write(p.writeFD, payload); err != nil {
-			log.Printf("relay-proxy: raw write to wg: %v", err)
-		}
-		return
-	}
+	p.connMu.RLock()
+	conn := p.conn
+	p.connMu.RUnlock()
 
-	_, err := p.conn.Write(payload)
+	_, err := conn.WriteTo(payload, p.wgAddr)
 	if err == nil {
 		return
 	}
 
-	// Detect EPERM from cgroup BPF (Cilium cil_sock4_sendmsg or similar).
-	// Switch to raw syscall.Write which uses write(2) on a connected socket,
-	// bypassing BPF_CGROUP_UDP4_SENDMSG (only triggered by sendto/sendmsg
-	// with msg_name set).
 	if errors.Is(err, syscall.EPERM) {
-		log.Printf("relay-proxy: EPERM detected, switching to raw syscall.Write mode")
-		p.rawMode.Store(true)
-		if _, werr := syscall.Write(p.writeFD, payload); werr != nil {
-			log.Printf("relay-proxy: raw write to wg: %v", werr)
-		}
+		log.Printf("relay-proxy: EPERM on port %d, scheduling socket recreation", p.wgPort)
+		go p.recreateConn(payload)
 		return
 	}
 
-	log.Printf("relay-proxy: write to wg: %v", err)
+	log.Printf("relay-proxy: write to wg port %d: %v", p.wgPort, err)
+}
+
+// recreateConn replaces the tainted UDP socket with a fresh one.
+// Binds to the same local port so that the WireGuard peer endpoint
+// remains valid without requiring a config resync.
+func (p *UDPProxy) recreateConn(firstPayload []byte) {
+	p.recreateOnce.Do(func() {
+		select {
+		case <-p.stopCh:
+			return
+		case <-time.After(3 * time.Second):
+		}
+
+		p.connMu.Lock()
+		oldAddr := p.conn.LocalAddr().(*net.UDPAddr)
+		p.conn.Close()
+
+		newConn, err := net.ListenUDP("udp4", oldAddr)
+		if err != nil {
+			fallback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+			newConn, err = net.ListenUDP("udp4", fallback)
+			if err != nil {
+				log.Printf("relay-proxy: socket recreation failed: %v", err)
+				p.connMu.Unlock()
+				return
+			}
+			log.Printf("relay-proxy: bound to new port %s (original %s unavailable)", newConn.LocalAddr(), oldAddr)
+		}
+
+		p.conn = newConn
+		p.connMu.Unlock()
+
+		if _, err := newConn.WriteTo(firstPayload, p.wgAddr); err != nil {
+			log.Printf("relay-proxy: write after recreation on port %d: %v", p.wgPort, err)
+		} else {
+			log.Printf("relay-proxy: EPERM resolved on port %d, listen %s", p.wgPort, newConn.LocalAddr())
+		}
+	})
 }
 
 func (p *UDPProxy) Close() {
 	p.stopOnce.Do(func() {
 		close(p.stopCh)
+		p.connMu.RLock()
 		p.conn.Close()
-		syscall.Close(p.writeFD)
+		p.connMu.RUnlock()
 	})
 }
