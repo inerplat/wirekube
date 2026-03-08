@@ -1,0 +1,25 @@
+---
+# WireKubeMesh with automatic AllowedIPs detection
+# Use case: on-premises or cloud nodes where Node.Status.InternalIP is the
+# correct routable address within the mesh. Eliminates the need to manually
+# kubectl patch each WireKubePeer after node join.
+#
+# Behavior:
+#   - autoAllowedIPs.strategy=node-internal-ip: if AllowedIPs is currently
+#     empty, the agent auto-sets it to <Node.Status.InternalIP>/32.
+#   - If AllowedIPs is already set (manually or previously), it is NOT overwritten.
+#
+# kubectl apply -f config/examples/wirekubemesh-auto-allowedips.yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51822
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
+  autoAllowedIPs:
+    strategy: node-internal-ip
