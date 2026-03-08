@@ -117,6 +117,72 @@ After endpoint discovery:
 - **Handshake timeout**: If any peer's handshake doesn't complete within
   `handshakeTimeoutSeconds` (default 30s), relay is activated for that peer.
 
+### ICE-like Negotiation
+
+WireKube implements an ICE-like (Interactive Connectivity Establishment)
+negotiation protocol to optimize peer connectivity. Unlike full ICE/STUN/TURN,
+it leverages WireGuard's built-in handshake as the connectivity check and
+Kubernetes CRDs as the signaling channel.
+
+#### Candidate Types
+
+Each agent gathers connectivity candidates and publishes them in its
+WireKubePeer status:
+
+| Type | Description | Priority |
+|------|-------------|----------|
+| `host` | Node's internal/LAN IP + WG listen port | 100 |
+| `srflx` | STUN-discovered public endpoint | 200 (cone) / 50 (symmetric) |
+| `relay` | Relay server available | 10 |
+| `prflx` | WireGuard-observed endpoint (learned during handshake) | — |
+
+#### NAT Type Matrix
+
+The agent evaluates the NAT type of both sides to select the optimal strategy:
+
+| Local NAT | Peer NAT | Strategy |
+|-----------|----------|----------|
+| Cone | Cone | Direct probe via STUN endpoints (high success rate) |
+| Cone | Symmetric | Probe with cone's stable endpoint; symmetric peer's keepalive opens pinhole |
+| Symmetric | Cone | Probe peer's stable endpoint; our NAT creates mapping for response |
+| Symmetric | Symmetric | Birthday attack (if enabled) or relay fallback |
+
+#### Same-NAT Detection
+
+When two peers share the same public IP (behind the same NAT gateway), STUN
+endpoints are unreliable — the NAT can only forward a given external port to one
+internal host. WireKube detects this by comparing STUN-discovered IPs and
+switches to the peer's `host` candidate (internal LAN IP) for direct
+communication. If the host candidate probe fails (e.g., peers are in different
+VPCs sharing a NAT gateway), it falls back to relay.
+
+#### Birthday Attack (Symmetric ↔ Symmetric)
+
+For two Symmetric NAT peers, no direct path exists through normal means. The
+birthday attack opens many UDP sockets simultaneously (256 by default), sending
+probes to predicted port ranges on the peer's public IP. With enough entropy,
+the probability of finding a matching port pair is approximately 1 − e^(−n²/2k)
+where n is the number of probes and k is the port range.
+
+!!! warning "Birthday attack considerations"
+    Some NAT gateways may interpret the burst of UDP probes as a port-scanning
+    attack and temporarily block the source. Birthday attack is **disabled by
+    default** and can be enabled via:
+
+    - **Cluster-wide**: `WireKubeMesh.spec.natTraversal.birthdayAttack: enabled`
+    - **Per-peer override**: annotation `wirekube.io/birthday-attack: enabled` on the WireKubePeer
+
+    Priority: peer annotation > mesh global > default (disabled).
+
+#### Endpoint Reflection
+
+When a direct connection succeeds, the WireGuard kernel module learns the
+peer's actual NAT-mapped endpoint (which may differ from the STUN-discovered
+one). The agent detects this change and patches the WireKubePeer CRD so other
+nodes also learn the correct endpoint. To prevent flapping with Symmetric NAT
+ports, endpoint updates for same-IP-different-port cases are only applied when
+ICE confirms the connection is stable.
+
 ### Stage 3: Relay Fallback
 
 When relay is activated for a peer:

@@ -25,11 +25,61 @@ const (
 	NATSymmetric NATType = "symmetric"
 )
 
+// PortPrediction describes the NAT's port allocation pattern observed via STUN.
+type PortPrediction struct {
+	BasePort    int
+	Increment   int
+	Jitter      int
+	SamplePorts []int
+}
+
+// GenerateCandidates produces a list of predicted ports spread around the base.
+// For sequential NATs the list fans out from the predicted next port.
+// For unpredictable NATs it covers a wide range.
+func (pp PortPrediction) GenerateCandidates(n int) []int {
+	if n <= 0 {
+		return nil
+	}
+	ports := make([]int, 0, n)
+
+	if pp.Increment != 0 && pp.Jitter <= abs(pp.Increment)*2 {
+		// Sequential allocation: fan out from predicted next port
+		nextPort := pp.BasePort + pp.Increment
+		for i := 0; i < n; i++ {
+			p := nextPort + pp.Increment*i
+			if p > 0 && p < 65536 {
+				ports = append(ports, p)
+			}
+		}
+	} else {
+		// Random/unpredictable allocation: scan a wide range around the base
+		start := pp.BasePort - n/2
+		if start < 1024 {
+			start = 1024
+		}
+		for i := 0; i < n; i++ {
+			p := start + i
+			if p > 0 && p < 65536 {
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 // STUNResult holds the outcome of a STUN-based endpoint discovery,
-// including NAT type detection.
+// including NAT type detection and port prediction data.
 type STUNResult struct {
-	Endpoint string
-	NATType  NATType
+	Endpoint       string
+	NATType        NATType
+	PortPrediction *PortPrediction
 }
 
 // ErrSymmetricNAT is returned when Symmetric NAT is detected.
@@ -54,6 +104,10 @@ func DiscoverPublicEndpoint(ctx context.Context, localPort int, stunServers []st
 // DiscoverPublicEndpointWithNATType is like DiscoverPublicEndpoint but returns
 // the full STUNResult including detected NAT type instead of an error for
 // Symmetric NAT. The caller can decide how to handle Symmetric NAT.
+//
+// Queries all available STUN servers (minimum 2) to:
+//  1. Detect NAT type by comparing mapped ports.
+//  2. Build a port prediction model for birthday attack traversal.
 func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunServers []string) (*STUNResult, error) {
 	if len(stunServers) == 0 {
 		stunServers = defaultSTUNServers
@@ -65,26 +119,25 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 	}
 	defer conn.Close()
 
-	// Query multiple STUN servers from the same socket for NAT type detection.
 	type stunResponse struct {
 		endpoint string
 		ip       string
-		port     string
+		port     int
 	}
 	var results []stunResponse
 	var lastErr error
 
+	// Query ALL available servers (not just 2) for better port prediction.
 	for _, server := range stunServers {
 		endpoint, err := querySTUN(ctx, conn, server)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		ip, port, _ := net.SplitHostPort(endpoint)
+		ip, portStr, _ := net.SplitHostPort(endpoint)
+		port := 0
+		fmt.Sscanf(portStr, "%d", &port)
 		results = append(results, stunResponse{endpoint: endpoint, ip: ip, port: port})
-		if len(results) >= 2 {
-			break
-		}
 	}
 
 	if len(results) == 0 {
@@ -96,16 +149,74 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATUnknown}, nil
 	}
 
-	// Compare mapped ports from two different STUN servers.
-	// Same port → Endpoint-Independent Mapping (Cone NAT) → direct P2P possible.
-	// Different port → Endpoint-Dependent Mapping (Symmetric NAT) → direct P2P impossible.
-	if results[0].port != results[1].port {
-		fmt.Printf("[stun] symmetric NAT detected: %s (server 1) vs %s (server 2)\n",
-			results[0].endpoint, results[1].endpoint)
-		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATSymmetric}, nil
+	// Collect all observed ports for port prediction.
+	samplePorts := make([]int, len(results))
+	for i, r := range results {
+		samplePorts[i] = r.port
 	}
 
-	return &STUNResult{Endpoint: results[0].endpoint, NATType: NATCone}, nil
+	// Determine NAT type and build port prediction.
+	allSame := true
+	for i := 1; i < len(results); i++ {
+		if results[i].port != results[0].port {
+			allSame = false
+			break
+		}
+	}
+
+	if allSame {
+		return &STUNResult{
+			Endpoint: results[0].endpoint,
+			NATType:  NATCone,
+		}, nil
+	}
+
+	// Symmetric NAT detected — build port prediction model.
+	pp := buildPortPrediction(samplePorts)
+	fmt.Printf("[stun] symmetric NAT detected: ports %v (increment=%d, jitter=%d)\n",
+		samplePorts, pp.Increment, pp.Jitter)
+
+	return &STUNResult{
+		Endpoint:       results[0].endpoint,
+		NATType:        NATSymmetric,
+		PortPrediction: &pp,
+	}, nil
+}
+
+// buildPortPrediction analyzes a sequence of STUN-observed ports to determine
+// the NAT's port allocation pattern.
+func buildPortPrediction(ports []int) PortPrediction {
+	pp := PortPrediction{
+		BasePort:    ports[len(ports)-1],
+		SamplePorts: ports,
+	}
+
+	if len(ports) < 2 {
+		return pp
+	}
+
+	deltas := make([]int, 0, len(ports)-1)
+	for i := 1; i < len(ports); i++ {
+		deltas = append(deltas, ports[i]-ports[i-1])
+	}
+
+	sum := 0
+	for _, d := range deltas {
+		sum += d
+	}
+	avgIncrement := sum / len(deltas)
+	pp.Increment = avgIncrement
+
+	maxJitter := 0
+	for _, d := range deltas {
+		j := abs(d - avgIncrement)
+		if j > maxJitter {
+			maxJitter = j
+		}
+	}
+	pp.Jitter = maxJitter
+
+	return pp
 }
 
 func querySTUN(ctx context.Context, conn *net.UDPConn, server string) (string, error) {

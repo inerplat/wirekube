@@ -24,7 +24,7 @@ This creates two Custom Resource Definitions:
 ## Step 2: Create a Mesh
 
 ```bash
-kubectl apply -f config/wirekubemesh-default.yaml
+kubectl apply -f config/examples/wirekubemesh-basic.yaml
 ```
 
 Or create a custom mesh configuration:

@@ -57,6 +57,7 @@ nav:
     - Quick Start: getting-started/quickstart.md
     - Installation: getting-started/installation.md
     - Configuration: getting-started/configuration.md
+    - EKS Hybrid Nodes: getting-started/eks-hybrid-nodes.md
   - Architecture:
     - Overview: architecture/overview.md
     - NAT Traversal: architecture/nat-traversal.md
