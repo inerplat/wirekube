@@ -119,7 +119,7 @@ wirekube/
 │   ├── agent/           # DaemonSet manifest (includes RBAC)
 │   ├── crd/             # CustomResourceDefinition YAMLs (generated)
 │   ├── relay/           # Relay deployment + service examples
-│   └── wirekubemesh-default.yaml
+│   └── examples/         # WireKubeMesh and EKS Hybrid Node examples
 ├── docs/                # Documentation (MkDocs Material)
 ├── .github/workflows/   # CI (tag-triggered build + test)
 ├── Dockerfile
