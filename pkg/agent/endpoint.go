@@ -29,9 +29,10 @@ const (
 
 // EndpointResult holds a discovered endpoint and how it was found.
 type EndpointResult struct {
-	Endpoint string
-	Method   DiscoveryMethod
-	NATType  nat.NATType
+	Endpoint       string
+	Method         DiscoveryMethod
+	NATType        nat.NATType
+	PortPrediction *nat.PortPrediction
 }
 
 // DiscoverEndpoint attempts to find the public WireGuard endpoint for this node.
@@ -56,15 +57,23 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	if stunResult, err := nat.DiscoverPublicEndpointWithNATType(stunCtx, listenPort, stunServers); err == nil {
 		detectedNATType = stunResult.NATType
 		if stunResult.NATType == nat.NATSymmetric {
-			// Symmetric NAT: mapped port is unreliable, but the public IP is still valid.
-			// Use STUN-discovered IP with the configured listen port for the CRD endpoint.
 			if host, _, err := net.SplitHostPort(stunResult.Endpoint); err == nil {
 				ep := fmt.Sprintf("%s:%d", host, listenPort)
 				fmt.Printf("[endpoint] symmetric NAT: using STUN public IP with listen port → %s\n", ep)
-				return &EndpointResult{Endpoint: ep, Method: MethodSTUN, NATType: nat.NATSymmetric}, nil
+				return &EndpointResult{
+					Endpoint:       ep,
+					Method:         MethodSTUN,
+					NATType:        nat.NATSymmetric,
+					PortPrediction: stunResult.PortPrediction,
+				}, nil
 			}
 		}
-		return &EndpointResult{Endpoint: stunResult.Endpoint, Method: MethodSTUN, NATType: stunResult.NATType}, nil
+		return &EndpointResult{
+			Endpoint:       stunResult.Endpoint,
+			Method:         MethodSTUN,
+			NATType:        stunResult.NATType,
+			PortPrediction: stunResult.PortPrediction,
+		}, nil
 	}
 
 	// 4. AWS EC2 Instance Metadata Service

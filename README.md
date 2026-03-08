@@ -34,11 +34,16 @@ flowchart LR
 ## Features
 
 - **Serverless coordination** — No VPN server; Kubernetes CRDs are the only coordination plane
+- **ICE-like NAT negotiation** — Evaluates NAT type combinations (cone/symmetric) to select optimal connectivity strategy per peer pair
 - **Three-tier NAT traversal** — STUN endpoint discovery → direct P2P → TCP relay fallback
 - **Symmetric NAT detection** — RFC 5780 multi-server STUN probing identifies endpoint-dependent mapping
+- **Same-NAT detection** — Peers sharing a public IP automatically use internal LAN addresses for direct communication
+- **Birthday attack** — Optional symmetric↔symmetric hole punching via concurrent UDP probes (disabled by default, configurable per-peer)
+- **Virtual Gateway (WireKubeGateway)** — Cross-VPC routing with HA failover, SNAT, and automatic CIDR injection/reconciliation
 - **Relay auto-reconnect** — Exponential backoff reconnection (1s–30s) with proxy persistence across TCP drops
 - **Relay pool scaling** — DNS-based multi-instance discovery; agents register on all replicas for seamless failover
 - **Direct path recovery** — Periodic probing upgrades relayed peers back to direct when NAT conditions change
+- **Prometheus metrics** — Peer latency (ICMP), traffic, connection state, transport mode, NAT type on `:9090/metrics`
 - **IPSec coexistence** — `disable_xfrm` + `disable_policy` on the WireGuard interface bypasses existing xfrm policies
 - **CNI compatible** — Routes only node IPs (`/32`, metric 200) through WireGuard; pod CIDRs are never touched
 - **Crash recovery** — initContainer cleans stale routing rules and interfaces from previous runs
@@ -59,17 +64,23 @@ WireKube consists of four components:
 
 **WireKubeMesh** (cluster-scoped, singleton) — Cluster-wide VPN configuration: listen port, interface name, MTU, STUN servers, relay settings.
 
-**WireKubePeer** (cluster-scoped, one per node) — Per-node state: public key, endpoint, allowedIPs. Status includes `natType` (`cone`/`symmetric`), per-peer `peerTransports` map, aggregate `transportMode` (`direct`/`relay`/`mixed`), and discovery method.
+**WireKubePeer** (cluster-scoped, one per node) — Per-node state: public key, endpoint, allowedIPs. Status includes `natType` (`cone`/`symmetric`), per-peer `peerTransports` map, aggregate `transportMode` (`direct`/`relay`/`mixed`), ICE candidates, and discovery method.
+
+**WireKubeGateway** (cluster-scoped) — Virtual gateway for cross-VPC routing. Defines `peerRefs` (HA ordered list), `clientRefs` (authorized peers), `routes` (CIDR ranges), SNAT and health check config. The first healthy peer becomes the active gateway with IP forwarding + MASQUERADE.
 
 ### NAT Traversal
 
 1. **STUN discovery** — Agent queries two or more STUN servers to discover its public `ip:port`. If the mapped ports differ between servers, the node is classified as Symmetric NAT (RFC 5780).
 
-2. **Direct P2P** — Nodes within the same network, between Cone NAT peers, or between Cone and Symmetric NAT peers can handshake directly. A Symmetric NAT node initiates the handshake to the Cone peer's stable STUN endpoint — the Cone NAT accepts the incoming packet, and WireGuard replies to the Symmetric side's actual source address. Only Symmetric ↔ Symmetric pairs require relay (neither side has a predictable port).
+2. **ICE negotiation** — Each agent gathers connectivity candidates (host/srflx/relay) and publishes them in its WireKubePeer status. The NAT type matrix determines the probe strategy: cone↔cone uses STUN endpoints directly; cone↔symmetric uses the cone side's stable endpoint; symmetric↔symmetric attempts birthday attack (if enabled) or stays on relay.
 
-3. **Relay fallback** — If no handshake completes within `handshakeTimeoutSeconds` (default 30s), or if Symmetric NAT is detected, traffic routes through the relay. The relay uses a simple binary frame protocol (`[4B length][1B type][body]`) over TCP. WireGuard encryption is preserved end-to-end.
+3. **Same-NAT optimization** — When two peers share the same public IP, the agent detects this and uses the peer's host candidate (internal LAN IP) instead of the unreliable STUN endpoint. Falls back to relay if internal connectivity fails.
 
-4. **Direct recovery** — Every `directRetryIntervalSeconds` (default 120s), the agent temporarily switches a relayed peer's endpoint to direct and checks for a successful handshake on the next sync. If it works, the relay proxy is removed.
+4. **Direct P2P** — Nodes within the same network, between Cone NAT peers, or between Cone and Symmetric NAT peers can handshake directly. Once a direct connection succeeds, the agent reflects the actual NAT-mapped endpoint back to the CRD for other nodes to learn.
+
+5. **Relay fallback** — If no handshake completes within `handshakeTimeoutSeconds` (default 30s), traffic routes through the relay. The relay uses a binary frame protocol (`[4B length][1B type][body]`) over TCP. WireGuard encryption is preserved end-to-end.
+
+6. **Direct recovery** — Every `directRetryIntervalSeconds` (default 120s), the agent re-probes relayed peers. If direct connectivity has become available, the relay proxy is removed.
 
 ### Routing
 

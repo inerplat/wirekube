@@ -19,9 +19,11 @@ spec:
         app.kubernetes.io/name: wirekube-relay
         app.kubernetes.io/component: relay
     spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: relay-ng
       containers:
         - name: relay
-          image: inerplat/wirekube:latest
+          image: inerplat/wirekube:v0.0.0-dev.14
           command: ["wirekube-relay"]
           args:
             - --addr=:3478
