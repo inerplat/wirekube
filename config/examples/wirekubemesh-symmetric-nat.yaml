@@ -1,0 +1,39 @@
+---
+# WireKubeMesh optimized for Symmetric NAT environments
+# Use case: nodes behind carrier-grade NAT (CGNAT) or strict corporate firewalls
+# where all nodes have Symmetric NAT. Birthday attack gives a chance at direct P2P;
+# relay provides guaranteed fallback.
+#
+# Symmetric↔Symmetric NAT traversal strategy (in order):
+#   1. Birthday attack: open 256 sockets, probe predicted port range simultaneously
+#   2. If birthday attack fails within timeout → fall back to relay
+#   3. Every 120s, re-attempt direct connection to upgrade off relay
+#
+# Per-peer override: annotate WireKubePeer to control birthday attack per node
+#   kubectl annotate wkpeer <name> wirekube.io/birthday-attack=disabled
+#
+# kubectl apply -f config/examples/wirekubemesh-symmetric-nat.yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51822
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
+
+  natTraversal:
+    birthdayAttack: enabled
+
+  relay:
+    mode: auto
+    provider: managed
+    handshakeTimeoutSeconds: 30
+    directRetryIntervalSeconds: 120
+    managed:
+      replicas: 2           # 2 replicas for relay HA; agents register on all
+      serviceType: LoadBalancer
+      port: 3478

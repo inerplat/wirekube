@@ -29,9 +29,6 @@ spec:
     - jsonPath: .status.natType
       name: NAT
       type: string
-    - jsonPath: .status.transportMode
-      name: Mode
-      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -174,6 +171,37 @@ spec:
                   EndpointDiscoveryMethod records how the endpoint was discovered.
                   One of: manual, annotation, stun, aws-metadata, internal-ip
                 type: string
+              iceCandidates:
+                description: |-
+                  ICECandidates lists connectivity candidates gathered by this peer's agent.
+                  Other peers read these to determine the best connectivity path.
+                items:
+                  description: ICECandidate represents a connectivity candidate discovered
+                    by the agent.
+                  properties:
+                    address:
+                      description: Address is the candidate address (IP:port).
+                      type: string
+                    priority:
+                      description: Priority determines candidate pair ordering (higher
+                        is preferred).
+                      format: int32
+                      type: integer
+                    type:
+                      description: 'Type is the candidate type: "host", "srflx", "relay",
+                        "prflx".'
+                      type: string
+                  required:
+                  - address
+                  - priority
+                  - type
+                  type: object
+                type: array
+              iceState:
+                description: |-
+                  ICEState tracks the ICE negotiation phase for observability.
+                  "gathering", "checking", "connected", "failed", "relay"
+                type: string
               lastHandshake:
                 description: LastHandshake is the timestamp of the most recent WireGuard
                   handshake.
@@ -186,12 +214,34 @@ spec:
                   "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
                   Empty string means NAT type was not determined (e.g., only one STUN server responded).
                 type: string
-              peerTransports:
-                additionalProperties:
-                  type: string
+              portPrediction:
                 description: |-
-                  PeerTransports records per-peer transport mode as seen by this node.
-                  Key is the peer CRD name (e.g. "node-worker7"), value is "direct" or "relay".
+                  PortPrediction holds NAT port allocation pattern data.
+                  Used for birthday attack when both peers are behind symmetric NAT.
+                properties:
+                  basePort:
+                    description: BasePort is the last observed STUN-mapped port.
+                    format: int32
+                    type: integer
+                  increment:
+                    description: |-
+                      Increment is the average port increment between successive STUN mappings.
+                      Positive for sequential allocation, 0 for unpredictable.
+                    format: int32
+                    type: integer
+                  jitter:
+                    description: Jitter is the observed variation in increments. High
+                      jitter = unreliable prediction.
+                    format: int32
+                    type: integer
+                  samplePorts:
+                    description: |-
+                      SamplePorts is the list of mapped ports observed from multiple STUN servers
+                      (ordered by query time). Peers use this for refined prediction.
+                    items:
+                      format: int32
+                      type: integer
+                    type: array
                 type: object
               relayLatencyMs:
                 description: |-
@@ -199,14 +249,6 @@ spec:
                   Only set when TransportMode is "relay".
                 format: int32
                 type: integer
-              transportMode:
-                description: |-
-                  TransportMode is the aggregate transport state across all peers.
-                  "direct": all peers reachable via P2P.
-                  "relay": all peers via relay.
-                  "mixed": some direct, some relayed.
-                  Derived from PeerTransports; retained for kubectl column convenience.
-                type: string
             type: object
         type: object
     served: true
