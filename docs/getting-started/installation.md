@@ -23,7 +23,7 @@ kubectl apply -f config/crd/
 Create a mesh configuration. See [Configuration](configuration.md) for all options.
 
 ```bash
-kubectl apply -f config/wirekubemesh-default.yaml
+kubectl apply -f config/examples/wirekubemesh-basic.yaml
 ```
 
 ### 3. Agent DaemonSet

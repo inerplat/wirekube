@@ -33,6 +33,23 @@ support direct P2P regardless of the cloud provider.
 - **Impact:** Direct P2P fails between nodes behind NAT Gateway
 - **Solution:** Relay fallback
 
+### EKS Hybrid Nodes
+
+EKS Hybrid Nodes are external worker nodes (on-premises, other clouds) managed
+by an EKS control plane. WireKube provides full mesh connectivity including
+relay-based fallback and a VGW gateway for `kubectl exec/logs`.
+
+See the [EKS Hybrid Nodes Guide](../getting-started/eks-hybrid-nodes.md) for
+a complete deployment walkthrough.
+
+| Aspect | Detail |
+|--------|--------|
+| CNI | Cilium (from AWS ECR) |
+| Relay | External provider via LoadBalancer |
+| NAT type | Usually Symmetric (cloud NAT) or Cone (home/office router) |
+| VGW gateway | EC2 node forwards VPC traffic to hybrid nodes via WireGuard |
+| kubectl exec/logs | Requires VGW gateway + VPC route table + Source/Dest Check off |
+
 ### Elastic IP
 
 Nodes with EIPs support direct P2P. The agent detects EIPs via IMDSv2:

@@ -75,6 +75,46 @@ Key log messages:
 | `EPERM detected, switching to raw syscall.Write` | Cilium BPF bypass activated |
 | `xfrm bypass enabled on wire_kube` | IPSec xfrm bypass set |
 
+## Prometheus Metrics
+
+The agent exposes Prometheus metrics on `:9090/metrics`. Use the provided
+ServiceMonitor (`config/agent/servicemonitor.yaml`) for Prometheus Operator
+auto-discovery.
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `wirekube_peer_latency_seconds` | Gauge | peer, endpoint, transport | ICMP RTT to peer |
+| `wirekube_peer_bytes_sent_total` | Gauge | peer | Total bytes sent via WireGuard |
+| `wirekube_peer_bytes_received_total` | Gauge | peer | Total bytes received via WireGuard |
+| `wirekube_peer_connected` | Gauge | peer, nat_type | Connection status (1=connected, 0=disconnected) |
+| `wirekube_peer_transport_mode` | Gauge | peer | Transport (1=direct, 2=relay, 3=mixed) |
+| `wirekube_peer_last_handshake_seconds` | Gauge | peer | Seconds since last WireGuard handshake |
+| `wirekube_node_nat_type` | Gauge | node | NAT type (1=cone, 2=symmetric, 0=unknown) |
+| `wirekube_peers_total` | Gauge | — | Total WireKubePeer count |
+| `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |
+
+### Grafana Dashboard
+
+Import the pre-built dashboard from `config/grafana/wirekube-dashboard.json`.
+It includes:
+
+- **Mesh Overview**: peer count, relayed peers, NAT type, connected peers
+- **Peer Latency**: time-series graph with per-peer ICMP RTT
+- **Transport Mode**: color-coded table (direct=green, relay=red, mixed=yellow)
+- **Traffic**: send/receive byte rates per peer
+- **Handshake & Health**: last handshake age and connection state timeline
+
+### ServiceMonitor Setup
+
+```bash
+kubectl apply -f config/agent/servicemonitor.yaml
+```
+
+This creates a headless Service and ServiceMonitor for Prometheus Operator
+to automatically scrape agent metrics.
+
 ## Network Diagnostics
 
 ### Route Table
