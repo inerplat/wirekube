@@ -8,4 +8,7 @@ terraform.tfstate.backup
 site/
 .claude/
 /relay
+/agent
+/operator
+/wirekubectl
 internal/

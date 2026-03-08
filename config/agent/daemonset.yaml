@@ -1,55 +1,9 @@
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: wirekube-agent
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: wirekube-agent
-rules:
-  - apiGroups: ["wirekube.io"]
-    resources: ["wirekubepeers"]
-    verbs: ["get", "list", "create", "patch", "update"]
-  - apiGroups: ["wirekube.io"]
-    resources: ["wirekubepeers/status"]
-    verbs: ["get", "patch", "update"]
-  - apiGroups: ["wirekube.io"]
-    resources: ["wirekubemeshes"]
-    verbs: ["get", "list"]
-  - apiGroups: ["wirekube.io"]
-    resources: ["wirekubegateways"]
-    verbs: ["get", "list"]
-  - apiGroups: ["wirekube.io"]
-    resources: ["wirekubegateways/status"]
-    verbs: ["get", "patch", "update"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: wirekube-agent
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: wirekube-agent
-subjects:
-  - kind: ServiceAccount
-    name: wirekube-agent
-    namespace: kube-system
----
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: wirekube-agent
-  namespace: kube-system
+  namespace: wirekube-system
   labels:
     app: wirekube-agent
 spec:
@@ -101,7 +55,7 @@ spec:
               memory: 16Mi
       containers:
         - name: agent
-          image: inerplat/wirekube:latest
+          image: inerplat/wirekube:v0.0.0-dev.14
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
@@ -112,6 +66,11 @@ spec:
                   fieldPath: spec.nodeName
             - name: WIREKUBE_INTERFACE
               value: "wire_kube"
+            # Uncomment and set for EKS Hybrid Nodes:
+            # - name: KUBERNETES_SERVICE_HOST
+            #   value: "YOUR_EKS_API_ENDPOINT"
+            # - name: KUBERNETES_SERVICE_PORT
+            #   value: "443"
           securityContext:
             capabilities:
               add: ["NET_ADMIN", "SYS_MODULE"]

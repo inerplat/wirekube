@@ -54,8 +54,10 @@ make init-mesh          # Apply default WireKubeMesh CR
 - Creates/updates its own `WireKubePeer` CR; watches all peers and syncs to kernel WireGuard
 - Adds `/32` node routes with metric 200 (higher than CNI, lower priority = less preferred)
 - Falls back to TCP relay after 30s handshake timeout; retries direct every 120s
+- ICE-like negotiation: evaluates NAT type combinations to choose optimal connectivity strategy
 - Gateway: if elected as active gateway, enables IP forwarding + SNAT for cross-VPC routing
 - Startup retry: exponential backoff loop (2s–60s) for API connectivity issues (e.g. CNI delay)
+- Prometheus metrics on `:9090/metrics` (peer latency, traffic, connection state)
 
 **Operator** (`cmd/operator/`) — Cluster-scoped deployment
 - Reconciles `WireKubeMesh` (cluster config), `WireKubePeer` (per-node state/status), and `WireKubeGateway` (VGW)
@@ -75,7 +77,7 @@ make init-mesh          # Apply default WireKubeMesh CR
 | Package | Purpose |
 |---|---|
 | `pkg/api/v1alpha1/` | CRD type definitions (`WireKubeMesh`, `WireKubePeer`, `WireKubeGateway`) |
-| `pkg/agent/` | Agent main logic, endpoint discovery, relay orchestration |
+| `pkg/agent/` | Agent main logic, endpoint discovery, relay orchestration, ICE negotiation, metrics |
 | `pkg/agent/nat/` | STUN (`stun.go`) and UPnP (`upnp.go`) endpoint discovery |
 | `pkg/agent/relay/` | Relay TCP client (`client.go`), UDP proxy (`proxy.go`), multi-instance pool (`pool.go`) |
 | `pkg/relay/` | Relay server and wire protocol |
@@ -84,7 +86,7 @@ make init-mesh          # Apply default WireKubeMesh CR
 
 ### CRDs
 
-**WireKubeMesh** (cluster-scoped singleton) — cluster-wide VPN config including relay settings (`mode: auto|always|never`, `provider: external|managed`).
+**WireKubeMesh** (cluster-scoped singleton) — cluster-wide VPN config including relay settings (`mode: auto|always|never`, `provider: external|managed`) and NAT traversal options (`natTraversal.birthdayAttack: enabled|disabled`).
 
 **WireKubePeer** (cluster-scoped, one per node) — holds public key, endpoint, allowedIPs; status reflects `connected`, `lastHandshake`, `transportMode: direct|relay`.
 
@@ -103,17 +105,24 @@ Inspired by [Tailscale's NAT traversal](https://tailscale.com/blog/how-nat-trave
 
 1. Direct P2P via STUN-discovered public endpoint
 2. TCP relay after 30s handshake timeout (WireGuard encryption preserved end-to-end)
-3. Periodic direct-upgrade probe every 120s (skips peers that self-report as relay-only/symmetric NAT)
-4. Relay auto-reconnect with exponential backoff (1s–30s)
-5. Relay pool: DNS-based multi-instance discovery, agents register on all replicas
+3. ICE-like negotiation with NAT type detection (cone vs symmetric)
+4. Cone ↔ Cone: direct via stable STUN endpoints
+5. Cone ↔ Symmetric: probe using cone side's stable endpoint
+6. Symmetric ↔ Symmetric: birthday attack (disabled by default, configurable via `WireKubeMesh.spec.natTraversal.birthdayAttack` or per-peer annotation `wirekube.io/birthday-attack`)
+7. Same-NAT detection: peers sharing the same public IP use host candidates (LAN IP) for direct communication
+8. NAT endpoint reflection: once a direct connection succeeds, the CRD endpoint is updated to the actual NAT-mapped port
+9. Relay auto-reconnect with exponential backoff (1s–30s)
+10. Relay pool: DNS-based multi-instance discovery, agents register on all replicas
 
 ## Config Layout
 
 ```
 config/
   crd/                        # Auto-generated CRD manifests (do not hand-edit)
-  agent/                      # DaemonSet YAML (includes RBAC)
+  agent/                      # DaemonSet YAML (includes RBAC + ServiceMonitor)
   relay/                      # Relay Deployment + Service examples
+  gateway/                    # WireKubeGateway example CRs
+  grafana/                    # Grafana dashboard JSON
   wirekubemesh-default.yaml   # Example WireKubeMesh CR
 ```
 
