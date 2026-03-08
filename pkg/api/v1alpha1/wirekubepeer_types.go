@@ -34,6 +34,36 @@ type WireKubePeerSpec struct {
 	PersistentKeepalive int32 `json:"persistentKeepalive,omitempty"`
 }
 
+// ICECandidate represents a connectivity candidate discovered by the agent.
+type ICECandidate struct {
+	// Type is the candidate type: "host", "srflx", "relay", "prflx".
+	Type string `json:"type"`
+
+	// Address is the candidate address (IP:port).
+	Address string `json:"address"`
+
+	// Priority determines candidate pair ordering (higher is preferred).
+	Priority int32 `json:"priority"`
+}
+
+// PortPrediction holds NAT port allocation pattern data from STUN observations.
+// Used by peers to predict mapped ports for birthday attack hole punching.
+type PortPrediction struct {
+	// BasePort is the last observed STUN-mapped port.
+	BasePort int32 `json:"basePort,omitempty"`
+
+	// Increment is the average port increment between successive STUN mappings.
+	// Positive for sequential allocation, 0 for unpredictable.
+	Increment int32 `json:"increment,omitempty"`
+
+	// Jitter is the observed variation in increments. High jitter = unreliable prediction.
+	Jitter int32 `json:"jitter,omitempty"`
+
+	// SamplePorts is the list of mapped ports observed from multiple STUN servers
+	// (ordered by query time). Peers use this for refined prediction.
+	SamplePorts []int32 `json:"samplePorts,omitempty"`
+}
+
 // WireKubePeerStatus defines the observed state of WireKubePeer
 type WireKubePeerStatus struct {
 	// Connected indicates whether this peer has an active WireGuard handshake.
@@ -54,25 +84,27 @@ type WireKubePeerStatus struct {
 	// +optional
 	EndpointDiscoveryMethod string `json:"endpointDiscoveryMethod,omitempty"`
 
-	// TransportMode is the aggregate transport state across all peers.
-	// "direct": all peers reachable via P2P.
-	// "relay": all peers via relay.
-	// "mixed": some direct, some relayed.
-	// Derived from PeerTransports; retained for kubectl column convenience.
-	// +optional
-	TransportMode string `json:"transportMode,omitempty"`
-
-	// PeerTransports records per-peer transport mode as seen by this node.
-	// Key is the peer CRD name (e.g. "node-worker7"), value is "direct" or "relay".
-	// +optional
-	PeerTransports map[string]string `json:"peerTransports,omitempty"`
-
 	// NATType indicates the NAT mapping behavior detected on this node via STUN.
 	// "cone": Endpoint-Independent Mapping — stable mapped port, direct P2P capable.
 	// "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
 	// Empty string means NAT type was not determined (e.g., only one STUN server responded).
 	// +optional
 	NATType string `json:"natType,omitempty"`
+
+	// ICECandidates lists connectivity candidates gathered by this peer's agent.
+	// Other peers read these to determine the best connectivity path.
+	// +optional
+	ICECandidates []ICECandidate `json:"iceCandidates,omitempty"`
+
+	// PortPrediction holds NAT port allocation pattern data.
+	// Used for birthday attack when both peers are behind symmetric NAT.
+	// +optional
+	PortPrediction *PortPrediction `json:"portPrediction,omitempty"`
+
+	// ICEState tracks the ICE negotiation phase for observability.
+	// "gathering", "checking", "connected", "failed", "relay"
+	// +optional
+	ICEState string `json:"iceState,omitempty"`
 
 	// RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
 	// Only set when TransportMode is "relay".
@@ -91,7 +123,6 @@ type WireKubePeerStatus struct {
 // +kubebuilder:printcolumn:name="AllowedIPs",type=string,JSONPath=`.spec.allowedIPs`
 // +kubebuilder:printcolumn:name="Connected",type=boolean,JSONPath=`.status.connected`
 // +kubebuilder:printcolumn:name="NAT",type=string,JSONPath=`.status.natType`
-// +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.status.transportMode`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // WireKubePeer represents a WireGuard peer in the mesh.

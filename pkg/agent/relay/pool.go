@@ -198,8 +198,14 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 	return err
 }
 
-// resolve does a DNS lookup on the relay address host to get all IPs
-// (headless service returns all pod IPs).
+// resolve does a DNS lookup on the relay address host to get all IPs.
+// For Kubernetes headless services, DNS returns each pod's private IP, so we
+// connect to each pod separately. For external relays (ELB, public addresses),
+// DNS may return multiple anycast IPs that all route to the same server;
+// connecting to each would register the same WireGuard pubkey multiple times,
+// causing the server to close older connections (EOF loop). To avoid this, we
+// only return private RFC-1918 IPs — if the resolved IPs are all public, the
+// caller falls back to the raw hostname (a single connection).
 func (p *Pool) resolve() []string {
 	host, port, err := net.SplitHostPort(p.relayAddr)
 	if err != nil {
@@ -212,10 +218,31 @@ func (p *Pool) resolve() []string {
 	}
 
 	endpoints := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		endpoints = append(endpoints, net.JoinHostPort(ip, port))
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip != nil && isPrivateIP(ip) {
+			endpoints = append(endpoints, net.JoinHostPort(ipStr, port))
+		}
 	}
 	return endpoints
+}
+
+// isPrivateIP reports whether ip is in a private (RFC-1918 / RFC-4193 / loopback) range.
+func isPrivateIP(ip net.IP) bool {
+	for _, cidr := range []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7",
+		"127.0.0.0/8",
+		"::1/128",
+	} {
+		_, network, _ := net.ParseCIDR(cidr)
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // discoveryLoop periodically re-resolves DNS and connects to new replicas.

@@ -1,25 +1,29 @@
 IMG ?= inerplat/wirekube
-VERSION ?= v0.0.2
+VERSION ?= v0.0.0-dev.14
 
 GO = go
-GOFLAGS =
+
+GOFLAGS = -ldflags="-s -w"
 
 ## ─── Build ───────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build: build-operator build-agent build-relay build-wirekubectl
-
-build-operator:
-	$(GO) build $(GOFLAGS) -o bin/operator ./cmd/operator
+build: build-agent build-relay build-wirekubectl
 
 build-agent:
 	$(GO) build $(GOFLAGS) -o bin/agent ./cmd/agent
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-agent-linux-amd64 ./cmd/agent/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-agent-linux-arm64 ./cmd/agent/
 
 build-relay:
 	$(GO) build $(GOFLAGS) -o bin/relay ./cmd/relay
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-relay-linux-amd64 ./cmd/relay/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-relay-linux-arm64 ./cmd/relay/
 
 build-wirekubectl:
 	$(GO) build $(GOFLAGS) -o bin/wirekubectl ./cmd/wirekubectl
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-amd64 ./cmd/wirekubectl/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-arm64 ./cmd/wirekubectl/
 
 ## ─── Generate ────────────────────────────────────────────────────────────────
 
@@ -29,8 +33,8 @@ generate:
 
 .PHONY: manifests
 manifests:
-	controller-gen crd:generateEmbeddedObjectMeta=true rbac:roleName=wirekube-operator \
-		paths="./pkg/..." output:crd:dir=config/crd
+	controller-gen crd:generateEmbeddedObjectMeta=true \
+		paths="./pkg/api/..." output:crd:dir=config/crd
 
 ## ─── Docker ──────────────────────────────────────────────────────────────────
 
@@ -42,22 +46,28 @@ docker-build:
 docker-push:
 	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG):$(VERSION) --push .
 
+.PHONY: podman-build
+podman-build:
+	podman build --platform linux/amd64 -t $(IMG):$(VERSION)-linux-amd64 .
+	podman build --platform linux/arm64 -t $(IMG):$(VERSION)-linux-arm64 .
+
+
+.PHONY: podman-push
+podman-push: podman-build
+	podman manifest rm $(IMG):$(VERSION) 2>/dev/null || podman rmi $(IMG):$(VERSION) 2>/dev/null || true
+	podman manifest create $(IMG):$(VERSION)
+	podman manifest add $(IMG):$(VERSION) $(IMG):$(VERSION)-linux-amd64
+	podman manifest add $(IMG):$(VERSION) $(IMG):$(VERSION)-linux-arm64
+	podman manifest push --all $(IMG):$(VERSION) docker://$(IMG):$(VERSION)
+
 ## ─── Deploy ──────────────────────────────────────────────────────────────────
 
 .PHONY: install-crds
 install-crds:
 	kubectl apply -f config/crd/
 
-.PHONY: install-rbac
-install-rbac:
-	kubectl apply -f config/rbac/
-
-.PHONY: deploy-operator
-deploy-operator: install-crds install-rbac
-	kubectl apply -f config/operator/
-
 .PHONY: deploy-agent
-deploy-agent:
+deploy-agent: install-crds
 	kubectl apply -f config/agent/
 
 .PHONY: deploy-relay
@@ -65,13 +75,12 @@ deploy-relay:
 	kubectl apply -f config/relay/
 
 .PHONY: deploy
-deploy: deploy-operator deploy-agent
+deploy: deploy-agent deploy-relay
 
 .PHONY: undeploy
 undeploy:
 	kubectl delete -f config/agent/ --ignore-not-found
-	kubectl delete -f config/operator/ --ignore-not-found
-	kubectl delete -f config/rbac/ --ignore-not-found
+	kubectl delete -f config/relay/ --ignore-not-found
 	kubectl delete -f config/crd/ --ignore-not-found
 
 ## ─── Quick start ─────────────────────────────────────────────────────────────
@@ -82,7 +91,7 @@ label-node:
 
 .PHONY: init-mesh
 init-mesh:
-	kubectl apply -f config/operator/wirekubemesh-default.yaml
+	kubectl apply -f config/examples/wirekubemesh-basic.yaml
 
 ## ─── Dev ─────────────────────────────────────────────────────────────────────
 
@@ -101,10 +110,6 @@ fmt:
 .PHONY: tidy
 tidy:
 	$(GO) mod tidy
-
-.PHONY: run-operator
-run-operator:
-	$(GO) run ./cmd/operator
 
 .PHONY: help
 help:
