@@ -1,0 +1,56 @@
+---
+# WireKubeMesh for EKS Hybrid Nodes
+#
+# Key configuration choices:
+#
+#   autoAllowedIPs (node-internal-ip):
+#     Automatically sets AllowedIPs to <InternalIP>/32 for new peers.
+#     Cloud nodes use VPC IPs; hybrid nodes use their on-prem private IPs.
+#
+#   podCIDRRouting (enabled):
+#     Appends Node.Spec.PodCIDR to AllowedIPs. Only Cilium hybrid nodes
+#     have this field; VPC CNI cloud nodes do not and are safely skipped.
+#
+#   relay (auto, external):
+#     Tries direct P2P first (STUN endpoint discovery), falls back to
+#     TCP relay after 30s handshake timeout. Provider is "external" to
+#     avoid CoreDNS dependency at startup (hybrid nodes have no ClusterIP
+#     routing before CNI is ready).
+#
+#   birthdayAttack (enabled):
+#     Maximizes direct P2P chance for Symmetric↔Symmetric NAT pairs
+#     common in home/office networks behind CGNAT.
+#
+# After deploying the relay Service (relay.yaml), update the endpoint:
+#   RELAY_EP=$(kubectl get svc wirekube-relay -n wirekube-system \
+#     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'):3478
+#   kubectl patch wirekubemesh default --type merge \
+#     -p "{\"spec\":{\"relay\":{\"external\":{\"endpoint\":\"${RELAY_EP}\"}}}}"
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  listenPort: 51822
+  interfaceName: wire_kube
+  mtu: 1420
+  stunServers:
+    - stun.cloudflare.com:3478
+    - stun.l.google.com:19302
+
+  autoAllowedIPs:
+    strategy: node-internal-ip
+
+  podCIDRRouting:
+    enabled: true
+
+  natTraversal:
+    birthdayAttack: enabled
+
+  relay:
+    mode: auto
+    provider: external
+    handshakeTimeoutSeconds: 30
+    directRetryIntervalSeconds: 120
+    external:
+      endpoint: "REPLACE_WITH_RELAY_LB:3478"   # ← relay LoadBalancer endpoint

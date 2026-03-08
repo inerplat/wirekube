@@ -1,0 +1,69 @@
+# Cilium Helm values for EKS Hybrid Nodes
+#
+# Install from AWS ECR (matches EKS-tested builds):
+#   helm upgrade --install cilium \
+#     oci://602401143452.dkr.ecr.<REGION>.amazonaws.com/eks/cilium/cilium \
+#     --version <VERSION> --namespace kube-system \
+#     -f config/examples/eks-hybrid/cilium-values.yaml
+#
+# Key settings:
+#   - kubeProxyReplacement: true — replaces kube-proxy with BPF
+#     (must also exclude kube-proxy from hybrid nodes via nodeAffinity patch)
+#   - socketLB.enabled: false — prevents BPF sendmsg hooks from blocking
+#     hostNetwork pods (the WireKube agent uses sendto on localhost)
+#   - k8sServiceHost/Port: explicit EKS API endpoint (required because
+#     hybrid nodes cannot reach the ClusterIP before CNI is ready)
+
+# Only schedule Cilium agent on hybrid nodes
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: eks.amazonaws.com/compute-type
+          operator: In
+          values:
+          - hybrid
+
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4MaskSize: 25
+    clusterPoolIPv4PodCIDRList:
+    - 10.200.0.0/16        # RFC 1918 — must NOT overlap with VPC CIDR, node subnets, or cloud internal ranges
+
+loadBalancer:
+  serviceTopology: true
+
+operator:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: eks.amazonaws.com/compute-type
+            operator: In
+            values:
+            - hybrid
+  unmanagedPodWatcher:
+    restart: false
+
+envoy:
+  enabled: false
+
+# Socket-level LB accelerates service routing via BPF.
+# Cilium's BPF sendmsg hook may transiently return EPERM on hostNetwork
+# UDP sendto() during pod restart (endpoint registration race, ~2-4s).
+# The WireKube agent retries with backoff until the hook clears.
+# Disabling socketLB does not remove the hook when kubeProxyReplacement
+# is enabled; no per-pod exemption exists (cilium/cilium#34225).
+socketLB:
+  enabled: true
+
+kubeProxyReplacement: "true"
+
+# EKS public API endpoint — required for Cilium agent init on hybrid nodes.
+# Replace with your cluster endpoint:
+#   aws eks describe-cluster --name <CLUSTER> --query cluster.endpoint --output text
+k8sServiceHost: "11A6ED051E0F05858986BCADCC41BE96.gr7.ap-northeast-2.eks.amazonaws.com"
+k8sServicePort: "443"

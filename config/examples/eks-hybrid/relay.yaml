@@ -1,0 +1,76 @@
+---
+# WireKube Relay Server
+#
+# Bridges WireGuard UDP over TCP when NAT blocks direct P2P.
+# Deployed on an EC2 node (nodeSelector targets the managed nodegroup).
+# Exposed via LoadBalancer so hybrid nodes can reach it over the internet.
+#
+# Replace the nodeSelector value with your EKS managed nodegroup name.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wirekube-relay
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: wirekube
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wirekube-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wirekube-relay
+        app.kubernetes.io/component: relay
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: relay-ng   # ← your managed nodegroup name
+      containers:
+        - name: relay
+          image: inerplat/wirekube:latest   # ← set your image tag
+          command: ["wirekube-relay"]
+          args:
+            - --addr=:3478
+          ports:
+            - name: relay
+              containerPort: 3478
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 3478
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 3478
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: wirekube
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: wirekube-relay
+  ports:
+    - name: relay
+      port: 3478
+      targetPort: 3478
+      protocol: TCP
