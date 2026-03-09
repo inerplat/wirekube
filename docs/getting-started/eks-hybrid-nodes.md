@@ -15,35 +15,37 @@ WireKube establishes a WireGuard mesh VPN across all nodes, enabling:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ AWS VPC                                                  │
-│                                                          │
-│  EKS Control Plane                                       │
-│  ┌────────────┐                                          │
-│  │ API Server  │──► ENI ──► VPC route ──► EC2 Node ──►   │
-│  └────────────┘              (gateway)    WireGuard      │
-│                                              │           │
-│  ┌────────────────────────────────────────────┤          │
-│  │ EC2 Managed Node                          │          │
-│  │  • VPC CNI (aws-node)                     │          │
-│  │  • wirekube-agent (VGW gateway peer)      │          │
-│  │  • wirekube-relay (TCP relay server)      │          │
-│  │  • IP forwarding + SNAT                   │          │
-│  │  • Source/Dest Check: DISABLED            │          │
-│  └────────────┬──────────────────────────────┘          │
-│               │ LoadBalancer :3478                       │
-└───────────────┼─────────────────────────────────────────┘
-                │ Internet
-  ┌─────────────┼──────────────────────────────────────┐
-  │ On-Premises / External Cloud                       │
-  │             │                                      │
-  │  ┌──────────┴──────┐  ┌──────────────┐             │
-  │  │ Hybrid Node A   │  │ Hybrid Node B│  ...        │
-  │  │ • Cilium CNI    │  │ • Cilium CNI │             │
-  │  │ • wirekube-agent│  │ • agent      │             │
-  │  └─────────────────┘  └──────────────┘             │
-  └────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph VPC["AWS VPC"]
+        API["EKS Control Plane<br/>API Server"]
+        LB["NLB :3478"]
+        subgraph EC2["EC2 Managed Node"]
+            Agent0["wirekube-agent<br/>(VGW · IP fwd + SNAT)"]
+            Relay["wirekube-relay"]
+            VPCCNI["VPC CNI (aws-node)"]
+        end
+    end
+
+    subgraph OnPrem["On-Premises / External Cloud"]
+        subgraph HybridA["Hybrid Node A"]
+            CiliumA["Cilium CNI"]
+            AgentA["wirekube-agent"]
+        end
+        subgraph HybridB["Hybrid Node B"]
+            CiliumB["Cilium CNI"]
+            AgentB["wirekube-agent"]
+        end
+    end
+
+    API -->|"kubelet :10250<br/>(via VGW)"| Agent0
+    Relay -. "exposed via" .-> LB
+    Agent0 <-->|"WireGuard P2P<br/>(UDP direct)"| HybridA
+    Agent0 <-->|"WireGuard P2P<br/>(UDP direct)"| HybridB
+    HybridA <-->|"WireGuard P2P<br/>(UDP direct)"| HybridB
+    HybridA ---|"Relay TCP fallback"| LB
+    HybridB ---|"Relay TCP fallback"| LB
+    HybridA <-->|"Cilium VXLAN<br/>over WireGuard"| HybridB
 ```
 
 ### Four Network Planes

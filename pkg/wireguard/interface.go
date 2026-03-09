@@ -52,6 +52,23 @@ func (m *Manager) Close() error {
 	return m.wgClient.Close()
 }
 
+// InterfaceExists checks whether the WireGuard interface already exists.
+func (m *Manager) InterfaceExists() bool {
+	_, err := netlink.LinkByName(m.ifaceName)
+	return err == nil
+}
+
+// ConfigMatchesKey returns true if the existing WireGuard interface is
+// configured with the same private key as the provided KeyPair.
+// Returns false when the interface does not exist or keys differ.
+func (m *Manager) ConfigMatchesKey(kp *KeyPair) bool {
+	dev, err := m.wgClient.Device(m.ifaceName)
+	if err != nil {
+		return false
+	}
+	return base64.StdEncoding.EncodeToString(dev.PrivateKey[:]) == kp.PrivateKeyBase64()
+}
+
 // EnsureInterface creates the WireGuard interface if it doesn't exist.
 func (m *Manager) EnsureInterface() error {
 	if _, err := netlink.LinkByName(m.ifaceName); err == nil {
@@ -492,6 +509,7 @@ func (m *Manager) AddRoute(dst string) error {
 // SyncRoutes ensures exactly the given CIDRs are routed through the WireGuard interface.
 // Routes present in the kernel but not in desired are removed.
 // Routes in desired but not in kernel are added.
+// Routes whose preferred source IP changed are replaced.
 func (m *Manager) SyncRoutes(desired []string) error {
 	link, err := netlink.LinkByName(m.ifaceName)
 	if err != nil {
@@ -514,17 +532,20 @@ func (m *Manager) SyncRoutes(desired []string) error {
 		return fmt.Errorf("listing routes: %w", err)
 	}
 
-	// Remove stale routes
 	for _, r := range current {
 		if r.Dst == nil {
 			continue
 		}
 		if _, ok := desiredSet[r.Dst.String()]; !ok {
 			_ = netlink.RouteDel(&r)
+			continue
+		}
+		if m.preferredSrc != nil && !m.preferredSrc.Equal(r.Src) {
+			_ = netlink.RouteDel(&r)
 		}
 	}
 
-	// Add missing routes
+	// Add missing routes (including those just deleted for src mismatch)
 	for _, cidr := range desired {
 		if err := m.AddRoute(cidr); err != nil {
 			fmt.Printf("warning: adding route %s: %v\n", cidr, err)

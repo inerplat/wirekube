@@ -3,7 +3,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -49,31 +48,9 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	}
 
 	// 3. STUN-based discovery with Symmetric NAT detection (RFC 5780).
-	// Queries two STUN servers from the same socket; if mapped ports differ,
-	// the node is behind Symmetric NAT and STUN endpoint is unusable for P2P.
-	stunCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	var detectedNATType nat.NATType
-	if stunResult, err := nat.DiscoverPublicEndpointWithNATType(stunCtx, listenPort, stunServers); err == nil {
-		detectedNATType = stunResult.NATType
-		if stunResult.NATType == nat.NATSymmetric {
-			if host, _, err := net.SplitHostPort(stunResult.Endpoint); err == nil {
-				ep := fmt.Sprintf("%s:%d", host, listenPort)
-				fmt.Printf("[endpoint] symmetric NAT: using STUN public IP with listen port → %s\n", ep)
-				return &EndpointResult{
-					Endpoint:       ep,
-					Method:         MethodSTUN,
-					NATType:        nat.NATSymmetric,
-					PortPrediction: stunResult.PortPrediction,
-				}, nil
-			}
-		}
-		return &EndpointResult{
-			Endpoint:       stunResult.Endpoint,
-			Method:         MethodSTUN,
-			NATType:        stunResult.NATType,
-			PortPrediction: stunResult.PortPrediction,
-		}, nil
+	result, detectedNATType := discoverViaSTUN(ctx, listenPort, stunServers)
+	if result != nil {
+		return result, nil
 	}
 
 	// 4. AWS EC2 Instance Metadata Service
@@ -82,8 +59,8 @@ func DiscoverEndpoint(ctx context.Context, node *corev1.Node, listenPort int, st
 	}
 
 	// 5. UPnP / NAT-PMP port forwarding
-	upnpCtx, cancel2 := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel2()
+	upnpCtx, upnpCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer upnpCancel()
 	if res, err := nat.ForwardPortUPnP(upnpCtx, listenPort); err == nil {
 		ep := fmt.Sprintf("%s:%d", res.ExternalIP, res.ExternalPort)
 		return &EndpointResult{Endpoint: ep, Method: MethodUPnP, NATType: detectedNATType}, nil
@@ -197,7 +174,54 @@ func imdsv1PublicIP(port int) string {
 	return fmt.Sprintf("%s:%d", ip, port)
 }
 
-// Suppress unused import warning
-var _ = json.Marshal
-
 const AnnotationEndpoint = "wirekube.io/endpoint"
+
+// discoverViaSTUN attempts STUN-based endpoint discovery and NAT type detection.
+// Tries the WireGuard listen port first; if unavailable (interface already running),
+// retries on an ephemeral port for NAT type detection only.
+// Returns the endpoint result (nil if STUN failed entirely) and the detected NAT type.
+func discoverViaSTUN(ctx context.Context, listenPort int, stunServers []string) (*EndpointResult, nat.NATType) {
+	stunCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if sr, err := nat.DiscoverPublicEndpointWithNATType(stunCtx, listenPort, stunServers); err == nil {
+		return buildSTUNResult(sr, listenPort, false), sr.NATType
+	}
+
+	// Listen port may be held by an existing WireGuard interface (restart
+	// preservation). Retry on an ephemeral port — NAT type detection only
+	// needs to compare mapped ports across STUN servers.
+	probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer probeCancel()
+	sr, err := nat.DiscoverPublicEndpointWithNATType(probeCtx, 0, stunServers)
+	if err != nil {
+		return nil, nat.NATUnknown
+	}
+	fmt.Printf("[endpoint] STUN on listen port failed; NAT type detected via ephemeral port: %s\n", sr.NATType)
+	return buildSTUNResult(sr, listenPort, true), sr.NATType
+}
+
+// buildSTUNResult converts a raw STUN result into an EndpointResult.
+//
+// useListenPort=false (bound to WG listen port): for cone NAT the mapped port
+// equals the WG port, so the STUN endpoint is used as-is. For symmetric NAT
+// the mapped port is unstable and gets replaced with listenPort.
+//
+// useListenPort=true (bound to ephemeral port): the mapped port reflects the
+// ephemeral source, not WG. Always substitute listenPort.
+func buildSTUNResult(sr *nat.STUNResult, listenPort int, useListenPort bool) *EndpointResult {
+	ep := sr.Endpoint
+	if useListenPort || sr.NATType == nat.NATSymmetric {
+		host, _, err := net.SplitHostPort(sr.Endpoint)
+		if err != nil {
+			return nil
+		}
+		ep = fmt.Sprintf("%s:%d", host, listenPort)
+	}
+	return &EndpointResult{
+		Endpoint:       ep,
+		Method:         MethodSTUN,
+		NATType:        sr.NATType,
+		PortPrediction: sr.PortPrediction,
+	}
+}

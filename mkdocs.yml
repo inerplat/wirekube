@@ -66,6 +66,7 @@ nav:
     - CNI Compatibility: architecture/cni-compatibility.md
   - Operations:
     - Deployment Topologies: operations/topologies.md
+    - Node Management: operations/node-management.md
     - Monitoring: operations/monitoring.md
     - Troubleshooting: operations/troubleshooting.md
   - Reference:

@@ -1,0 +1,94 @@
+# WireKube Cleanup Job
+#
+# Removes the WireGuard interface, routing rules, and routes from a node
+# that is being permanently removed from the mesh.
+#
+# The agent intentionally preserves WireGuard kernel state across pod restarts
+# for zero-downtime operation. Run this job only when decommissioning a node.
+#
+# Usage:
+#   1. Replace NODE_NAME with the target node name.
+#   2. Delete the WireKubePeer CR for this node:
+#        kubectl delete wirekubepeer <node-name>
+#   3. Apply this job:
+#        kubectl apply -f cleanup-job.yaml
+#   4. Verify and clean up:
+#        kubectl logs job/wirekube-cleanup-<node-name>
+#        kubectl delete job wirekube-cleanup-<node-name>
+#
+# Alternatively, use the one-liner:
+#   NODE=<node-name> && kubectl delete wirekubepeer $NODE && \
+#     sed "s/TARGET_NODE_NAME/$NODE/g" cleanup-job.yaml | kubectl apply -f -
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wirekube-cleanup-TARGET_NODE_NAME
+  namespace: wirekube-system
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      nodeName: TARGET_NODE_NAME
+      hostNetwork: true
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: cleanup
+          image: alpine:3.21
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              IFACE="${WIREKUBE_INTERFACE:-wire_kube}"
+              echo "WireKube cleanup on $(hostname)"
+
+              # Remove iptables rules
+              MARK="0x574b"
+              iptables -t filter -D KUBE-FIREWALL \
+                -m mark --mark "$MARK" -d 127.0.0.0/8 -j ACCEPT \
+                -m comment --comment "wirekube: allow WG relay proxy on loopback" 2>/dev/null || true
+
+              # Flush routes in WireKube table
+              ip route flush table 22347 2>/dev/null || true
+
+              # Remove ip rules
+              ip rule del prio 200 table 22347 2>/dev/null || true
+              # Try multiple fwmark rule priorities (agent auto-selects based on local table)
+              for prio in 100 110 120 130 140 150 160 170 180 190 199; do
+                ip rule del prio "$prio" fwmark "$MARK" 2>/dev/null || true
+              done
+
+              # Delete WireGuard interface
+              if ip link show "$IFACE" >/dev/null 2>&1; then
+                ip link delete "$IFACE"
+                echo "interface $IFACE deleted"
+              else
+                echo "interface $IFACE not found (already clean)"
+              fi
+
+              # Clean up key material
+              rm -rf /var/lib/wirekube
+              echo "key material removed"
+
+              echo "cleanup complete"
+          env:
+            - name: WIREKUBE_INTERFACE
+              value: "wire_kube"
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: wireguard-keys
+              mountPath: /var/lib/wirekube
+          resources:
+            limits:
+              cpu: 50m
+              memory: 16Mi
+      volumes:
+        - name: wireguard-keys
+          hostPath:
+            path: /var/lib/wirekube
+            type: DirectoryOrCreate
