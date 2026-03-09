@@ -120,7 +120,6 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 
-			log.Printf("relay: forwarding %d bytes from %x to %x", len(payload), pubKey[:8], destKey[:8])
 			outFrame := MakeDataFrame(pubKey, payload)
 			dest.mu.Lock()
 			err = WriteFrame(dest.writer, outFrame)

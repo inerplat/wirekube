@@ -20,37 +20,37 @@ var (
 		Namespace: "wirekube",
 		Name:      "peer_latency_seconds",
 		Help:      "ICMP round-trip time to a peer in seconds.",
-	}, []string{"peer", "endpoint", "transport"})
+	}, []string{"source", "peer", "transport"})
 
 	peerBytesSent = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_bytes_sent_total",
 		Help:      "Total bytes sent to a WireGuard peer.",
-	}, []string{"peer"})
+	}, []string{"source", "peer"})
 
 	peerBytesReceived = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_bytes_received_total",
 		Help:      "Total bytes received from a WireGuard peer.",
-	}, []string{"peer"})
+	}, []string{"source", "peer"})
 
 	peerConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_connected",
 		Help:      "Whether a peer has a recent WireGuard handshake (1=yes, 0=no).",
-	}, []string{"peer", "nat_type"})
+	}, []string{"source", "peer", "nat_type"})
 
 	peerTransport = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_transport_mode",
-		Help:      "Transport mode gauge (1=direct, 2=relay, 3=mixed).",
-	}, []string{"peer"})
+		Help:      "Transport mode gauge (1=direct, 2=relay).",
+	}, []string{"source", "peer"})
 
 	peerLastHandshake = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_last_handshake_seconds",
 		Help:      "Seconds since the last WireGuard handshake.",
-	}, []string{"peer"})
+	}, []string{"source", "peer"})
 
 	nodeNATType = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
@@ -69,9 +69,23 @@ var (
 		Name:      "relayed_peers_total",
 		Help:      "Number of peers currently using relay transport.",
 	})
+
+	directPeersCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "direct_peers_total",
+		Help:      "Number of peers currently using direct P2P transport.",
+	})
+
+	peerICEStateMetric = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_ice_state",
+		Help:      "ICE negotiation state for a peer (0=relay, 1=gathering, 2=checking, 3=connected, 4=birthday, 5=failed).",
+	}, []string{"source", "peer"})
 )
 
 // updateMetrics publishes Prometheus metrics from WireGuard stats and peer CRDs.
+// All per-peer metrics include a "source" label set to this node's name, allowing
+// Grafana to distinguish which agent is reporting and build proper mesh views.
 func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
 	stats, err := a.wgMgr.GetStats()
 	if err != nil {
@@ -90,12 +104,13 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 		}{s.BytesSent, s.BytesReceived, s.LastHandshake, s.ActualEndpoint}
 	}
 
-	myPeerName := a.nodeName
+	me := a.nodeName
 	relayed := 0
+	direct := 0
 
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
-		if p.Name == myPeerName {
+		if p.Name == me {
 			natVal := float64(0)
 			switch a.detectedNATType {
 			case "cone":
@@ -103,36 +118,57 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			case "symmetric":
 				natVal = 2
 			}
-			nodeNATType.WithLabelValues(myPeerName).Set(natVal)
+			nodeNATType.WithLabelValues(me).Set(natVal)
 			continue
 		}
 
 		s, ok := statsByKey[p.Spec.PublicKey]
 		if ok {
-			peerBytesSent.WithLabelValues(p.Name).Set(float64(s.sent))
-			peerBytesReceived.WithLabelValues(p.Name).Set(float64(s.recv))
+			peerBytesSent.WithLabelValues(me, p.Name).Set(float64(s.sent))
+			peerBytesReceived.WithLabelValues(me, p.Name).Set(float64(s.recv))
 
 			connected := float64(0)
 			if !s.handshake.IsZero() && time.Since(s.handshake) < 3*time.Minute {
 				connected = 1
 			}
-			peerConnected.WithLabelValues(p.Name, p.Status.NATType).Set(connected)
+			peerConnected.WithLabelValues(me, p.Name, p.Status.NATType).Set(connected)
 
 			if !s.handshake.IsZero() {
-				peerLastHandshake.WithLabelValues(p.Name).Set(time.Since(s.handshake).Seconds())
+				peerLastHandshake.WithLabelValues(me, p.Name).Set(time.Since(s.handshake).Seconds())
 			}
 		}
 
-		transport := float64(1) // direct
-		if a.relayedPeers[p.Name] {
-			transport = 2 // relay
+		isRelayed := a.relayedPeers[p.Name]
+		transport := float64(1)
+		if isRelayed {
+			transport = 2
 			relayed++
+		} else {
+			direct++
 		}
-		peerTransport.WithLabelValues(p.Name).Set(transport)
+		peerTransport.WithLabelValues(me, p.Name).Set(transport)
+
+		iceVal := float64(0)
+		if state, exists := a.iceStates[p.Name]; exists {
+			switch state.State {
+			case iceStateGathering:
+				iceVal = 1
+			case iceStateChecking:
+				iceVal = 2
+			case iceStateConnected:
+				iceVal = 3
+			case iceStateBirthday:
+				iceVal = 4
+			case iceStateFailed:
+				iceVal = 5
+			}
+		}
+		peerICEStateMetric.WithLabelValues(me, p.Name).Set(iceVal)
 	}
 
 	peerCount.Set(float64(len(peerList.Items)))
 	relayedPeersCount.Set(float64(relayed))
+	directPeersCount.Set(float64(direct))
 }
 
 // measurePeerLatency runs a single ICMP ping to each connected peer and
@@ -169,7 +205,7 @@ func (a *Agent) measurePeerLatency(peerList *wirekubev1alpha1.WireKubePeerList) 
 
 		rtt := pingHost(target)
 		if rtt >= 0 {
-			peerLatency.WithLabelValues(p.Name, p.Spec.Endpoint, transport).Set(rtt)
+			peerLatency.WithLabelValues(myPeerName, p.Name, transport).Set(rtt)
 		}
 	}
 }

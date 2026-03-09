@@ -73,8 +73,9 @@ spec:
 | `port` | int | No | `3478` | Relay service port |
 
 When `provider: managed`, the agent discovers the relay's externally reachable
-address by querying the Service (ExternalIP → LB Ingress → NodePort). If no
-external address is found, it falls back to `wirekube-relay.wirekube-system.svc.cluster.local:<port>`.
+address by querying the Service (ExternalIP → LB Ingress → NodePort). The agent
+does **not** fall back to ClusterIP DNS because CoreDNS may be unreachable on
+hybrid/NAT'd nodes before the mesh tunnel is established.
 
 For multi-instance scaling, use a Headless Service. The relay pool re-resolves
 DNS every 30s to track replica changes.

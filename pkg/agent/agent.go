@@ -51,8 +51,14 @@ type Agent struct {
 	directEndpoints map[string]string
 	// directRetryTime tracks the last time we attempted direct connectivity for a relayed peer.
 	directRetryTime map[string]time.Time
-	// directProbing tracks peers currently being probed for direct connectivity.
+	// directProbing tracks peers being actively probed (ForceEndpoint=true).
 	directProbing map[string]bool
+	// passiveProbing tracks peers in passive observation mode.
+	// WG endpoint is NOT changed — we observe if the peer initiates direct.
+	passiveProbing map[string]time.Time
+	// relayGracePeers tracks peers whose relay should be closed after one more cycle.
+	// Allows make-before-break: WG switches to direct first, relay closes next cycle.
+	relayGracePeers map[string]bool
 	// iceStates tracks per-peer ICE negotiation state.
 	iceStates map[string]*peerICEState
 	// holePunchEndpoints maps peer name → birthday-attack proxy listen address.
@@ -63,6 +69,10 @@ type Agent struct {
 	portPrediction *nat.PortPrediction
 	// gwState tracks gateway configuration when this node serves as a VGW.
 	gwState *gatewayState
+	// wasInterfacePreserved is set during setup when an existing WireGuard
+	// interface was reused. Used to shorten the initial relayRetry so that
+	// direct upgrade probing starts sooner after restart.
+	wasInterfacePreserved bool
 	// gwClientCache maps gateway CIDR → set of authorized client peer names.
 	// Rebuilt every sync cycle. nil means not yet built.
 	gwClientCache map[string]map[string]bool
@@ -86,6 +96,8 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName string
 		directEndpoints:    make(map[string]string),
 		directRetryTime:    make(map[string]time.Time),
 		directProbing:      make(map[string]bool),
+		passiveProbing:     make(map[string]time.Time),
+		relayGracePeers:    make(map[string]bool),
 		iceStates:          make(map[string]*peerICEState),
 		holePunchEndpoints: make(map[string]string),
 	}
@@ -95,8 +107,10 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName string
 // Setup is retried with exponential backoff to handle transient failures
 // such as CNI not yet installed (DNS/API server unreachable).
 func (a *Agent) Run(ctx context.Context) error {
-	// Clean up stale interface from previous runs
-	_ = a.wgMgr.DeleteInterface()
+	// WireGuard interface is intentionally NOT deleted here.
+	// If the interface already exists from a previous run with the same key,
+	// it continues forwarding traffic during the restart window.
+	// setup() validates the config and recreates only on mismatch.
 
 	backoff := 2 * time.Second
 	const maxBackoff = 60 * time.Second
@@ -135,10 +149,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// cleanup removes WireGuard routes and interface on shutdown.
+// cleanup releases user-space resources on shutdown.
+// The WireGuard kernel interface and routes are intentionally preserved so that
+// direct P2P tunnels continue forwarding traffic across agent restarts.
+// Full interface teardown (routes + link deletion) is deferred to an explicit
+// cleanup job or CR deletion — see config/cleanup/ and docs.
 func (a *Agent) cleanup() {
-	fmt.Printf("[cleanup] removing routes and WireGuard interface %s\n", a.wgMgr.InterfaceName())
-	// Close birthday-attack hole-punch proxies.
+	fmt.Printf("[cleanup] releasing user-space resources (WireGuard interface %s preserved)\n", a.wgMgr.InterfaceName())
 	for name, state := range a.iceStates {
 		if state.holePunch != nil {
 			state.holePunch.Close()
@@ -149,12 +166,6 @@ func (a *Agent) cleanup() {
 	a.cleanupGateway()
 	if a.relayPool != nil {
 		a.relayPool.Close()
-	}
-	if err := a.wgMgr.SyncRoutes(nil); err != nil {
-		fmt.Printf("[cleanup] warning: flushing routes: %v\n", err)
-	}
-	if err := a.wgMgr.DeleteInterface(); err != nil {
-		fmt.Printf("[cleanup] warning: deleting interface: %v\n", err)
 	}
 }
 
@@ -176,6 +187,20 @@ func (a *Agent) setup(ctx context.Context) error {
 
 	if err := a.applyMeshDefaults(ctx, mesh); err != nil {
 		fmt.Printf("warning: applying mesh defaults: %v\n", err)
+	}
+
+	// If the WireGuard interface survives from a previous run, validate that
+	// the key matches. A mismatch (e.g. /var/lib/wirekube deleted and
+	// regenerated) requires a full teardown before reconfiguration.
+	if a.wgMgr.InterfaceExists() {
+		if a.wgMgr.ConfigMatchesKey(kp) {
+			fmt.Printf("[setup] existing WireGuard interface %s matches key — reusing\n", a.wgMgr.InterfaceName())
+			a.wasInterfacePreserved = true
+		} else {
+			fmt.Printf("[setup] key mismatch on existing interface — recreating\n")
+			_ = a.wgMgr.SyncRoutes(nil)
+			_ = a.wgMgr.DeleteInterface()
+		}
 	}
 
 	// Discover endpoint BEFORE creating WireGuard interface.
@@ -222,6 +247,12 @@ func (a *Agent) setup(ctx context.Context) error {
 	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64()); err != nil {
 		fmt.Printf("warning: relay init failed (will retry): %v\n", err)
 	}
+
+	// Recover ICE state from surviving WireGuard peers. If the interface was
+	// preserved across a restart, peers with a recent handshake and a non-local
+	// endpoint are already directly connected — mark them as such so the agent
+	// doesn't force them through relay and wait relayRetry (120s) before probing.
+	a.recoverICEStateFromWG()
 
 	// Publish ICE candidates and port prediction to CRD.
 	candidates := a.gatherICECandidates(epResult)
@@ -301,14 +332,36 @@ func applyAutoAllowedIPs(mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node,
 	if mesh == nil || node == nil {
 		return
 	}
-	// Auto-set InternalIP/32 only when AllowedIPs is currently empty.
 	if mesh.Spec.AutoAllowedIPs != nil &&
 		mesh.Spec.AutoAllowedIPs.Strategy == "node-internal-ip" &&
 		len(spec.AllowedIPs) == 0 {
+		// Collect IPs owned by tunnel/virtual interfaces so we can skip them.
+		// Kubelet may report a WireGuard or VPN interface IP as InternalIP
+		// (e.g. wg0 10.10.0.x), which must not be used for mesh routing.
+		tunnelIPs := tunnelInterfaceIPs()
+
 		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				spec.AllowedIPs = []string{addr.Address + "/32"}
-				break
+			if addr.Type != corev1.NodeInternalIP {
+				continue
+			}
+			ip := net.ParseIP(addr.Address)
+			if ip == nil || !ip.IsPrivate() {
+				continue
+			}
+			if tunnelIPs[addr.Address] {
+				fmt.Printf("[autoAllowedIPs] skipping %s (belongs to tunnel/virtual interface)\n", addr.Address)
+				continue
+			}
+			spec.AllowedIPs = []string{addr.Address + "/32"}
+			break
+		}
+		// Fallback: scan host network interfaces. Cloud providers (e.g. OCI)
+		// may assign both a public and private IP on the same interface but
+		// only report the public one to Kubernetes as InternalIP.
+		if len(spec.AllowedIPs) == 0 {
+			if privateIP := discoverHostPrivateIP(node); privateIP != "" {
+				spec.AllowedIPs = []string{privateIP + "/32"}
+				fmt.Printf("[autoAllowedIPs] discovered private IP %s from host interface\n", privateIP)
 			}
 		}
 	}
@@ -316,6 +369,103 @@ func applyAutoAllowedIPs(mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node,
 	if mesh.Spec.PodCIDRRouting != nil && mesh.Spec.PodCIDRRouting.Enabled && node.Spec.PodCIDR != "" {
 		spec.AllowedIPs = mergeCIDRs(spec.AllowedIPs, []string{node.Spec.PodCIDR})
 	}
+}
+
+// tunnelInterfaceIPs returns a set of IPv4 addresses assigned to tunnel and
+// virtual interfaces (WireGuard, VPN, container bridges, etc.). These must be
+// excluded from autoAllowedIPs to prevent the agent from advertising a tunnel
+// IP as its reachable mesh address.
+func tunnelInterfaceIPs() map[string]bool {
+	result := make(map[string]bool)
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return result
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if !isVirtualInterface(iface.Name) && !isTunnelInterface(iface) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ipNet.IP.To4() != nil {
+				result[ipNet.IP.String()] = true
+			}
+		}
+	}
+	return result
+}
+
+// isTunnelInterface detects point-to-point tunnel interfaces (WireGuard, GRE, etc.)
+// by checking interface flags. POINTOPOINT interfaces without BROADCAST are tunnels.
+func isTunnelInterface(iface net.Interface) bool {
+	const flagPointToPoint = net.FlagPointToPoint
+	return iface.Flags&flagPointToPoint != 0 && iface.Flags&net.FlagBroadcast == 0
+}
+
+// discoverHostPrivateIP finds a private IP on the same host interface that
+// carries the node's Kubernetes InternalIP. This handles cloud providers where
+// the K8s node address only lists the public IP but the interface also has a
+// private IP (e.g. OCI with /32 public + /24 private on the same NIC).
+// The agent runs with hostNetwork: true, so net.Interfaces() returns host NICs.
+func discoverHostPrivateIP(node *corev1.Node) string {
+	var nodeIP net.IP
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			nodeIP = net.ParseIP(addr.Address)
+			break
+		}
+	}
+	if nodeIP == nil {
+		return ""
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		hasNodeIP := false
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ipNet.IP.Equal(nodeIP) {
+				hasNodeIP = true
+				break
+			}
+		}
+		if !hasNodeIP {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ipNet.IP.To4() != nil && ipNet.IP.IsPrivate() {
+				return ipNet.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
 // mergeCIDRs returns a deduplicated union of two CIDR slices, preserving order.
@@ -452,8 +602,26 @@ func (a *Agent) sync(ctx context.Context) error {
 		fmt.Printf("warning: syncing own pod CIDR: %v\n", err)
 	}
 
+	// Close relay proxies for peers upgraded to direct in the previous cycle.
+	// This is the "break" half of make-before-break: WG was switched to direct
+	// last cycle, so the relay proxy is no longer needed.
+	a.processRelayGrace()
+
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
+
+	// After the first ICE cycle post-restart, restore the normal relayRetry interval.
+	if a.wasInterfacePreserved && a.relayRetry == restartRelayRetry {
+		mesh, err := a.getMesh(ctx)
+		if err == nil && mesh.Spec.Relay != nil {
+			a.relayRetry = time.Duration(mesh.Spec.Relay.DirectRetryIntervalSeconds) * time.Second
+			if a.relayRetry == 0 {
+				a.relayRetry = 120 * time.Second
+			}
+			fmt.Printf("[relay] restoring normal relay retry interval %s\n", a.relayRetry)
+		}
+		a.wasInterfacePreserved = false
+	}
 
 	// Reflect NAT-mapped endpoints back to CRDs (only for direct peers)
 	a.reflectNATEndpoints(ctx, peerList)
@@ -508,13 +676,13 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 		if !ok || s.ActualEndpoint == "" {
 			continue
 		}
-		if time.Since(s.LastHandshake) > 3*time.Minute {
+		if time.Since(s.LastHandshake) > handshakeValidWindow {
 			continue
 		}
 		if s.ActualEndpoint == p.Spec.Endpoint {
 			continue
 		}
-		if len(s.ActualEndpoint) > 10 && s.ActualEndpoint[:10] == "127.0.0.1:" {
+		if isLocalhostEndpoint(s.ActualEndpoint) {
 			continue
 		}
 
@@ -567,7 +735,7 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeer
 		if !s.LastHandshake.IsZero() && s.LastHandshake.After(lastHandshake) {
 			lastHandshake = s.LastHandshake
 		}
-		if time.Since(s.LastHandshake) < 3*time.Minute {
+		if time.Since(s.LastHandshake) < handshakeValidWindow {
 			connected = true
 		}
 	}
@@ -637,7 +805,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	relay := mesh.Spec.Relay
 	a.relayMode = relay.Mode
-	if a.relayMode == "never" {
+	if a.relayMode == relayModeNever {
 		return nil
 	}
 
@@ -648,6 +816,13 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	a.relayRetry = time.Duration(relay.DirectRetryIntervalSeconds) * time.Second
 	if a.relayRetry == 0 {
 		a.relayRetry = 120 * time.Second
+	}
+
+	// After restart with a preserved interface, use a shorter initial retry
+	// so direct upgrade probing starts quickly instead of waiting the full 120s.
+	if a.wasInterfacePreserved {
+		a.relayRetry = restartRelayRetry
+		fmt.Printf("[relay] interface preserved — using shortened relay retry %s for initial probing\n", a.relayRetry)
 	}
 
 	var endpoint string
@@ -664,7 +839,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		}
 		endpoint = a.discoverManagedRelay(ctx, port)
 		if endpoint == "" {
-			endpoint = fmt.Sprintf("wirekube-relay.wirekube-system.svc.cluster.local:%d", port)
+			return fmt.Errorf("managed relay: no externally reachable address found on wirekube-relay Service (LB/NodePort not ready yet)")
 		}
 	default:
 		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
@@ -697,11 +872,11 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 //   - If a direct probe is active, the direct endpoint is returned temporarily.
 //   - Birthday-attack hole-punched paths use a local proxy address.
 func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stats map[string]wireguard.PeerStats) string {
-	if a.relayPool == nil || a.relayMode == "never" {
+	if a.relayPool == nil || a.relayMode == relayModeNever {
 		return peer.Spec.Endpoint
 	}
 
-	if a.relayMode == "always" {
+	if a.relayMode == relayModeAlways {
 		return a.enableRelayForPeer(peer)
 	}
 
@@ -726,8 +901,8 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 
 	// Check if peer already has a healthy direct connection.
 	s, hasStats := stats[peer.Spec.PublicKey]
-	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < 3*time.Minute
-	if hasRecentHandshake && !a.relayedPeers[peer.Name] && !isLocalhostEndpoint(s.ActualEndpoint) {
+	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < handshakeValidWindow
+	if hasRecentHandshake && !a.relayedPeers[peer.Name] && s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 		iceState.State = iceStateConnected
 		a.setICEState(peer.Name, iceState)
 		return peer.Spec.Endpoint
@@ -798,10 +973,11 @@ func (a *Agent) disableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
 }
 
 // discoverManagedRelay queries the wirekube-relay Service to find an externally
-// reachable address. This avoids the chicken-and-egg problem where the ClusterIP
-// is only reachable through the CNI — which might not work yet for NAT'd nodes.
+// reachable address. CoreDNS service domains (ClusterIP) are NOT used because
+// they require a functioning CNI, which may not be available on hybrid/NAT'd
+// nodes at startup.
 //
-// Priority: LoadBalancer externalIP → LoadBalancer ingress → NodePort via node public IP → "" (fallback to ClusterIP DNS).
+// Priority: ExternalIPs → LB ingress IP/hostname → NodePort via public node IP.
 func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
 	svc := &corev1.Service{}
 	if err := a.client.Get(ctx, client.ObjectKey{
@@ -835,7 +1011,9 @@ func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
 		}
 	}
 
-	// 3. NodePort — find a cluster node with a public IP and use NodePort
+	// 3. NodePort — find a cluster node with a public IP and use NodePort.
+	// Checks ExternalIP first, then InternalIP (some cloud providers like
+	// OCI register the public IP as InternalIP).
 	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer || svc.Spec.Type == corev1.ServiceTypeNodePort {
 		var nodePort int32
 		for _, p := range svc.Spec.Ports {
@@ -845,21 +1023,45 @@ func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
 			}
 		}
 		if nodePort != 0 {
-			nodeList := &corev1.NodeList{}
-			if err := a.client.List(ctx, nodeList); err == nil {
-				for _, n := range nodeList.Items {
-					for _, addr := range n.Status.Addresses {
-						if addr.Type == corev1.NodeExternalIP {
-							ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
-							fmt.Printf("[relay] using NodePort: %s\n", ep)
-							return ep
-						}
-					}
-				}
+			if ep := a.findNodePortEndpoint(ctx, nodePort); ep != "" {
+				return ep
 			}
 		}
 	}
 
+	return ""
+}
+
+// findNodePortEndpoint scans cluster nodes for a publicly reachable IP to use
+// with the given NodePort.
+func (a *Agent) findNodePortEndpoint(ctx context.Context, nodePort int32) string {
+	nodeList := &corev1.NodeList{}
+	if err := a.client.List(ctx, nodeList); err != nil {
+		return ""
+	}
+	for _, n := range nodeList.Items {
+		for _, addr := range n.Status.Addresses {
+			if addr.Type == corev1.NodeExternalIP {
+				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
+				fmt.Printf("[relay] using NodePort (ExternalIP): %s\n", ep)
+				return ep
+			}
+		}
+	}
+	// Fallback: use non-private InternalIP (OCI registers public IP as InternalIP)
+	for _, n := range nodeList.Items {
+		for _, addr := range n.Status.Addresses {
+			if addr.Type != corev1.NodeInternalIP {
+				continue
+			}
+			ip := net.ParseIP(addr.Address)
+			if ip != nil && !ip.IsPrivate() {
+				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
+				fmt.Printf("[relay] using NodePort (public InternalIP): %s\n", ep)
+				return ep
+			}
+		}
+	}
 	return ""
 }
 
@@ -938,4 +1140,54 @@ func (a *Agent) syncOwnPodCIDR(ctx context.Context) error {
 	peer.Spec.AllowedIPs = append(peer.Spec.AllowedIPs, node.Spec.PodCIDR)
 	fmt.Printf("[sync] pod CIDR %s added to own AllowedIPs\n", node.Spec.PodCIDR)
 	return a.client.Patch(ctx, peer, patch)
+}
+
+// recoverICEStateFromWG inspects WireGuard kernel state after a restart and
+// pre-populates ICE state for peers that already have a healthy direct connection.
+// Without this, all peers would start in iceStateRelay and wait relayRetry (120s)
+// before the first direct upgrade attempt, causing unnecessary relay detours.
+func (a *Agent) recoverICEStateFromWG() {
+	stats, err := a.wgMgr.GetStats()
+	if err != nil || len(stats) == 0 {
+		return
+	}
+
+	recovered := 0
+	for _, s := range stats {
+		if s.LastHandshake.IsZero() || time.Since(s.LastHandshake) > handshakeValidWindow {
+			continue
+		}
+		if s.ActualEndpoint == "" || isLocalhostEndpoint(s.ActualEndpoint) {
+			continue
+		}
+
+		peerName := a.findPeerNameByKey(s.PublicKeyB64)
+		if peerName == "" {
+			continue
+		}
+
+		state := a.getICEState(peerName)
+		state.State = iceStateConnected
+		state.FailCount = 0
+		a.setICEState(peerName, state)
+		recovered++
+	}
+
+	if recovered > 0 {
+		fmt.Printf("[setup] recovered %d peer(s) with existing direct connections\n", recovered)
+	}
+}
+
+// findPeerNameByKey resolves a WireGuard public key to the WireKubePeer name.
+func (a *Agent) findPeerNameByKey(pubKeyB64 string) string {
+	peerList := &wirekubev1alpha1.WireKubePeerList{}
+	if err := a.client.List(context.Background(), peerList); err != nil {
+		return ""
+	}
+	for _, p := range peerList.Items {
+		if p.Spec.PublicKey == pubKeyB64 {
+			return p.Name
+		}
+	}
+	return ""
 }

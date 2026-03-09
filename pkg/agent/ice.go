@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,12 +36,40 @@ const (
 	candidateTypePrflx = "prflx" // peer-reflexive (WG-observed)
 )
 
+// Timing constants for ICE probe evaluation and handshake validation.
+const (
+	handshakeValidWindow = 3 * time.Minute
+	activeProbeWait      = 8 * time.Second
+	passiveProbeTimeout  = 60 * time.Second
+	iceCheckTimeout      = 90 * time.Second
+	// restartRelayRetry is the shortened retry interval used immediately after
+	// agent restart to quickly re-evaluate direct connectivity for peers that
+	// were relayed before the restart.
+	restartRelayRetry = 15 * time.Second
+)
+
+// Relay mode constants matching WireKubeMesh.spec.relay.mode values.
+const (
+	relayModeAlways = "always"
+	relayModeNever  = "never"
+)
+
+// Well-known virtual interface prefixes to skip during IP discovery.
+var virtualIfacePrefixes = []string{
+	"docker", "veth", "cilium", "cni", "flannel",
+	"br-", "virbr", "wg", "wire_kube", "lxc",
+}
+
 // peerICEState tracks ICE negotiation state for a single peer.
 type peerICEState struct {
 	State         string
 	LastCheck     time.Time
 	CheckCount    int
 	BirthdayTried bool
+	// FailCount tracks consecutive isDirectConnected failures.
+	// The peer reverts to relay only after multiple consecutive failures,
+	// preventing flip-flop from transient handshake delays.
+	FailCount int
 
 	// holePunch holds the result of a successful birthday attack.
 	// If non-nil, the UDP proxy is active and WG should use its local address.
@@ -48,9 +78,9 @@ type peerICEState struct {
 
 // holePunchProxy bridges WireGuard traffic through a birthday-attack hole-punched path.
 type holePunchProxy struct {
-	localConn *net.UDPConn // receives from WG (localhost:random → localhost:wgport)
-	holeConn  *net.UDPConn // the hole-punched socket
-	peerAddr  *net.UDPAddr // peer's NAT-mapped address
+	localConn *net.UDPConn         // receives from WG (localhost:random → localhost:wgport)
+	holeConn  *net.UDPConn         // the hole-punched socket
+	peerAddr  atomic.Pointer[net.UDPAddr] // peer's NAT-mapped address; updated on rebind
 	wgPort    int
 	stopCh    chan struct{}
 	once      sync.Once
@@ -64,13 +94,14 @@ func newHolePunchProxy(holeResult *nat.HolePunchResult, wgPort int) (*holePunchP
 		return nil, fmt.Errorf("creating local proxy socket: %w", err)
 	}
 
-	return &holePunchProxy{
+	hp := &holePunchProxy{
 		localConn: localConn,
 		holeConn:  holeResult.LocalConn,
-		peerAddr:  holeResult.PeerAddr,
 		wgPort:    wgPort,
 		stopCh:    make(chan struct{}),
-	}, nil
+	}
+	hp.peerAddr.Store(holeResult.PeerAddr)
+	return hp, nil
 }
 
 // ListenAddr returns the local address WireGuard should use as peer endpoint.
@@ -97,7 +128,7 @@ func (hp *holePunchProxy) forwardWGToHole() {
 		if err != nil {
 			continue
 		}
-		hp.holeConn.WriteToUDP(buf[:n], hp.peerAddr)
+		hp.holeConn.WriteToUDP(buf[:n], hp.peerAddr.Load())
 	}
 }
 
@@ -114,12 +145,14 @@ func (hp *holePunchProxy) forwardHoleToWG() {
 		if err != nil {
 			continue
 		}
-		// Only accept packets from the peer's known address.
-		if !addr.IP.Equal(hp.peerAddr.IP) {
+		current := hp.peerAddr.Load()
+		if !addr.IP.Equal(current.IP) {
 			continue
 		}
-		// Update peer address if port changes (NAT rebinding).
-		hp.peerAddr = addr
+		// Accept port changes for NAT rebinding.
+		if addr.Port != current.Port {
+			hp.peerAddr.Store(addr)
+		}
 		hp.localConn.Write(buf[:n])
 	}
 }
@@ -212,12 +245,8 @@ func firstNonLoopbackIPv4() string {
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
 			continue
 		}
-		name := iface.Name
-		// Skip well-known virtual interfaces.
-		for _, skip := range []string{"docker", "veth", "cilium", "cni", "flannel", "br-", "virbr", "wg", "wire_kube"} {
-			if len(name) >= len(skip) && name[:len(skip)] == skip {
-				continue
-			}
+		if isVirtualInterface(iface.Name) {
+			continue
 		}
 		addrs, _ := iface.Addrs()
 		for _, addr := range addrs {
@@ -233,6 +262,15 @@ func firstNonLoopbackIPv4() string {
 		}
 	}
 	return ""
+}
+
+func isVirtualInterface(name string) bool {
+	for _, prefix := range virtualIfacePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // publishICEState updates this node's WireKubePeer status with ICE candidates
@@ -266,6 +304,11 @@ func (a *Agent) publishICEState(ctx context.Context, peerName string, candidates
 
 // runICENegotiation evaluates peers and attempts connectivity upgrades.
 // Called from the sync loop. Returns quickly; heavy work runs in background goroutines.
+//
+// Probe strategy (passive-first, make-before-break):
+//  1. Passive observation: keep relay, watch for peer-initiated direct handshake.
+//  2. Active probe: if passive fails, ForceEndpoint to test direct path.
+//  3. Make-before-break: relay proxy is closed one cycle AFTER WG switches to direct.
 func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList,
 	statsByKey map[string]wireguard.PeerStats) {
 
@@ -283,10 +326,18 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 
 		switch state.State {
 		case iceStateConnected:
-			// Verify the connection is still healthy.
 			if !a.isDirectConnected(p, statsByKey) {
-				fmt.Printf("[ice] peer %s: direct connection lost, reverting to relay\n", p.Name)
+				// Grace: require 2 consecutive failures before reverting.
+				if state.FailCount < 2 {
+					state.FailCount++
+					a.setICEState(p.Name, state)
+					continue
+				}
+				fmt.Printf("[ice] peer %s: direct connection lost (consecutive failures), reverting to relay\n", p.Name)
 				a.revertToRelay(p)
+			} else {
+				state.FailCount = 0
+				a.setICEState(p.Name, state)
 			}
 			continue
 
@@ -294,7 +345,6 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 			if !a.relayedPeers[p.Name] {
 				continue
 			}
-			// Check if enough time passed since last check to retry.
 			if !state.LastCheck.IsZero() && time.Since(state.LastCheck) < a.relayRetry {
 				continue
 			}
@@ -304,8 +354,6 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 			a.evaluateICECheck(ctx, p, statsByKey)
 
 		case iceStateBirthday:
-			// Birthday attack is running in a background goroutine.
-			// Check if it completed (holePunch != nil).
 			if state.holePunch != nil {
 				a.upgradeToDirect(p, state.holePunch.ListenAddr())
 			}
@@ -340,7 +388,9 @@ func (a *Agent) setICEState(peerName string, s *peerICEState) {
 }
 
 // startICECheck initiates a connectivity check for a relayed peer.
-// It evaluates the NAT type combination and decides the optimal strategy.
+// Uses a passive-first strategy to minimize disruption:
+//   - Passive: observe if the peer initiates direct (no WG endpoint change).
+//   - Active: ForceEndpoint probe only when passive fails or isn't applicable.
 func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKubePeer,
 	stats map[string]wireguard.PeerStats) {
 
@@ -349,8 +399,6 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 	state.LastCheck = time.Now()
 	state.CheckCount++
 
-	// Same-NAT detection: if the peer's public IP matches ours, use the
-	// peer's host candidate (internal LAN IP) for direct communication.
 	if a.trySameNATDirect(peer) {
 		a.setICEState(peer.Name, state)
 		return
@@ -359,27 +407,26 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 	peerNAT := peer.Status.NATType
 	myNAT := a.detectedNATType
 
-	// Determine strategy based on NAT type combination.
 	switch {
 	case myNAT != "symmetric" && peerNAT != "symmetric":
-		// Cone ↔ Cone (or Unknown): direct via STUN endpoints, high success rate.
-		fmt.Printf("[ice] peer %s: cone↔cone — probing direct endpoint %s\n", peer.Name, peer.Spec.Endpoint)
+		// Cone ↔ Cone: both endpoints are stable. Active probe is safe and fast
+		// because the peer can reach us at our stable STUN endpoint simultaneously.
+		fmt.Printf("[ice] peer %s: cone↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
 		a.probeDirectEndpoint(peer)
 
 	case myNAT != "symmetric" && peerNAT == "symmetric":
-		// Cone ↔ Symmetric: peer can reach our stable STUN endpoint.
-		// We set WG to peer's STUN endpoint — the peer's NAT may allow return traffic
-		// if the peer's keepalive packets opened a pinhole to our IP.
-		fmt.Printf("[ice] peer %s: cone↔symmetric — probing with our stable endpoint\n", peer.Name)
-		a.probeDirectEndpoint(peer)
+		// Cone ↔ Symmetric: the symmetric peer can reach our stable endpoint.
+		// Passive observation avoids disrupting the relay — we wait for their
+		// active probe to establish the path, then detect it via WG stats.
+		fmt.Printf("[ice] peer %s: cone↔symmetric — passive probe (waiting for peer to initiate)\n", peer.Name)
+		a.startPassiveProbe(peer)
 
 	case myNAT == "symmetric" && peerNAT != "symmetric":
-		// Symmetric ↔ Cone: we can reach peer's stable endpoint.
-		fmt.Printf("[ice] peer %s: symmetric↔cone — probing peer's stable endpoint\n", peer.Name)
+		// Symmetric ↔ Cone: we should probe the peer's stable endpoint.
+		fmt.Printf("[ice] peer %s: symmetric↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT == "symmetric":
-		// Symmetric ↔ Symmetric: birthday attack is the only option.
 		if !a.isBirthdayAttackEnabled(peer) {
 			fmt.Printf("[ice] peer %s: symmetric↔symmetric — birthday attack disabled, staying on relay\n", peer.Name)
 			state.State = iceStateFailed
@@ -485,8 +532,17 @@ func (a *Agent) isBirthdayAttackEnabled(peer *wirekubev1alpha1.WireKubePeer) boo
 	return false
 }
 
+// startPassiveProbe begins observing whether the peer initiates a direct
+// WireGuard handshake. The relay proxy and WG endpoint are left unchanged,
+// so there is zero traffic disruption. If the peer's agent runs an active
+// probe towards our stable STUN endpoint, the kernel will learn the peer's
+// actual NAT-mapped address, which we detect in evaluateICECheck.
+func (a *Agent) startPassiveProbe(peer *wirekubev1alpha1.WireKubePeer) {
+	a.passiveProbing[peer.Name] = time.Now()
+}
+
 // probeDirectEndpoint sets the peer's WG endpoint to their direct address
-// and lets WireGuard attempt a handshake. Result is evaluated next sync.
+// and lets WireGuard attempt a handshake (active probe, causes brief disruption).
 func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	directEp := a.directEndpoints[peer.Name]
 	if directEp == "" {
@@ -499,47 +555,96 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	a.directProbing[peer.Name] = true
 }
 
-// evaluateICECheck examines the WireGuard handshake stats to determine
-// whether a direct connectivity probe succeeded.
+// processRelayGrace closes relay proxies for peers that were upgraded to
+// direct in the previous sync cycle. This implements the "break" half of
+// make-before-break: WG was already switched to the direct endpoint, so
+// closing the relay proxy now does not disrupt traffic.
+func (a *Agent) processRelayGrace() {
+	for name := range a.relayGracePeers {
+		peer := &wirekubev1alpha1.WireKubePeer{}
+		if err := a.client.Get(context.Background(), client.ObjectKey{Name: name}, peer); err == nil {
+			a.disableRelayForPeer(peer)
+			fmt.Printf("[ice] peer %s: relay proxy closed (grace period complete)\n", name)
+		}
+		delete(a.relayGracePeers, name)
+	}
+}
+
+// evaluateICECheck examines WireGuard handshake stats to determine whether
+// a connectivity probe succeeded. Handles both passive and active probes.
 //
-// Timing: the probe needs at least 2 sync cycles to evaluate:
-//   - Cycle 1 (startICECheck): sets directProbing = true
-//   - Cycle 2 (first eval): resolveEndpointForPeer returns direct endpoint,
-//     WG gets configured, but stats are from BEFORE the config change.
-//   - Cycle 3+ (subsequent evals): stats now reflect the direct endpoint.
+// Passive probe flow (zero disruption):
+//  1. startPassiveProbe: marks peer, WG endpoint unchanged (relay continues).
+//  2. evaluateICECheck: checks if WG kernel learned a non-localhost endpoint
+//     (the peer initiated a direct handshake from their side).
+//  3. If detected → upgrade. If not after 60s → escalate to active probe.
 //
-// We use state.LastCheck to ensure we wait at least 35 seconds.
+// Active probe flow (brief disruption):
+//  1. probeDirectEndpoint: ForceEndpoint=true, WG switches to direct.
+//  2. evaluateICECheck: waits 35s, checks handshake stats.
 func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKubePeer,
 	stats map[string]wireguard.PeerStats) {
 
 	state := a.getICEState(peer.Name)
 
-	if a.directProbing[peer.Name] {
-		// Wait at least 2 sync cycles (35s) before evaluating the probe result.
-		// WG needs time to receive the direct endpoint config and attempt a handshake.
-		if time.Since(state.LastCheck) < 35*time.Second {
-			return
-		}
+	// --- Passive probe evaluation ---
+	if passiveStart, ok := a.passiveProbing[peer.Name]; ok {
+		s, hasStats := stats[peer.Spec.PublicKey]
 
-		s, ok := stats[peer.Spec.PublicKey]
-		probeOK := ok && !s.LastHandshake.IsZero() &&
-			time.Since(s.LastHandshake) < 3*time.Minute &&
-			s.ActualEndpoint != "" &&
-			!isLocalhostEndpoint(s.ActualEndpoint)
+		// Check if WG learned a non-localhost endpoint (peer initiated direct).
+		if hasStats && !s.LastHandshake.IsZero() &&
+			time.Since(s.LastHandshake) < handshakeValidWindow &&
+			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 
-		delete(a.directProbing, peer.Name)
-
-		if probeOK {
-			fmt.Printf("[ice] peer %s: direct probe succeeded (%s)\n", peer.Name, s.ActualEndpoint)
+			delete(a.passiveProbing, peer.Name)
+			fmt.Printf("[ice] peer %s: passive probe detected direct path (%s)\n", peer.Name, s.ActualEndpoint)
 			a.upgradeToDirect(peer, "")
 			state.State = iceStateConnected
 			a.setICEState(peer.Name, state)
 			return
 		}
 
-		// Probe failed. If both symmetric → try birthday attack.
+		if time.Since(passiveStart) > passiveProbeTimeout {
+			delete(a.passiveProbing, peer.Name)
+			fmt.Printf("[ice] peer %s: passive probe timed out, escalating to active probe\n", peer.Name)
+			a.probeDirectEndpoint(peer)
+			state.LastCheck = time.Now()
+			a.setICEState(peer.Name, state)
+		}
+		return
+	}
+
+	// --- Active probe evaluation ---
+	if a.directProbing[peer.Name] {
+		if time.Since(state.LastCheck) < activeProbeWait {
+			return
+		}
+
+		s, ok := stats[peer.Spec.PublicKey]
+		probeOK := ok && !s.LastHandshake.IsZero() &&
+			time.Since(s.LastHandshake) < handshakeValidWindow &&
+			s.ActualEndpoint != "" &&
+			!isLocalhostEndpoint(s.ActualEndpoint)
+
+		delete(a.directProbing, peer.Name)
+
+		if probeOK {
+			fmt.Printf("[ice] peer %s: active probe succeeded (%s)\n", peer.Name, s.ActualEndpoint)
+			a.upgradeToDirect(peer, "")
+			state.State = iceStateConnected
+			a.setICEState(peer.Name, state)
+			return
+		}
+
+		// Probe failed — immediately revert to relay to minimize disruption.
+		// The peer is re-enabled for relay so the next resolveEndpointForPeer
+		// call returns the relay proxy address instead of the dead direct endpoint.
+		if a.relayedPeers[peer.Name] || a.directEndpoints[peer.Name] != "" {
+			a.enableRelayForPeer(peer)
+		}
+
 		if a.detectedNATType == "symmetric" && peer.Status.NATType == "symmetric" && !state.BirthdayTried {
-			fmt.Printf("[ice] peer %s: direct probe failed, trying birthday attack\n", peer.Name)
+			fmt.Printf("[ice] peer %s: active probe failed, trying birthday attack\n", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
 			a.setICEState(peer.Name, state)
@@ -547,15 +652,14 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			return
 		}
 
-		fmt.Printf("[ice] peer %s: direct probe failed, staying on relay\n", peer.Name)
+		fmt.Printf("[ice] peer %s: active probe failed, reverting to relay\n", peer.Name)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		a.setICEState(peer.Name, state)
 		return
 	}
 
-	// No probe was active — timeout; mark as failed.
-	if time.Since(state.LastCheck) > 90*time.Second {
+	if time.Since(state.LastCheck) > iceCheckTimeout {
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		a.setICEState(peer.Name, state)
@@ -647,17 +751,28 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 }
 
 // upgradeToDirect switches a peer from relay to direct transport.
+// Uses make-before-break: the relay proxy stays alive for one more sync cycle
+// so WG can switch to the direct endpoint first without disrupting traffic.
 func (a *Agent) upgradeToDirect(peer *wirekubev1alpha1.WireKubePeer, proxyAddr string) {
-	a.disableRelayForPeer(peer)
 	delete(a.peerFirstSeen, peer.Name)
 
 	state := a.getICEState(peer.Name)
 	state.State = iceStateConnected
+	state.FailCount = 0
 	a.setICEState(peer.Name, state)
 
 	if proxyAddr != "" {
-		// Birthday attack: use the hole-punch proxy address.
 		a.holePunchEndpoints[peer.Name] = proxyAddr
+	}
+
+	// Mark relay for delayed closure instead of closing immediately.
+	// The next sync cycle applies the direct WG endpoint; the cycle after
+	// that closes the relay proxy (processRelayGrace).
+	if a.relayedPeers[peer.Name] {
+		a.relayGracePeers[peer.Name] = true
+		// Clear the relayed flag so resolveEndpointForPeer returns the direct endpoint.
+		delete(a.relayedPeers, peer.Name)
+		fmt.Printf("[ice] peer %s: upgraded to direct (relay proxy retained for grace period)\n", peer.Name)
 	}
 }
 
@@ -688,9 +803,14 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 		return false
 	}
 	return !s.LastHandshake.IsZero() &&
-		time.Since(s.LastHandshake) < 3*time.Minute
+		time.Since(s.LastHandshake) < handshakeValidWindow
 }
 
 func isLocalhostEndpoint(ep string) bool {
-	return len(ep) >= 10 && ep[:10] == "127.0.0.1:"
+	host, _, err := net.SplitHostPort(ep)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
