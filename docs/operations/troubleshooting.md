@@ -253,28 +253,29 @@ kubectl patch wirekubepeer <name> --type merge \
 
 ---
 
-## Scenario 10: Managed Relay Unreachable (Chicken-and-Egg)
+## Scenario 10: Managed Relay Unreachable
 
 **Symptoms:**
 
-NAT'd node cannot connect to the relay at `wirekube-relay.wirekube-system.svc.cluster.local:3478`
-because the CNI tunnel (which provides ClusterIP routing) isn't up yet.
+Agent logs show `managed relay: no externally reachable address found on wirekube-relay Service`.
 
-**Root Cause:** The node needs the relay to establish the mesh tunnel, but the
-relay's ClusterIP is only reachable via the mesh tunnel.
+**Root Cause:** The managed relay Service does not have an ExternalIP, LoadBalancer
+Ingress, or NodePort with a reachable node IP. The agent does **not** use
+ClusterIP/CoreDNS for relay discovery because it may be unreachable on hybrid/NAT'd
+nodes before the mesh tunnel is established.
 
 **Fix:**
 
-The agent auto-discovers the managed relay's external address by checking the
-Service for ExternalIP, LoadBalancer Ingress, or NodePort. Ensure the relay
-Service has an externally reachable address:
+Ensure the relay Service has an externally reachable address:
 
 ```bash
 kubectl get svc wirekube-relay -n wirekube-system -o wide
 ```
 
 If using `serviceType: LoadBalancer`, wait for the external IP to be assigned.
-For `NodePort`, ensure at least one cluster node has an external IP.
+For `NodePort`, ensure at least one cluster node has a public IP (ExternalIP or
+a public InternalIP). The agent retries relay initialization with exponential
+backoff, so it will connect once the external address becomes available.
 
 ---
 

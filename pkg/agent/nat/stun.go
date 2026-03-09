@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/pion/stun/v3"
@@ -12,7 +13,6 @@ import (
 
 var defaultSTUNServers = []string{
 	"stun:stun.l.google.com:19302",
-	"stun:stun1.l.google.com:19302",
 	"stun:stun.cloudflare.com:3478",
 }
 
@@ -135,8 +135,7 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 			continue
 		}
 		ip, portStr, _ := net.SplitHostPort(endpoint)
-		port := 0
-		fmt.Sscanf(portStr, "%d", &port)
+		port, _ := strconv.Atoi(portStr)
 		results = append(results, stunResponse{endpoint: endpoint, ip: ip, port: port})
 	}
 

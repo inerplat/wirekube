@@ -20,14 +20,28 @@
         "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }] } },
         "overrides": []
       },
-      "options": { "colorMode": "value", "graphMode": "none", "textMode": "auto" },
-      "targets": [{ "expr": "wirekube_peers_total", "legendFormat": "peers" }]
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "max(wirekube_peers_total)", "legendFormat": "peers" }]
     },
     {
-      "title": "Relayed Peers",
+      "title": "Direct P2P",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "max(wirekube_direct_peers_total{source=~\"$source\"})", "legendFormat": "direct" }]
+    },
+    {
+      "title": "Relayed",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -40,59 +54,161 @@
         },
         "overrides": []
       },
-      "options": { "colorMode": "value", "graphMode": "none", "textMode": "auto" },
-      "targets": [{ "expr": "wirekube_relayed_peers_total", "legendFormat": "relayed" }]
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "max(wirekube_relayed_peers_total{source=~\"$source\"})", "legendFormat": "relayed" }]
     },
     {
-      "title": "NAT Type",
+      "title": "This Node NAT",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "options": { "0": { "text": "Unknown" }, "1": { "text": "Cone" }, "2": { "text": "Symmetric" } }, "type": "value" }
+            { "options": { "0": { "text": "Unknown", "color": "blue" }, "1": { "text": "Cone", "color": "green" }, "2": { "text": "Symmetric", "color": "orange" } }, "type": "value" }
           ],
+          "thresholds": { "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "wirekube_node_nat_type{node=~\"$source\"}", "legendFormat": "{{ node }}" }]
+    },
+    {
+      "title": "Connected",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "count(wirekube_peer_connected{source=~\"$source\"} == 1)", "legendFormat": "connected" }]
+    },
+    {
+      "title": "Disconnected",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
           "thresholds": {
             "steps": [
-              { "color": "blue", "value": null },
-              { "color": "green", "value": 1 },
-              { "color": "orange", "value": 2 }
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
             ]
           }
         },
         "overrides": []
       },
-      "options": { "colorMode": "value", "graphMode": "none", "textMode": "auto" },
-      "targets": [{ "expr": "wirekube_node_nat_type{node=~\"$node\"}", "legendFormat": "{{ node }}" }]
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "count(wirekube_peer_connected{source=~\"$source\"} == 0) or vector(0)", "legendFormat": "down" }]
     },
+
     {
-      "title": "Connected Peers",
-      "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
-      "fieldConfig": {
-        "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }] } },
-        "overrides": []
-      },
-      "options": { "colorMode": "value", "graphMode": "none", "textMode": "auto" },
-      "targets": [{ "expr": "count(wirekube_peer_connected == 1)", "legendFormat": "connected" }]
-    },
-    {
-      "title": "Peer Latency (ICMP RTT)",
+      "title": "Peer Connectivity",
       "type": "row",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
       "collapsed": false
     },
     {
-      "title": "Peer Latency (ms)",
+      "title": "Peer Transport (from $source)",
+      "description": "Shows which peers use Direct P2P vs Relay transport from the selected source node's perspective.",
+      "type": "table",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "displayMode": "color-background-solid", "align": "center" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Transport" },
+            "properties": [{
+              "id": "mappings",
+              "value": [{ "options": { "1": { "text": "Direct P2P ✓", "color": "green" }, "2": { "text": "Relay ⟳", "color": "red" } }, "type": "value" }]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ICE State" },
+            "properties": [{
+              "id": "mappings",
+              "value": [{ "options": { "0": { "text": "relay" }, "1": { "text": "gathering" }, "2": { "text": "checking" }, "3": { "text": "connected", "color": "green" }, "4": { "text": "birthday" }, "5": { "text": "failed", "color": "red" } }, "type": "value" }]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Connected" },
+            "properties": [{
+              "id": "mappings",
+              "value": [{ "options": { "0": { "text": "No", "color": "red" }, "1": { "text": "Yes", "color": "green" } }, "type": "value" }]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Latency" },
+            "properties": [{ "id": "unit", "value": "s" }, { "id": "decimals", "value": 1 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Handshake Age" },
+            "properties": [{ "id": "unit", "value": "s" }, { "id": "decimals", "value": 0 }]
+          }
+        ]
+      },
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "Transport", "desc": true }], "footer": { "enablePagination": false } },
+      "targets": [
+        { "expr": "wirekube_peer_transport_mode{source=~\"$source\"}", "legendFormat": "__auto", "format": "table", "instant": true, "refId": "A" },
+        { "expr": "wirekube_peer_ice_state{source=~\"$source\"}", "legendFormat": "__auto", "format": "table", "instant": true, "refId": "B" },
+        { "expr": "wirekube_peer_connected{source=~\"$source\"}", "legendFormat": "__auto", "format": "table", "instant": true, "refId": "C" },
+        { "expr": "wirekube_peer_latency_seconds{source=~\"$source\"}", "legendFormat": "__auto", "format": "table", "instant": true, "refId": "D" },
+        { "expr": "wirekube_peer_last_handshake_seconds{source=~\"$source\"}", "legendFormat": "__auto", "format": "table", "instant": true, "refId": "E" }
+      ],
+      "transformations": [
+        { "id": "seriesToColumns", "options": { "byField": "peer" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true, "Time 5": true, "__name__": true, "__name__ 1": true, "__name__ 2": true, "__name__ 3": true, "__name__ 4": true, "instance": true, "instance 1": true, "instance 2": true, "instance 3": true, "instance 4": true, "job": true, "job 1": true, "job 2": true, "job 3": true, "job 4": true, "source": true, "source 1": true, "source 2": true, "source 3": true, "source 4": true, "nat_type": true, "endpoint": true, "transport": true },
+            "renameByName": { "peer": "Peer", "Value #A": "Transport", "Value #B": "ICE State", "Value #C": "Connected", "Value #D": "Latency", "Value #E": "Handshake Age" },
+            "indexByName": { "Peer": 0, "Connected": 1, "Transport": 2, "ICE State": 3, "Latency": 4, "Handshake Age": 5 }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Connection Status Timeline",
+      "description": "Shows connection state changes over time. Green = connected, Red = disconnected.",
+      "type": "state-timeline",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "Down", "color": "red" }, "1": { "text": "Up", "color": "green" } }, "type": "value" }
+          ],
+          "custom": { "fillOpacity": 80 }
+        },
+        "overrides": []
+      },
+      "options": { "showValue": "auto", "mergeValues": true, "alignValue": "left" },
+      "targets": [{ "expr": "wirekube_peer_connected{source=~\"$source\"}", "legendFormat": "{{ peer }}" }]
+    },
+
+    {
+      "title": "Latency & Performance",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false
+    },
+    {
+      "title": "Direct P2P Latency",
+      "description": "ICMP round-trip time to peers connected via direct P2P.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "pointSize": 5, "showPoints": "auto" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "pointSize": 4, "showPoints": "auto" },
           "thresholds": {
             "steps": [
               { "color": "green", "value": null },
@@ -105,103 +221,84 @@
         "overrides": []
       },
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "last"] }, "tooltip": { "mode": "multi" } },
-      "targets": [{ "expr": "wirekube_peer_latency_seconds{peer=~\"$peer\"}", "legendFormat": "{{ peer }} ({{ transport }})" }]
+      "targets": [{ "expr": "wirekube_peer_latency_seconds{source=~\"$source\", transport=\"direct\"}", "legendFormat": "{{ peer }}" }]
     },
     {
-      "title": "Peer Latency Heatmap",
-      "type": "table",
+      "title": "Relay Latency",
+      "description": "ICMP round-trip time to peers connected via relay.",
+      "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "pointSize": 4, "showPoints": "auto" },
           "thresholds": {
-            "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 0.05 },
-              { "color": "red", "value": 0.2 }
+              { "color": "yellow", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "red", "value": 0.5 }
             ]
           },
-          "custom": { "displayMode": "color-background" }
+          "color": { "mode": "palette-classic" }
         },
         "overrides": []
       },
-      "options": { "showHeader": true, "sortBy": [{ "displayName": "Value", "desc": true }] },
-      "targets": [{ "expr": "wirekube_peer_latency_seconds", "legendFormat": "{{ peer }}", "format": "table", "instant": true }],
-      "transformations": [
-        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true, "endpoint": true }, "renameByName": { "peer": "Peer", "transport": "Transport", "Value": "RTT" } } }
-      ]
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "last"] }, "tooltip": { "mode": "multi" } },
+      "targets": [{ "expr": "wirekube_peer_latency_seconds{source=~\"$source\", transport=\"relay\"}", "legendFormat": "{{ peer }} (relay)" }]
     },
-    {
-      "title": "Transport Mode",
-      "type": "table",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "options": { "0": { "text": "Unknown" }, "1": { "text": "Direct", "color": "green" }, "2": { "text": "Relay", "color": "red" }, "3": { "text": "Mixed", "color": "yellow" } }, "type": "value" }
-          ],
-          "custom": { "displayMode": "color-background-solid" }
-        },
-        "overrides": []
-      },
-      "options": { "showHeader": true },
-      "targets": [{ "expr": "wirekube_peer_transport_mode", "legendFormat": "{{ peer }}", "format": "table", "instant": true }],
-      "transformations": [
-        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true }, "renameByName": { "peer": "Peer", "Value": "Transport" } } }
-      ]
-    },
+
     {
       "title": "Traffic",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
       "collapsed": false
     },
     {
-      "title": "Bytes Sent per Peer (rate)",
+      "title": "Throughput — Sent (per peer)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20 },
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20, "stacking": { "mode": "none" } },
           "color": { "mode": "palette-classic" }
         },
         "overrides": []
       },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
-      "targets": [{ "expr": "rate(wirekube_peer_bytes_sent_total{peer=~\"$peer\"}[5m])", "legendFormat": "{{ peer }}" }]
+      "targets": [{ "expr": "rate(wirekube_peer_bytes_sent_total{source=~\"$source\"}[5m])", "legendFormat": "→ {{ peer }}" }]
     },
     {
-      "title": "Bytes Received per Peer (rate)",
+      "title": "Throughput — Received (per peer)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20 },
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20, "stacking": { "mode": "none" } },
           "color": { "mode": "palette-classic" }
         },
         "overrides": []
       },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
-      "targets": [{ "expr": "rate(wirekube_peer_bytes_received_total{peer=~\"$peer\"}[5m])", "legendFormat": "{{ peer }}" }]
+      "targets": [{ "expr": "rate(wirekube_peer_bytes_received_total{source=~\"$source\"}[5m])", "legendFormat": "← {{ peer }}" }]
     },
+
     {
-      "title": "Handshake & Health",
+      "title": "Handshake Health",
       "type": "row",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "collapsed": false
     },
     {
       "title": "Last Handshake Age",
+      "description": "Time since the last WireGuard handshake. Values > 180s indicate a stale or broken connection.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -218,24 +315,25 @@
         "overrides": []
       },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [{ "expr": "wirekube_peer_last_handshake_seconds{peer=~\"$peer\"}", "legendFormat": "{{ peer }}" }]
+      "targets": [{ "expr": "wirekube_peer_last_handshake_seconds{source=~\"$source\"}", "legendFormat": "{{ peer }}" }]
     },
     {
-      "title": "Connection Status",
+      "title": "Transport Mode Over Time",
+      "description": "Shows transport mode transitions (1=Direct, 2=Relay).",
       "type": "state-timeline",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "options": { "0": { "text": "Disconnected", "color": "red" }, "1": { "text": "Connected", "color": "green" } }, "type": "value" }
+            { "options": { "1": { "text": "Direct", "color": "green" }, "2": { "text": "Relay", "color": "orange" } }, "type": "value" }
           ],
-          "custom": { "fillOpacity": 70 }
+          "custom": { "fillOpacity": 80 }
         },
         "overrides": []
       },
       "options": { "showValue": "auto", "mergeValues": true, "alignValue": "left" },
-      "targets": [{ "expr": "wirekube_peer_connected{peer=~\"$peer\"}", "legendFormat": "{{ peer }} ({{ nat_type }})" }]
+      "targets": [{ "expr": "wirekube_peer_transport_mode{source=~\"$source\"}", "legendFormat": "{{ peer }}" }]
     }
   ],
   "schemaVersion": 39,
@@ -245,22 +343,12 @@
       {
         "current": {},
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "definition": "label_values(wirekube_peer_connected, peer)",
-        "includeAll": true,
-        "multi": true,
-        "name": "peer",
-        "query": "label_values(wirekube_peer_connected, peer)",
-        "refresh": 2,
-        "type": "query"
-      },
-      {
-        "current": {},
-        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "definition": "label_values(wirekube_node_nat_type, node)",
-        "includeAll": true,
-        "multi": true,
-        "name": "node",
-        "query": "label_values(wirekube_node_nat_type, node)",
+        "definition": "label_values(wirekube_peer_connected, source)",
+        "includeAll": false,
+        "multi": false,
+        "name": "source",
+        "label": "Source Node",
+        "query": "label_values(wirekube_peer_connected, source)",
         "refresh": 2,
         "type": "query"
       }
@@ -269,7 +357,7 @@
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "WireKube Mesh Overview",
+  "title": "WireKube Mesh",
   "uid": "wirekube-mesh",
-  "version": 1
+  "version": 2
 }

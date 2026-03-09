@@ -61,7 +61,7 @@ spec:
 | Provider | Description |
 |----------|-------------|
 | `external` | User-provided relay endpoint. Agent connects to the configured `external.endpoint`. |
-| `managed` | Relay deployed as Deployment + Service in the cluster. Agent auto-discovers the Service's external address (ExternalIP → LB Ingress → NodePort) so NAT'd nodes can connect without relying on CNI tunnels. Falls back to ClusterIP DNS if no external address is found. |
+| `managed` | Relay deployed as Deployment + Service in the cluster. Agent auto-discovers the Service's external address (ExternalIP → LB Ingress → NodePort) so NAT'd nodes can connect without relying on CNI tunnels. Does **not** fall back to ClusterIP DNS. |
 
 ## Node Labels and Annotations
 
@@ -111,7 +111,7 @@ securityContext:
 
 The DaemonSet uses `dnsPolicy: ClusterFirstWithHostNet`. Since the agent runs with
 `hostNetwork: true`, this setting ensures it can resolve cluster-internal DNS names
-(e.g., `wirekube-relay.wirekube-system.svc.cluster.local`) for managed relay discovery.
+for Kubernetes API and other services.
 
 ### initContainer Cleanup
 
