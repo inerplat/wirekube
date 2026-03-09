@@ -26,33 +26,6 @@ spec:
       tolerations:
         - operator: Exists
       terminationGracePeriodSeconds: 30
-      initContainers:
-        - name: cleanup
-          image: alpine:3.21
-          command:
-            - /bin/sh
-            - -c
-            - |
-              IFACE="${WIREKUBE_INTERFACE:-wire_kube}"
-              if ip link show "$IFACE" >/dev/null 2>&1; then
-                echo "cleaning up stale $IFACE routes and interface"
-                ip route flush dev "$IFACE" 2>/dev/null
-                ip link delete "$IFACE"
-              fi
-              # Clean up stale ip rules from previous agent runs (crash/OOMKill)
-              ip rule del prio 100 fwmark 0x574b 2>/dev/null || true
-              ip rule del prio 200 table 22347 2>/dev/null || true
-              ip route flush table 22347 2>/dev/null || true
-          env:
-            - name: WIREKUBE_INTERFACE
-              value: "wire_kube"
-          securityContext:
-            capabilities:
-              add: ["NET_ADMIN"]
-          resources:
-            limits:
-              cpu: 50m
-              memory: 16Mi
       containers:
         - name: agent
           image: inerplat/wirekube:v0.0.0-dev.14

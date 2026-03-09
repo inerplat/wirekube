@@ -212,11 +212,14 @@ Kubernetes Service API for the relay's externally reachable address:
 
 1. **ExternalIPs** — Manually configured public IPs on the Service
 2. **LoadBalancer Ingress** — Cloud-assigned external IP or hostname
-3. **NodePort** — Service NodePort via a cluster node's external IP
-4. **ClusterIP DNS** — Fallback if no external address is found
+3. **NodePort** — Service NodePort via a cluster node's public IP (ExternalIP
+   or public InternalIP for cloud providers like OCI)
 
-This ensures NAT'd nodes can connect to the relay directly over the public
-internet, without relying on CNI tunnels to be functional first.
+ClusterIP DNS is intentionally **not** used as a fallback because CoreDNS
+resolution depends on a functioning CNI, which may not be available on
+hybrid/NAT'd nodes before the mesh tunnel is established. If no external address
+is found, the agent retries with exponential backoff until the Service becomes
+externally reachable (e.g., LoadBalancer IP is assigned).
 
 ## Deployment Options
 
