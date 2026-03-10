@@ -28,10 +28,12 @@ import (
 //   - Agent syncs all WireKubePeer CRDs into WireGuard peer config + kernel routes.
 //   - No IPAM, no mesh IP assignment, no kubelet modification.
 type Agent struct {
-	client    client.Client
-	wgMgr     *wireguard.Manager
-	nodeName  string
-	syncEvery time.Duration
+	client       client.Client
+	wgMgr        *wireguard.Manager
+	nodeName     string
+	podName      string
+	podNamespace string
+	syncEvery    time.Duration
 
 	relayPool    *agentrelay.Pool
 	relayMode    string
@@ -85,11 +87,13 @@ type Agent struct {
 }
 
 // NewAgent creates a new Agent.
-func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName string) *Agent {
+func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podName, podNamespace string) *Agent {
 	return &Agent{
 		client:             k8sClient,
 		wgMgr:              wgMgr,
 		nodeName:           nodeName,
+		podName:            podName,
+		podNamespace:       podNamespace,
 		syncEvery:          30 * time.Second,
 		peerFirstSeen:      make(map[string]time.Time),
 		relayedPeers:       make(map[string]bool),
@@ -209,6 +213,14 @@ func (a *Agent) setup(ctx context.Context) error {
 	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, node); err != nil {
 		return fmt.Errorf("getting node: %w", err)
 	}
+	// Annotate own pod with node InternalIP so ServiceMonitor can scrape via
+	// WireGuard (reachable through VGW) instead of the public host IP.
+	if a.podName != "" {
+		if ip := nodeInternalIP(node); ip != "" {
+			a.annotateOwnPod(ctx, ip)
+		}
+	}
+
 	epResult, err := DiscoverEndpoint(ctx, node, int(mesh.Spec.ListenPort), mesh.Spec.STUNServers)
 	if err != nil {
 		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
@@ -1190,4 +1202,36 @@ func (a *Agent) findPeerNameByKey(pubKeyB64 string) string {
 		}
 	}
 	return ""
+}
+
+// nodeInternalIP returns the first InternalIP from the node's status addresses.
+func nodeInternalIP(node *corev1.Node) string {
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			return addr.Address
+		}
+	}
+	return ""
+}
+
+// annotateOwnPod sets the wirekube.io/node-internal-ip annotation on the agent's
+// own pod so that ServiceMonitor relabeling can replace the scrape address with
+// the WireGuard-reachable internal IP instead of the public host IP.
+func (a *Agent) annotateOwnPod(ctx context.Context, internalIP string) {
+	pod := &corev1.Pod{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: a.podName, Namespace: a.podNamespace}, pod); err != nil {
+		fmt.Printf("warning: getting own pod for metrics annotation: %v\n", err)
+		return
+	}
+	if pod.Annotations != nil && pod.Annotations["wirekube.io/node-internal-ip"] == internalIP {
+		return
+	}
+	patch := client.MergeFrom(pod.DeepCopy())
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations["wirekube.io/node-internal-ip"] = internalIP
+	if err := a.client.Patch(ctx, pod, patch); err != nil {
+		fmt.Printf("warning: annotating own pod with node internal IP: %v\n", err)
+	}
 }

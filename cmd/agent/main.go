@@ -41,7 +41,12 @@ func main() {
 	var apiServer string
 	var metricsAddr string
 
+	var podName string
+	var podNamespace string
+
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of this Kubernetes node")
+	flag.StringVar(&podName, "pod-name", os.Getenv("POD_NAME"), "Name of this agent pod (used to annotate metrics scrape IP)")
+	flag.StringVar(&podNamespace, "pod-namespace", os.Getenv("POD_NAMESPACE"), "Namespace of this agent pod")
 	flag.StringVar(&meshName, "mesh-name", "default", "Name of the WireKubeMesh resource")
 	flag.StringVar(&ifaceName, "interface", os.Getenv("WIREKUBE_INTERFACE"), "WireGuard interface name (overrides CR interfaceName)")
 	flag.IntVar(&listenPort, "listen-port", 51820, "WireGuard UDP listen port")
@@ -142,7 +147,7 @@ func main() {
 		}
 	}()
 
-	a := agentpkg.NewAgent(k8sClient, wgMgr, nodeName)
+	a := agentpkg.NewAgent(k8sClient, wgMgr, nodeName, podName, podNamespace)
 	ctx := ctrl.SetupSignalHandler()
 	log.Info("starting agent", "node", nodeName)
 	if err := a.Run(ctx); err != nil && err != context.Canceled {
