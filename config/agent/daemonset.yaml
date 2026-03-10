@@ -28,7 +28,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: agent
-          image: inerplat/wirekube:v0.0.0-dev.14
+          image: inerplat/wirekube:v0.0.7-dev.3
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
