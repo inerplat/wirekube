@@ -35,3 +35,11 @@ spec:
       interval: 30s
       path: /metrics
       scrapeTimeout: 10s
+      relabelings:
+        # Replace scrape address with the node's InternalIP (annotated by agent).
+        # Hybrid nodes have a public host IP unreachable from within the cluster;
+        # the InternalIP is routable via WireGuard VGW.
+        - sourceLabels: [__meta_kubernetes_pod_annotation_wirekube_io_node_internal_ip]
+          regex: (.+)
+          targetLabel: __address__
+          replacement: "${1}:9090"
