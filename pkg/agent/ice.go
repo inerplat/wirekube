@@ -327,15 +327,24 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 		switch state.State {
 		case iceStateConnected:
 			if !a.isDirectConnected(p, statsByKey) {
-				// Grace: require 2 consecutive failures before reverting.
-				if state.FailCount < 2 {
+				if state.FailCount == 0 {
+					// First failure: pre-warm relay proxy so it's ready if direct
+					// continues to fail. WG stays on direct this cycle (make-before-break).
 					state.FailCount++
 					a.setICEState(p.Name, state)
+					a.prewarmRelayForPeer(p)
 					continue
 				}
+				// Second consecutive failure: relay proxy is already warm — activate
+				// it now so WG switches to a ready relay with no additional delay.
 				fmt.Printf("[ice] peer %s: direct connection lost (consecutive failures), reverting to relay\n", p.Name)
 				a.revertToRelay(p)
 			} else {
+				if state.FailCount > 0 {
+					// Direct connection recovered before relay was activated — clean up
+					// the pre-warmed proxy so it doesn't consume relay server resources.
+					a.cancelPrewarmedRelay(p)
+				}
 				state.FailCount = 0
 				a.setICEState(p.Name, state)
 			}
@@ -785,6 +794,8 @@ func (a *Agent) revertToRelay(peer *wirekubev1alpha1.WireKubePeer) {
 		state.holePunch = nil
 	}
 	delete(a.holePunchEndpoints, peer.Name)
+	// Clear pre-warm flag since relay is now being fully activated.
+	delete(a.relayPrewarmed, peer.Name)
 
 	state.State = iceStateRelay
 	state.LastCheck = time.Now()
@@ -793,6 +804,52 @@ func (a *Agent) revertToRelay(peer *wirekubev1alpha1.WireKubePeer) {
 
 	// Re-enable relay for this peer.
 	a.enableRelayForPeer(peer)
+}
+
+// prewarmRelayForPeer creates a relay proxy for a peer without activating it.
+// Used for make-before-break failover: the proxy establishes its TCP connection
+// to the relay server in advance so that when revertToRelay is called on the
+// next failure, the relay is immediately ready with no warmup delay.
+func (a *Agent) prewarmRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
+	if a.relayPool == nil || !a.relayPool.IsConnected() {
+		return
+	}
+	if a.relayedPeers[peer.Name] || a.relayPrewarmed[peer.Name] {
+		return
+	}
+	var pubKey [32]byte
+	keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
+	if err != nil {
+		return
+	}
+	copy(pubKey[:], keyBytes)
+	if _, err := a.relayPool.GetOrCreateProxy(pubKey); err != nil {
+		fmt.Printf("[ice] peer %s: failed to pre-warm relay proxy: %v\n", peer.Name, err)
+		return
+	}
+	a.relayPrewarmed[peer.Name] = true
+	fmt.Printf("[ice] peer %s: relay proxy pre-warmed for failover\n", peer.Name)
+}
+
+// cancelPrewarmedRelay tears down a pre-warmed relay proxy that was never
+// activated. Called when the direct connection recovers before the second
+// consecutive failure triggers revertToRelay.
+func (a *Agent) cancelPrewarmedRelay(peer *wirekubev1alpha1.WireKubePeer) {
+	if !a.relayPrewarmed[peer.Name] {
+		return
+	}
+	delete(a.relayPrewarmed, peer.Name)
+	if a.relayPool == nil {
+		return
+	}
+	var pubKey [32]byte
+	keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
+	if err != nil {
+		return
+	}
+	copy(pubKey[:], keyBytes)
+	a.relayPool.RemoveProxy(pubKey)
+	fmt.Printf("[ice] peer %s: pre-warmed relay proxy cancelled (direct recovered)\n", peer.Name)
 }
 
 // isDirectConnected checks if a peer has a recent non-localhost handshake.
