@@ -65,6 +65,9 @@ type Agent struct {
 	iceStates map[string]*peerICEState
 	// holePunchEndpoints maps peer name → birthday-attack proxy listen address.
 	holePunchEndpoints map[string]string
+	// relayPrewarmed tracks peers whose relay proxy has been pre-created for
+	// make-before-break failover but not yet activated (WG still uses direct).
+	relayPrewarmed map[string]bool
 	// ownPublicKeyB64 caches the base64-encoded public key.
 	ownPublicKeyB64 string
 	// portPrediction stores our NAT port prediction data from STUN.
@@ -104,6 +107,7 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podNa
 		relayGracePeers:    make(map[string]bool),
 		iceStates:          make(map[string]*peerICEState),
 		holePunchEndpoints: make(map[string]string),
+		relayPrewarmed:     make(map[string]bool),
 	}
 }
 
