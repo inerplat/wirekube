@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 )
 
 // Wire protocol for WireKube relay.
@@ -23,6 +24,7 @@ const (
 	MsgRegister  byte = 0x01
 	MsgData      byte = 0x02
 	MsgKeepalive byte = 0x03
+	MsgNATProbe  byte = 0x04
 	MsgError     byte = 0xFF
 
 	MaxFrameSize = 65536
@@ -99,4 +101,26 @@ func ParseDataFrame(body []byte) (destPubKey [PubKeySize]byte, payload []byte, e
 	copy(destPubKey[:], body[:PubKeySize])
 	payload = body[PubKeySize:]
 	return
+}
+
+// MakeNATProbeFrame creates a frame requesting the relay to send a UDP probe
+// to the specified endpoint from a different source port. Used by agents to
+// detect port-restricted cone NAT: if the agent receives the probe, it is NOT
+// port-restricted; if it doesn't, it IS port-restricted.
+// Body layout: [4 bytes IPv4][2 bytes port big-endian]
+func MakeNATProbeFrame(ip net.IP, port int) Frame {
+	body := make([]byte, 6)
+	copy(body[:4], ip.To4())
+	binary.BigEndian.PutUint16(body[4:], uint16(port))
+	return Frame{Type: MsgNATProbe, Body: body}
+}
+
+// ParseNATProbeFrame extracts the target IP and port from a NATProbe frame body.
+func ParseNATProbeFrame(body []byte) (net.IP, int, error) {
+	if len(body) < 6 {
+		return nil, 0, fmt.Errorf("NAT probe frame too short: %d", len(body))
+	}
+	ip := net.IPv4(body[0], body[1], body[2], body[3])
+	port := int(binary.BigEndian.Uint16(body[4:]))
+	return ip, port, nil
 }

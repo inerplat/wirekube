@@ -213,13 +213,6 @@ type WireKubeMeshStatus struct {
 	// TotalPeers is the total number of WireKubePeer resources in the cluster.
 	TotalPeers int32 `json:"totalPeers,omitempty"`
 
-	// NodeConnections maps each node's name to its view of peer transport modes.
-	// Each agent writes only its own entry (key = node's own name).
-	// Inner key is the peer name, value is "direct" or "relay".
-	// Using JSON merge-patch semantics: each agent's write only affects its own key.
-	// +optional
-	NodeConnections map[string]map[string]string `json:"nodeConnections,omitempty"`
-
 	// Conditions reflect the current state of the WireKubeMesh.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
