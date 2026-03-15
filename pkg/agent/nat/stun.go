@@ -20,9 +20,10 @@ var defaultSTUNServers = []string{
 type NATType string
 
 const (
-	NATUnknown   NATType = ""
-	NATCone      NATType = "cone"
-	NATSymmetric NATType = "symmetric"
+	NATUnknown             NATType = ""
+	NATCone                NATType = "cone"
+	NATPortRestrictedCone  NATType = "port-restricted-cone"
+	NATSymmetric           NATType = "symmetric"
 )
 
 // PortPrediction describes the NAT's port allocation pattern observed via STUN.
@@ -268,6 +269,82 @@ func querySTUN(ctx context.Context, conn *net.UDPConn, server string) (string, e
 	}
 
 	return fmt.Sprintf("%s:%d", xorAddr.IP, xorAddr.Port), nil
+}
+
+// NATProbeFunc sends a UDP probe from a different source port to the given
+// endpoint. Used by DetectPortRestriction to request the relay to probe us.
+type NATProbeFunc func(ip net.IP, port int) error
+
+// DetectPortRestriction checks whether a cone NAT is port-restricted by asking
+// an external prober (typically the relay server) to send a UDP packet from a
+// source port different from what we communicated with.
+//
+// Algorithm:
+//  1. Open a temporary UDP socket on an ephemeral port.
+//  2. Do a STUN query to discover the socket's mapped endpoint (pub_ip:pub_port).
+//  3. Send a regular UDP packet to the relay IP on port 3478 from this socket
+//     (this opens the NAT filter for relay_ip:3478).
+//  4. Ask the relay (via TCP) to send a UDP probe to pub_ip:pub_port from a
+//     DIFFERENT source port (e.g., random ephemeral).
+//  5. Listen on the temp socket for 3 seconds.
+//  6. If received → restricted-cone (address-only filter).
+//     If not → port-restricted-cone.
+func DetectPortRestriction(ctx context.Context, stunServers []string, relayIP string, probeFunc NATProbeFunc) (NATType, error) {
+	if len(stunServers) == 0 {
+		stunServers = defaultSTUNServers
+	}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return NATCone, fmt.Errorf("listen UDP: %w", err)
+	}
+	defer conn.Close()
+
+	stunCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	endpoint, err := querySTUN(stunCtx, conn, stunServers[0])
+	if err != nil {
+		return NATCone, fmt.Errorf("STUN query for port-restriction test: %w", err)
+	}
+
+	ip, portStr, _ := net.SplitHostPort(endpoint)
+	port, _ := strconv.Atoi(portStr)
+	mappedIP := net.ParseIP(ip)
+	if mappedIP == nil {
+		return NATCone, fmt.Errorf("invalid STUN mapped IP: %s", ip)
+	}
+
+	// Send a packet to the relay IP on port 3478 to open the NAT filter for
+	// that IP (address-restricted cone would accept from any port on that IP).
+	relayAddr, err := net.ResolveUDPAddr("udp4", relayIP+":3478")
+	if err != nil {
+		return NATCone, fmt.Errorf("resolve relay addr: %w", err)
+	}
+	conn.WriteToUDP([]byte("WIREKUBE_NAT_OPEN"), relayAddr)
+
+	// Ask the relay to probe us from a different port.
+	if err := probeFunc(mappedIP, port); err != nil {
+		return NATCone, fmt.Errorf("requesting NAT probe: %w", err)
+	}
+
+	// Wait for the probe packet.
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 256)
+	for {
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			// Timeout — no probe received → port-restricted cone.
+			fmt.Printf("[stun] port-restriction test: no probe received from relay (timeout) → port-restricted-cone\n")
+			return NATPortRestrictedCone, nil
+		}
+		// Check if the packet is from the relay IP but a different port.
+		if addr.IP.Equal(relayAddr.IP) && addr.Port != relayAddr.Port {
+			fmt.Printf("[stun] port-restriction test: received probe from %s (relay port %d) → restricted-cone (not port-restricted)\n", addr, relayAddr.Port)
+			_ = n
+			return NATCone, nil
+		}
+		// Ignore packets from same port (our own STUN exchange) or other sources.
+	}
 }
 
 func resolveSTUNAddr(server string) (*net.UDPAddr, error) {

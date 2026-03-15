@@ -102,6 +102,68 @@ func (p *Pool) GetOrCreateProxy(peerPubKey [relayproto.PubKeySize]byte) (*UDPPro
 	return proxy, nil
 }
 
+// LastRelayHandshake returns the most recent time a WireGuard handshake packet
+// was delivered to WG via the relay proxy for the given peer. Returns the zero
+// time if no proxy exists or no handshake has been relayed yet.
+func (p *Pool) LastRelayHandshake(peerPubKey [relayproto.PubKeySize]byte) time.Time {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if !ok {
+		return time.Time{}
+	}
+	return proxy.LastHandshakeDelivered()
+}
+
+// HoldDelivery blocks relay packet delivery to WG for the given peer until
+// the returned function is called. Returns a no-op if no proxy exists.
+// Used by the ICE engine to take a clean WG stats snapshot without a
+// concurrent relay packet contaminating ActualEndpoint via WG roaming.
+func (p *Pool) HoldDelivery(peerPubKey [relayproto.PubKeySize]byte) func() {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if !ok {
+		return func() {}
+	}
+	return proxy.HoldDelivery()
+}
+
+// SuspendDelivery blocks relay→WG delivery for the given peer for the
+// duration of an ICE probe. Packets are buffered internally. Call
+// ResumeDelivery when the probe completes.
+func (p *Pool) SuspendDelivery(peerPubKey [relayproto.PubKeySize]byte) {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if ok {
+		proxy.SuspendDelivery()
+	}
+}
+
+// ResumeDelivery re-enables relay→WG delivery after a probe.
+// flush=true delivers buffered packets (probe failed, relay resumes).
+// flush=false discards them (probe succeeded, direct path active).
+func (p *Pool) ResumeDelivery(peerPubKey [relayproto.PubKeySize]byte, flush bool) {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if ok {
+		proxy.ResumeDelivery(flush)
+	}
+}
+
+// IsDeliverySuspended reports whether delivery for the given peer is suspended.
+func (p *Pool) IsDeliverySuspended(peerPubKey [relayproto.PubKeySize]byte) bool {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return proxy.IsSuspended()
+}
+
 // RemoveProxy stops and removes a proxy for a peer.
 func (p *Pool) RemoveProxy(peerPubKey [relayproto.PubKeySize]byte) {
 	p.mu.Lock()
@@ -114,6 +176,30 @@ func (p *Pool) RemoveProxy(peerPubKey [relayproto.PubKeySize]byte) {
 	if ok {
 		proxy.Close()
 	}
+}
+
+// SendNATProbe asks the relay to send a UDP probe from a different source port
+// to the specified mapped endpoint. Used for port-restricted cone detection.
+func (p *Pool) SendNATProbe(ip net.IP, port int) error {
+	clients := p.connectedClients()
+	if len(clients) == 0 {
+		return fmt.Errorf("no relay connected")
+	}
+	return clients[0].SendNATProbe(ip, port)
+}
+
+// RelayIP returns the IP of the first connected relay server.
+func (p *Pool) RelayIP() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for addr := range p.clients {
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil {
+			return host
+		}
+	}
+	host, _, _ := net.SplitHostPort(p.relayAddr)
+	return host
 }
 
 // SendToPeer sends a UDP payload to a remote peer through any connected relay.
