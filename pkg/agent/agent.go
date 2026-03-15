@@ -68,6 +68,10 @@ type Agent struct {
 	// relayPrewarmed tracks peers whose relay proxy has been pre-created for
 	// make-before-break failover but not yet activated (WG still uses direct).
 	relayPrewarmed map[string]bool
+	// probeForced tracks symmetric NAT peers where the probe endpoint has already
+	// been force-applied to WG once. After the first sync, ForceEndpoint is disabled
+	// so WG can learn the peer's actual NAT-mapped port from incoming packets.
+	probeForced map[string]bool
 	// ownPublicKeyB64 caches the base64-encoded public key.
 	ownPublicKeyB64 string
 	// portPrediction stores our NAT port prediction data from STUN.
@@ -108,6 +112,7 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podNa
 		iceStates:          make(map[string]*peerICEState),
 		holePunchEndpoints: make(map[string]string),
 		relayPrewarmed:     make(map[string]bool),
+		probeForced:        make(map[string]bool),
 	}
 }
 
@@ -255,6 +260,20 @@ func (a *Agent) setup(ctx context.Context) error {
 
 	// Upsert our WireKubePeer
 	peerName := a.nodeName
+
+	// When STUN fell back to an ephemeral port (preserved interface restart),
+	// the cone NAT port mapping for the WG socket is unknown — the substituted
+	// listenPort may be wrong. Prefer the existing CRD endpoint (set during
+	// the initial startup when STUN could bind directly to the WG port).
+	if epResult != nil && epResult.PortEstimated {
+		existing := &wirekubev1alpha1.WireKubePeer{}
+		if getErr := a.client.Get(ctx, client.ObjectKey{Name: peerName}, existing); getErr == nil && existing.Spec.Endpoint != "" {
+			fmt.Printf("[endpoint] preserved interface restart: keeping existing endpoint %s (ephemeral STUN port unreliable for cone NAT)\n", existing.Spec.Endpoint)
+			epResult.Endpoint = existing.Spec.Endpoint
+			epResult.PortEstimated = false
+		}
+	}
+
 	if err := a.upsertOwnPeer(ctx, mesh, node, peerName, kp.PublicKeyBase64(), epResult); err != nil {
 		return fmt.Errorf("upserting own peer: %w", err)
 	}
@@ -262,6 +281,33 @@ func (a *Agent) setup(ctx context.Context) error {
 	// Initialize relay client if configured (relay-first: connect immediately).
 	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64()); err != nil {
 		fmt.Printf("warning: relay init failed (will retry): %v\n", err)
+	}
+
+	// If initial STUN detected cone NAT and relay is available, refine detection
+	// to distinguish port-restricted cone from address-restricted cone.
+	if a.detectedNATType == string(nat.NATCone) && a.relayPool != nil && a.relayPool.IsConnected() {
+		relayIP := a.relayPool.RelayIP()
+		fmt.Printf("[setup] starting port-restriction detection (relayIP=%s)\n", relayIP)
+		if relayIP != "" {
+			probeFunc := func(ip net.IP, port int) error {
+				return a.relayPool.SendNATProbe(ip, port)
+			}
+			refinedType, err := nat.DetectPortRestriction(ctx, mesh.Spec.STUNServers, relayIP, probeFunc)
+			if err != nil {
+				fmt.Printf("[setup] port-restriction detection failed: %v (keeping cone)\n", err)
+			} else {
+				a.detectedNATType = string(refinedType)
+				if refinedType == nat.NATPortRestrictedCone {
+					fmt.Printf("[setup] port-restricted cone NAT detected — direct retry disabled for incompatible peers\n")
+				} else {
+					fmt.Printf("[setup] address-restricted cone NAT confirmed — direct P2P possible\n")
+				}
+				// Update CRD with refined NAT type.
+				if err := a.updateDiscoveryMethod(ctx, peerName, "stun"); err != nil {
+					fmt.Printf("warning: updating NAT type in CRD: %v\n", err)
+				}
+			}
+		}
 	}
 
 	// Recover ICE state from surviving WireGuard peers. If the interface was
@@ -579,12 +625,43 @@ func (a *Agent) sync(ctx context.Context) error {
 			allRoutes = append(allRoutes, cidr)
 		}
 
+		// ForceEndpoint overrides WG's NAT-preservation logic (which would reuse
+		// the kernel's existing.Endpoint). We force in two cases:
+		//   1. Active ICE probe: ensure WG sends to the candidate endpoint.
+		//   2. ICE-connected but not relayed: after relay proxy closure the kernel
+		//      still holds the old proxy address (127.0.0.1:PORT) as existing.Endpoint.
+		//      Without forcing, SyncPeers reuses that dead address and WG keepalives
+		//      go to a closed socket, causing isDirectConnected to fail within 30s.
+		//
+		// Symmetric NAT exception: for symmetric peers, we only ForceEndpoint ONCE
+		// during the probe (to set the initial endpoint and open our NAT filter).
+		// After that first sync, ForceEndpoint is disabled so WG can learn the
+		// peer's actual NAT-mapped port from incoming packets. The CRD endpoint
+		// uses the STUN port (e.g. 51822), but symmetric NAT maps each destination
+		// to a DIFFERENT port. ForceEndpoint on every sync would overwrite the
+		// WG-learned port, breaking bidirectional connectivity.
+		iceStateNow := a.getICEState(p.Name)
+		peerIsSymmetric := p.Status.NATType == "symmetric"
+		forceForProbe := a.directProbing[p.Name] && (!peerIsSymmetric || !a.probeForced[p.Name])
+		if forceForProbe && peerIsSymmetric {
+			a.probeForced[p.Name] = true
+		}
+		// Force the endpoint when:
+		//   1. Active probe: ensure WG sends to the candidate endpoint.
+		//   2. Connected non-symmetric peer: prevent WG from keeping stale relay address.
+		//   3. Connected symmetric peer WITH a discovered endpoint: use the actual
+		//      NAT-mapped port instead of the wrong CRD port.
+		hasDiscoveredEp := peerIsSymmetric && a.directEndpoints[p.Name] != "" &&
+			!isLocalhostEndpoint(a.directEndpoints[p.Name])
+		forceEp := forceForProbe ||
+			(iceStateNow.State == iceStateConnected && !a.relayedPeers[p.Name] &&
+				(!peerIsSymmetric || hasDiscoveredEp))
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
 			Endpoint:         endpoint,
 			AllowedIPs:       filteredAllowedIPs,
 			KeepaliveSeconds: int(p.Spec.PersistentKeepalive),
-			ForceEndpoint:    a.directProbing[p.Name],
+			ForceEndpoint:    forceEp,
 		})
 	}
 
@@ -618,10 +695,27 @@ func (a *Agent) sync(ctx context.Context) error {
 		fmt.Printf("warning: syncing own pod CIDR: %v\n", err)
 	}
 
-	// Close relay proxies for peers upgraded to direct in the previous cycle.
-	// This is the "break" half of make-before-break: WG was switched to direct
-	// last cycle, so the relay proxy is no longer needed.
+	// Process relay grace for peers upgraded to direct.
+	// Unlike the old design which fully closed relay proxies, the new standby
+	// mode keeps relay proxies alive but marks the peer as non-relayed. The
+	// relay proxy remains pre-warmed for instant failover.
 	a.processRelayGrace()
+
+	// Ensure relay proxies exist for ALL peers in standby mode so that
+	// failover from direct→relay is instant with no warmup delay.
+	a.prewarmAllPeerRelays(peerList)
+
+	// Refresh WG stats after relay proxy closures. processRelayGrace may have
+	// just closed relay proxies, and WG's ForceEndpoint (set above for
+	// iceStateConnected peers) may have triggered a re-handshake during this
+	// sync cycle. Using fresh stats ensures isDirectConnected sees the new
+	// LastHandshake rather than the stale snapshot from the start of the cycle.
+	if freshStats, err := a.wgMgr.GetStats(); err == nil {
+		statsByKey = make(map[string]wireguard.PeerStats, len(freshStats))
+		for _, s := range freshStats {
+			statsByKey[s.PublicKeyB64] = s
+		}
+	}
 
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
@@ -705,11 +799,16 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 		crdHost, _, crdErr := net.SplitHostPort(p.Spec.Endpoint)
 		actualHost, _, actualErr := net.SplitHostPort(s.ActualEndpoint)
 		if crdErr == nil && actualErr == nil {
-			// Same IP, different port: skip. Port changes within the same public IP
-			// are a symptom of symmetric NAT (each destination sees a different mapping).
-			// Only reflect when the public IP itself changes (e.g. dynamic IP rotation).
 			if crdHost == actualHost {
-				continue
+				// For symmetric NAT: same IP, different port = per-destination mapping.
+				// Skip to avoid poisoning the CRD with an unstable port.
+				// For cone NAT: same IP, different port = the actual stable NAT-mapped port
+				// for this peer's WireGuard socket (e.g. when STUN couldn't bind to the WG
+				// port during a preserved-interface restart and substituted listenPort).
+				// Allow the update so future probes use the correct port.
+				if p.Status.NATType != "cone" {
+					continue
+				}
 			}
 			// Never downgrade a public IP to a private IP. The kernel may hold
 			// a stale private endpoint from before the peer switched to relay.
@@ -768,20 +867,15 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeer
 		return err
 	}
 
-	// Write per-peer transport view to WireKubeMesh status.
-	// Each agent writes only its own node key; JSON merge-patch merges other nodes' keys.
-	return a.updateMeshNodeConnections(ctx, peerName, remotePeerNames)
+	// Write per-peer transport view and aggregated counts.
+	return a.updatePeerConnections(ctx, peerName, remotePeerNames)
 }
 
-// updateMeshNodeConnections writes this node's peer transport view and
-// aggregated peer counts to WireKubeMesh status. This consolidates the
-// reconciliation that was previously split across a separate operator.
-func (a *Agent) updateMeshNodeConnections(ctx context.Context, myNode string, remotePeerNames []string) error {
-	mesh, err := a.getMesh(ctx)
-	if err != nil {
-		return err
-	}
-
+// updatePeerConnections writes this node's per-peer transport view to its own
+// WireKubePeer status and updates aggregate counts in WireKubeMesh.
+// Each agent writes only to its own peer, avoiding write conflicts at scale.
+func (a *Agent) updatePeerConnections(ctx context.Context, myNode string, remotePeerNames []string) error {
+	// Build connections map (this node's view of each remote peer).
 	connections := make(map[string]string, len(remotePeerNames))
 	for _, name := range remotePeerNames {
 		if a.relayedPeers[name] {
@@ -791,7 +885,24 @@ func (a *Agent) updateMeshNodeConnections(ctx context.Context, myNode string, re
 		}
 	}
 
-	// Count all peers for ReadyPeers/TotalPeers.
+	// Write connections to own WireKubePeer status.
+	ownPeer := &wirekubev1alpha1.WireKubePeer{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: myNode}, ownPeer); err != nil {
+		return err
+	}
+	peerPatch := client.MergeFrom(ownPeer.DeepCopy())
+	ownPeer.Status.Connections = connections
+	if err := a.client.Status().Patch(ctx, ownPeer, peerPatch); err != nil {
+		return err
+	}
+
+	// Update ReadyPeers/TotalPeers in WireKubeMesh (aggregate counts).
+	// Multiple agents write these concurrently; last-write-wins is acceptable
+	// since the values are eventually consistent approximations.
+	mesh, err := a.getMesh(ctx)
+	if err != nil {
+		return err
+	}
 	peerList := &wirekubev1alpha1.WireKubePeerList{}
 	if listErr := a.client.List(ctx, peerList); listErr != nil {
 		return listErr
@@ -802,15 +913,10 @@ func (a *Agent) updateMeshNodeConnections(ctx context.Context, myNode string, re
 			readyCount++
 		}
 	}
-
-	patch := client.MergeFrom(mesh.DeepCopy())
-	if mesh.Status.NodeConnections == nil {
-		mesh.Status.NodeConnections = make(map[string]map[string]string)
-	}
-	mesh.Status.NodeConnections[myNode] = connections
+	meshPatch := client.MergeFrom(mesh.DeepCopy())
 	mesh.Status.ReadyPeers = readyCount
 	mesh.Status.TotalPeers = int32(len(peerList.Items))
-	return a.client.Status().Patch(ctx, mesh, patch)
+	return a.client.Status().Patch(ctx, mesh, meshPatch)
 }
 
 // initRelay sets up the relay client from the mesh relay configuration.
@@ -902,15 +1008,32 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 	}
 
 	// If ICE has determined this peer is directly reachable (post-upgrade),
-	// use the direct endpoint.
+	// use the direct endpoint. For symmetric NAT peers, use the NAT-mapped
+	// endpoint discovered during probe Phase 2 (stored in directEndpoints).
+	// If no discovered endpoint exists, return "" so WG keeps its kernel-learned port.
 	iceState := a.getICEState(peer.Name)
 	if iceState.State == iceStateConnected && !a.relayedPeers[peer.Name] {
+		if peer.Status.NATType == "symmetric" {
+			if ep := a.directEndpoints[peer.Name]; ep != "" && !isLocalhostEndpoint(ep) {
+				return ep
+			}
+			return ""
+		}
 		return peer.Spec.Endpoint
 	}
 
 	// If peer is being probed for direct connectivity, temporarily use direct.
 	if a.directProbing[peer.Name] {
 		if ep := a.directEndpoints[peer.Name]; ep != "" {
+			// Anchor LastCheck to when the endpoint is first written into WG config
+			// (via SyncPeers, which runs before tryDirectUpgrade in the same sync).
+			// Without this, evaluateICECheck sees LastCheck from startICECheck (one
+			// sync cycle earlier) and evaluates before WG has time to handshake.
+			if !iceState.directProbeApplied {
+				iceState.directProbeApplied = true
+				iceState.LastCheck = time.Now()
+				a.setICEState(peer.Name, iceState)
+			}
 			return ep
 		}
 	}
@@ -1079,6 +1202,37 @@ func (a *Agent) findNodePortEndpoint(ctx context.Context, nodePort int32) string
 		}
 	}
 	return ""
+}
+
+// prewarmAllPeerRelays ensures a relay proxy exists for every remote peer,
+// even peers currently on a direct path. The proxy sits idle in standby
+// mode but is immediately available if the direct path fails, providing
+// zero-delay failover.
+func (a *Agent) prewarmAllPeerRelays(peerList *wirekubev1alpha1.WireKubePeerList) {
+	if a.relayPool == nil || !a.relayPool.IsConnected() {
+		return
+	}
+	if a.relayMode == relayModeNever {
+		return
+	}
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+		if p.Name == a.nodeName || p.Spec.PublicKey == "" {
+			continue
+		}
+		if a.relayedPeers[p.Name] {
+			continue
+		}
+		var pubKey [relayproto.PubKeySize]byte
+		keyBytes, err := base64.StdEncoding.DecodeString(p.Spec.PublicKey)
+		if err != nil {
+			continue
+		}
+		copy(pubKey[:], keyBytes)
+		if _, err := a.relayPool.GetOrCreateProxy(pubKey); err != nil {
+			fmt.Printf("[relay-standby] failed to pre-warm proxy for %s: %v\n", p.Name, err)
+		}
+	}
 }
 
 func (a *Agent) getOwnPublicKey() string {

@@ -82,6 +82,9 @@ func (c *Client) dial(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 
 	writer := bufio.NewWriterSize(conn, 64*1024)
 	regFrame := relayproto.MakeRegisterFrame(c.myPubKey)
@@ -251,6 +254,21 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 			break
 		}
 	}
+}
+
+// SendNATProbe asks the relay to send a UDP probe from a different source port
+// to the specified mapped endpoint. Used for port-restricted cone detection.
+func (c *Client) SendNATProbe(ip net.IP, port int) error {
+	frame := relayproto.MakeNATProbeFrame(ip, port)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writer == nil {
+		return fmt.Errorf("not connected")
+	}
+	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
+		return err
+	}
+	return c.writer.Flush()
 }
 
 // SendToPeer sends a UDP payload to a remote peer through the relay.

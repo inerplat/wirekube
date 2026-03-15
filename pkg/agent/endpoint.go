@@ -32,6 +32,12 @@ type EndpointResult struct {
 	Method         DiscoveryMethod
 	NATType        nat.NATType
 	PortPrediction *nat.PortPrediction
+	// PortEstimated is true when the port in Endpoint is not confirmed via
+	// STUN from the WireGuard listen socket. This happens when the WG interface
+	// is preserved across restart and STUN falls back to an ephemeral port —
+	// for cone NAT the WG port's actual NAT mapping may differ from listenPort.
+	// Callers should prefer the existing CRD endpoint port over this value.
+	PortEstimated bool
 }
 
 // DiscoverEndpoint attempts to find the public WireGuard endpoint for this node.
@@ -204,24 +210,33 @@ func discoverViaSTUN(ctx context.Context, listenPort int, stunServers []string) 
 // buildSTUNResult converts a raw STUN result into an EndpointResult.
 //
 // useListenPort=false (bound to WG listen port): for cone NAT the mapped port
-// equals the WG port, so the STUN endpoint is used as-is. For symmetric NAT
-// the mapped port is unstable and gets replaced with listenPort.
+// is the actual WG NAT mapping; use it as-is. For symmetric NAT the mapped
+// port is per-destination and unstable; substitute listenPort as a placeholder.
 //
 // useListenPort=true (bound to ephemeral port): the mapped port reflects the
-// ephemeral source, not WG. Always substitute listenPort.
+// ephemeral source, not the WG socket. We substitute listenPort but mark
+// PortEstimated=true for cone NAT because the WG port's actual NAT mapping
+// is unknown — the caller should prefer the existing CRD endpoint port.
 func buildSTUNResult(sr *nat.STUNResult, listenPort int, useListenPort bool) *EndpointResult {
 	ep := sr.Endpoint
+	portEstimated := false
 	if useListenPort || sr.NATType == nat.NATSymmetric {
 		host, _, err := net.SplitHostPort(sr.Endpoint)
 		if err != nil {
 			return nil
 		}
 		ep = fmt.Sprintf("%s:%d", host, listenPort)
+		// For cone NAT with ephemeral-port STUN, the WG port's actual NAT
+		// mapping may differ from listenPort — mark as estimated.
+		if useListenPort && sr.NATType != nat.NATSymmetric {
+			portEstimated = true
+		}
 	}
 	return &EndpointResult{
 		Endpoint:       ep,
 		Method:         MethodSTUN,
 		NATType:        sr.NATType,
 		PortPrediction: sr.PortPrediction,
+		PortEstimated:  portEstimated,
 	}
 }

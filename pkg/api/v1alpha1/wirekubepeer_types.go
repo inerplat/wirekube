@@ -106,6 +106,11 @@ type WireKubePeerStatus struct {
 	// +optional
 	ICEState string `json:"iceState,omitempty"`
 
+	// Connections maps each remote peer name to the transport mode this node uses to reach it.
+	// "direct" or "relay". Written by the agent that owns this peer.
+	// +optional
+	Connections map[string]string `json:"connections,omitempty"`
+
 	// RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
 	// Only set when TransportMode is "relay".
 	// +optional
