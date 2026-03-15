@@ -67,8 +67,9 @@ make init-mesh          # Apply default WireKubeMesh CR
 **Relay** (`cmd/relay/`) — Optional, single deployment
 - Bridges WireGuard UDP over TCP when NAT blocks direct P2P
 - Custom binary frame protocol: `[4B length][1B type][body]`
-  - `0x01` Register (32B WG pubkey), `0x02` Data (32B dest pubkey + UDP payload), `0x03` Keepalive, `0xFF` Error
-- Listens on port 3478 (override with `--addr` or `WIREKUBE_RELAY_ADDR`)
+  - `0x01` Register (32B WG pubkey), `0x02` Data (32B dest pubkey + UDP payload), `0x03` Keepalive, `0x04` NATProbe (IP+port), `0xFF` Error
+- Listens on TCP 3478 + UDP 3478 (override with `--addr` or `WIREKUBE_RELAY_ADDR`)
+- UDP 3478 is used for NAT verification probes (dual-probe port-restriction detection)
 
 **WireKubeCTL** (`cmd/wirekubectl/`) — CLI for status and peer management
 
@@ -105,14 +106,16 @@ Inspired by [Tailscale's NAT traversal](https://tailscale.com/blog/how-nat-trave
 
 1. Direct P2P via STUN-discovered public endpoint
 2. TCP relay after 30s handshake timeout (WireGuard encryption preserved end-to-end)
-3. ICE-like negotiation with NAT type detection (cone vs symmetric)
+3. ICE-like negotiation with NAT type detection (cone vs symmetric vs port-restricted-cone)
 4. Cone ↔ Cone: direct via stable STUN endpoints
 5. Cone ↔ Symmetric: probe using cone side's stable endpoint
-6. Symmetric ↔ Symmetric: birthday attack (disabled by default, configurable via `WireKubeMesh.spec.natTraversal.birthdayAttack` or per-peer annotation `wirekube.io/birthday-attack`)
-7. Same-NAT detection: peers sharing the same public IP use host candidates (LAN IP) for direct communication
-8. NAT endpoint reflection: once a direct connection succeeds, the CRD endpoint is updated to the actual NAT-mapped port
-9. Relay auto-reconnect with exponential backoff (1s–30s)
-10. Relay pool: DNS-based multi-instance discovery, agents register on all replicas
+6. Port-Restricted Cone ↔ Symmetric: permanent relay (direct impossible)
+7. Symmetric ↔ Symmetric: birthday attack (disabled by default, configurable via `WireKubeMesh.spec.natTraversal.birthdayAttack` or per-peer annotation `wirekube.io/birthday-attack`)
+8. Same-NAT detection: peers sharing the same public IP use host candidates (LAN IP) for direct communication
+9. NAT endpoint reflection: once a direct connection succeeds, the CRD endpoint is updated to the actual NAT-mapped port
+10. Relay auto-reconnect with exponential backoff (1s–30s)
+11. Relay pool: DNS-based multi-instance discovery, agents register on all replicas
+12. Dual-probe port-restriction detection: relay sends verification probe (from bound port) + test probe (from random port). If neither arrives → firewall blocking (not NAT) → cone; if only verification → port-restricted-cone; if both → cone
 
 ## Config Layout
 
