@@ -14,6 +14,11 @@ import (
 type Server struct {
 	mu    sync.RWMutex
 	peers map[[PubKeySize]byte]*clientConn
+
+	// probeConn is a UDP socket bound to the relay's listen port for sending
+	// NAT verification probes. Agents open their NAT filter for this port,
+	// so a probe from here distinguishes "firewall blocked" from "NAT blocked".
+	probeConn *net.UDPConn
 }
 
 type clientConn struct {
@@ -35,6 +40,21 @@ func (s *Server) ListenAndServe(addr string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	defer ln.Close()
+
+	// Bind a UDP socket on the same port for NAT verification probes.
+	// Agents send a UDP packet to this port to open their NAT filter,
+	// then we probe back from THIS socket as a verification that the
+	// path is reachable (distinguishes firewall from NAT restriction).
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	udpAddr := &net.UDPAddr{IP: tcpAddr.IP, Port: tcpAddr.Port}
+	s.probeConn, err = net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		log.Printf("relay: warning: UDP probe listener on %s failed: %v (verification probes disabled)", udpAddr, err)
+	} else {
+		log.Printf("relay: UDP probe listener on %s", udpAddr)
+		defer s.probeConn.Close()
+	}
+
 	log.Printf("relay: listening on %s", addr)
 
 	for {
@@ -152,27 +172,43 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-// sendNATProbe sends a UDP probe to the specified endpoint from a random
-// ephemeral port. The agent uses this to detect port-restricted cone NAT:
-// the agent first opens its NAT mapping via STUN, then asks the relay to
-// probe from a different source port. If the agent receives this probe,
-// it knows its NAT accepts traffic from any port on a known IP (restricted
-// cone). If it doesn't, it's port-restricted cone.
+// sendNATProbe sends two UDP probes to the specified endpoint:
+//
+//  1. Verification probe from the relay's bound UDP port (same port the agent
+//     sent its NAT-opening packet to). This tests basic reachability.
+//  2. Test probe from a random ephemeral port. This tests port restriction.
+//
+// The agent evaluates the combination:
+//   - Both received   → cone (address-restricted or full)
+//   - Only verify     → port-restricted cone
+//   - Neither         → firewall blocking (not NAT) → remains cone
 func (s *Server) sendNATProbe(ip net.IP, port int, requester [PubKeySize]byte) {
 	addr := &net.UDPAddr{IP: ip, Port: port}
+
+	// Probe 1: verification from the bound UDP port (agent opened NAT for this).
+	if s.probeConn != nil {
+		verify := []byte("WIREKUBE_NAT_VERIFY")
+		if _, err := s.probeConn.WriteToUDP(verify, addr); err != nil {
+			log.Printf("relay: NAT verify probe to %s failed: %v", addr, err)
+		} else {
+			log.Printf("relay: NAT verify probe sent to %s for %x (from bound port)", addr, requester[:8])
+		}
+	}
+
+	// Probe 2: test from a random ephemeral port.
 	conn, err := net.DialUDP("udp4", nil, addr)
 	if err != nil {
-		log.Printf("relay: NAT probe dial %s failed: %v", addr, err)
+		log.Printf("relay: NAT test probe dial %s failed: %v", addr, err)
 		return
 	}
 	defer conn.Close()
 
 	probe := []byte("WIREKUBE_NAT_PROBE")
 	if _, err := conn.Write(probe); err != nil {
-		log.Printf("relay: NAT probe send to %s failed: %v", addr, err)
+		log.Printf("relay: NAT test probe send to %s failed: %v", addr, err)
 		return
 	}
-	log.Printf("relay: NAT probe sent to %s for %x", addr, requester[:8])
+	log.Printf("relay: NAT test probe sent to %s for %x (from ephemeral port)", addr, requester[:8])
 }
 
 // ConnectedPeers returns the number of currently connected peers.
