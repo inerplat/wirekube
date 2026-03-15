@@ -102,6 +102,33 @@ func (p *Pool) GetOrCreateProxy(peerPubKey [relayproto.PubKeySize]byte) (*UDPPro
 	return proxy, nil
 }
 
+// LastRelayHandshake returns the most recent time a WireGuard handshake packet
+// was delivered to WG via the relay proxy for the given peer. Returns the zero
+// time if no proxy exists or no handshake has been relayed yet.
+func (p *Pool) LastRelayHandshake(peerPubKey [relayproto.PubKeySize]byte) time.Time {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if !ok {
+		return time.Time{}
+	}
+	return proxy.LastHandshakeDelivered()
+}
+
+// HoldDelivery blocks relay packet delivery to WG for the given peer until
+// the returned function is called. Returns a no-op if no proxy exists.
+// Used by the ICE engine to take a clean WG stats snapshot without a
+// concurrent relay packet contaminating ActualEndpoint via WG roaming.
+func (p *Pool) HoldDelivery(peerPubKey [relayproto.PubKeySize]byte) func() {
+	p.mu.RLock()
+	proxy, ok := p.proxies[peerPubKey]
+	p.mu.RUnlock()
+	if !ok {
+		return func() {}
+	}
+	return proxy.HoldDelivery()
+}
+
 // RemoveProxy stops and removes a proxy for a peer.
 func (p *Pool) RemoveProxy(peerPubKey [relayproto.PubKeySize]byte) {
 	p.mu.Lock()

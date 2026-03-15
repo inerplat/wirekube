@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +34,19 @@ type UDPProxy struct {
 	recreateOnce sync.Once
 	stopOnce     sync.Once
 	stopCh       chan struct{}
+
+	// deliveryMu guards the actual write to the WG UDP socket.
+	// HoldDelivery acquires the write lock, blocking all DeliverToWireGuard
+	// calls. This lets the ICE engine take a clean WG stats snapshot without
+	// a concurrent relay packet roaming the peer's ActualEndpoint to localhost.
+	// Hold duration is bounded by one GetStats ioctl (~sub-millisecond).
+	deliveryMu sync.RWMutex
+
+	// lastHSDelivered tracks the most recent time a WireGuard handshake
+	// packet (Initiation type=1 or Response type=2) was delivered to WG
+	// via relay. Used by the ICE engine to distinguish relay-mediated
+	// handshakes from direct ones when evaluating probe success.
+	lastHSDelivered atomic.Pointer[time.Time]
 }
 
 func NewUDPProxy(peerPubKey [relayproto.PubKeySize]byte, sender Sender, wgPort int) (*UDPProxy, error) {
@@ -91,6 +105,28 @@ func (p *UDPProxy) Run() {
 	}
 }
 
+// LastHandshakeDelivered returns the time the most recent WireGuard handshake
+// packet (Initiation or Response) was delivered to WG via this relay proxy.
+// Returns the zero time if no handshake packet has been delivered yet.
+func (p *UDPProxy) LastHandshakeDelivered() time.Time {
+	if t := p.lastHSDelivered.Load(); t != nil {
+		return *t
+	}
+	return time.Time{}
+}
+
+// HoldDelivery acquires an exclusive lock on the delivery path, blocking any
+// concurrent DeliverToWireGuard calls until the returned function is called.
+// The caller must always invoke the returned function (defer is recommended).
+//
+// Intended for ICE probe evaluation: hold while calling wgMgr.GetStats() so
+// the snapshot is not contaminated by a relay packet roaming ActualEndpoint
+// to localhost. Hold duration is sub-millisecond (one GetStats ioctl).
+func (p *UDPProxy) HoldDelivery() func() {
+	p.deliveryMu.Lock()
+	return p.deliveryMu.Unlock
+}
+
 // DeliverToWireGuard sends a relay packet to the local WireGuard interface.
 //
 // Cilium's cgroup BPF sendmsg hook may reject sendto() with EPERM on sockets
@@ -100,11 +136,21 @@ func (p *UDPProxy) Run() {
 // for the BPF state to settle, then close the tainted socket and bind a fresh
 // one on the same port.  WireGuard's retransmissions cover the gap.
 func (p *UDPProxy) DeliverToWireGuard(payload []byte) {
+	// WireGuard message type 1 = Handshake Initiation, type 2 = Response.
+	// Track relay-mediated handshakes so the ICE engine can distinguish them
+	// from direct handshakes when evaluating direct-probe success.
+	if len(payload) >= 1 && (payload[0] == 1 || payload[0] == 2) {
+		now := time.Now()
+		p.lastHSDelivered.Store(&now)
+	}
+
 	p.connMu.RLock()
 	conn := p.conn
 	p.connMu.RUnlock()
 
+	p.deliveryMu.RLock()
 	_, err := conn.WriteTo(payload, p.wgAddr)
+	p.deliveryMu.RUnlock()
 	if err == nil {
 		return
 	}

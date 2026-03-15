@@ -166,6 +166,13 @@ spec:
                 description: Connected indicates whether this peer has an active WireGuard
                   handshake.
                 type: boolean
+              connections:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Connections maps each remote peer name to the transport mode this node uses to reach it.
+                  "direct" or "relay". Written by the agent that owns this peer.
+                type: object
               endpointDiscoveryMethod:
                 description: |-
                   EndpointDiscoveryMethod records how the endpoint was discovered.
