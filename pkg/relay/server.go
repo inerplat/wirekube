@@ -49,6 +49,9 @@ func (s *Server) ListenAndServe(addr string) error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 	reader := bufio.NewReader(conn)
 
 	frame, err := ReadFrame(reader)
@@ -132,6 +135,14 @@ func (s *Server) handleConn(conn net.Conn) {
 				log.Printf("relay: forward error to %x: %v", destKey[:8], err)
 			}
 
+		case MsgNATProbe:
+			ip, port, err := ParseNATProbeFrame(frame.Body)
+			if err != nil {
+				log.Printf("relay: bad NAT probe frame from %x: %v", pubKey[:8], err)
+				continue
+			}
+			go s.sendNATProbe(ip, port, pubKey)
+
 		case MsgKeepalive:
 			// no-op
 
@@ -139,6 +150,29 @@ func (s *Server) handleConn(conn net.Conn) {
 			log.Printf("relay: unknown frame type %d from %x", frame.Type, pubKey[:8])
 		}
 	}
+}
+
+// sendNATProbe sends a UDP probe to the specified endpoint from a random
+// ephemeral port. The agent uses this to detect port-restricted cone NAT:
+// the agent first opens its NAT mapping via STUN, then asks the relay to
+// probe from a different source port. If the agent receives this probe,
+// it knows its NAT accepts traffic from any port on a known IP (restricted
+// cone). If it doesn't, it's port-restricted cone.
+func (s *Server) sendNATProbe(ip net.IP, port int, requester [PubKeySize]byte) {
+	addr := &net.UDPAddr{IP: ip, Port: port}
+	conn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		log.Printf("relay: NAT probe dial %s failed: %v", addr, err)
+		return
+	}
+	defer conn.Close()
+
+	probe := []byte("WIREKUBE_NAT_PROBE")
+	if _, err := conn.Write(probe); err != nil {
+		log.Printf("relay: NAT probe send to %s failed: %v", addr, err)
+		return
+	}
+	log.Printf("relay: NAT probe sent to %s for %x", addr, requester[:8])
 }
 
 // ConnectedPeers returns the number of currently connected peers.

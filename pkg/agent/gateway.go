@@ -424,7 +424,9 @@ func (a *Agent) collectNonGatewayPeerIPs(ctx context.Context, peerList *wirekube
 	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
 	if err := a.client.List(ctx, gwList); err == nil {
 		for i := range gwList.Items {
-			if ap := gwList.Items[i].Status.ActivePeer; ap != "" {
+			// Use electActivePeer (reads Spec.PeerRefs) rather than Status.ActivePeer
+			// so new gateways are recognised immediately, before their status is set.
+			if ap := a.electActivePeer(ctx, &gwList.Items[i]); ap != "" {
 				gwPeers[ap] = true
 			}
 		}
