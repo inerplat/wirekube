@@ -42,6 +42,14 @@ type UDPProxy struct {
 	// Hold duration is bounded by one GetStats ioctl (~sub-millisecond).
 	deliveryMu sync.RWMutex
 
+	// suspended blocks relay delivery for the entire ICE probe window.
+	// While suspended, incoming relay packets are buffered instead of
+	// delivered to WG. This prevents relay traffic from roaming WG's
+	// ActualEndpoint to localhost during cone↔symmetric probe evaluation.
+	suspendMu sync.Mutex
+	suspended bool
+	buffer    [][]byte
+
 	// lastHSDelivered tracks the most recent time a WireGuard handshake
 	// packet (Initiation type=1 or Response type=2) was delivered to WG
 	// via relay. Used by the ICE engine to distinguish relay-mediated
@@ -127,7 +135,49 @@ func (p *UDPProxy) HoldDelivery() func() {
 	return p.deliveryMu.Unlock
 }
 
+const maxSuspendBuffer = 128
+
+// SuspendDelivery blocks relay→WG delivery for the entire ICE probe window.
+// Incoming packets are buffered (up to maxSuspendBuffer) instead of being
+// written to the WG socket. This prevents relay traffic from roaming WG's
+// ActualEndpoint to localhost during direct connectivity probes.
+func (p *UDPProxy) SuspendDelivery() {
+	p.suspendMu.Lock()
+	p.suspended = true
+	p.buffer = p.buffer[:0]
+	p.suspendMu.Unlock()
+}
+
+// ResumeDelivery re-enables relay→WG delivery.
+// If flush is true, buffered packets are delivered to WG (probe failed,
+// relay traffic resumes). If false, the buffer is discarded (probe
+// succeeded, direct path took over).
+func (p *UDPProxy) ResumeDelivery(flush bool) {
+	p.suspendMu.Lock()
+	p.suspended = false
+	pending := p.buffer
+	p.buffer = nil
+	p.suspendMu.Unlock()
+
+	if flush {
+		for _, pkt := range pending {
+			p.deliverDirect(pkt)
+		}
+	}
+}
+
+// IsSuspended reports whether delivery is currently suspended.
+func (p *UDPProxy) IsSuspended() bool {
+	p.suspendMu.Lock()
+	defer p.suspendMu.Unlock()
+	return p.suspended
+}
+
 // DeliverToWireGuard sends a relay packet to the local WireGuard interface.
+//
+// When delivery is suspended (during ICE probes), packets are buffered
+// instead of written to the WG socket. This prevents relay traffic from
+// roaming WG's peer endpoint to localhost during direct connectivity probes.
 //
 // Cilium's cgroup BPF sendmsg hook may reject sendto() with EPERM on sockets
 // created during a brief window after pod restart (before Cilium finishes
@@ -136,14 +186,27 @@ func (p *UDPProxy) HoldDelivery() func() {
 // for the BPF state to settle, then close the tainted socket and bind a fresh
 // one on the same port.  WireGuard's retransmissions cover the gap.
 func (p *UDPProxy) DeliverToWireGuard(payload []byte) {
-	// WireGuard message type 1 = Handshake Initiation, type 2 = Response.
-	// Track relay-mediated handshakes so the ICE engine can distinguish them
-	// from direct handshakes when evaluating direct-probe success.
 	if len(payload) >= 1 && (payload[0] == 1 || payload[0] == 2) {
 		now := time.Now()
 		p.lastHSDelivered.Store(&now)
 	}
 
+	p.suspendMu.Lock()
+	if p.suspended {
+		if len(p.buffer) < maxSuspendBuffer {
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			p.buffer = append(p.buffer, cp)
+		}
+		p.suspendMu.Unlock()
+		return
+	}
+	p.suspendMu.Unlock()
+
+	p.deliverDirect(payload)
+}
+
+func (p *UDPProxy) deliverDirect(payload []byte) {
 	p.connMu.RLock()
 	conn := p.conn
 	p.connMu.RUnlock()
