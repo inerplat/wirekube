@@ -8,7 +8,7 @@ GOFLAGS = -ldflags="-s -w"
 ## ─── Build ───────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build: build-agent build-relay build-wirekubectl
+build: build-agent build-relay build-wirekubectl build-stun-server
 
 build-agent:
 	$(GO) build $(GOFLAGS) -o bin/agent ./cmd/agent
@@ -24,6 +24,11 @@ build-wirekubectl:
 	$(GO) build $(GOFLAGS) -o bin/wirekubectl ./cmd/wirekubectl
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-amd64 ./cmd/wirekubectl/
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-arm64 ./cmd/wirekubectl/
+
+build-stun-server:
+	$(GO) build $(GOFLAGS) -o bin/wirekube-stun ./cmd/stun-server
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-stun-linux-amd64 ./cmd/stun-server/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-stun-linux-arm64 ./cmd/stun-server/
 
 ## ─── Generate ────────────────────────────────────────────────────────────────
 
@@ -99,6 +104,20 @@ init-mesh:
 test:
 	$(GO) test ./... -v
 
+# kind-e2e: run end-to-end tests in a local kind cluster.
+#
+# Prerequisites (one-time setup — requires internet access):
+#   docker pull kindest/node:v1.31.0   # pre-pull kind node image
+#   make docker-build                   # build WireKube image locally
+#
+# Optional overrides:
+#   WIREKUBE_IMAGE=myrepo/wirekube:tag  # custom agent image
+#   WIREKUBE_KIND_CLUSTER=my-cluster    # reuse an existing kind cluster
+#   WIREKUBE_KIND_NODE_IMG=kindest/node:v1.30.0
+.PHONY: kind-e2e
+kind-e2e:
+	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m
+
 .PHONY: vet
 vet:
 	$(GO) vet ./...
@@ -125,4 +144,5 @@ help:
 	@echo "  undeploy           Remove all WireKube resources"
 	@echo "  label-node         Label a node: NODE_NAME=<name> make label-node"
 	@echo "  init-mesh          Create default WireKubeMesh"
-	@echo "  test               Run tests"
+	@echo "  test               Run unit tests"
+	@echo "  kind-e2e           Run kind-based e2e tests (requires pre-built image + kind CLI)"
