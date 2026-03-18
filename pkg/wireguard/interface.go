@@ -322,6 +322,60 @@ func (m *Manager) SyncPeers(peers []PeerConfig) error {
 	})
 }
 
+// ForceEndpoint immediately updates a single peer's endpoint in the WG
+// kernel interface, bypassing the full SyncPeers cycle. Used by ICE probing
+// to switch a peer from relay (localhost) to direct before the next sync.
+//
+// Also temporarily sets PersistentKeepaliveInterval to 1s so that WG sends
+// a keepalive/handshake to the new endpoint within 1 second. Without this,
+// WG reuses the existing session and waits up to the configured keepalive
+// interval (25s) before sending any packet to the new endpoint, which
+// exceeds the 8s probe window. The normal SyncPeers on the next cycle
+// restores the original keepalive interval.
+func (m *Manager) ForceEndpoint(pubKeyB64 string, endpoint string) error {
+	pubKey, err := decodeKey(pubKeyB64)
+	if err != nil {
+		return fmt.Errorf("decoding public key: %w", err)
+	}
+	ep, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return fmt.Errorf("resolving endpoint %s: %w", endpoint, err)
+	}
+	pokeKeepalive := 1 * time.Second
+	return m.wgClient.ConfigureDevice(m.ifaceName, wgtypes.Config{
+		ReplacePeers: false,
+		Peers: []wgtypes.PeerConfig{{
+			PublicKey:                   pubKey,
+			UpdateOnly:                 true,
+			Endpoint:                   ep,
+			ReplaceAllowedIPs:          false,
+			PersistentKeepaliveInterval: &pokeKeepalive,
+		}},
+	})
+}
+
+// PokeKeepalive temporarily sets PersistentKeepaliveInterval to 1s
+// to trigger an immediate outgoing WG packet without changing the endpoint.
+// If REKEY_AFTER_TIME has passed, this forces WG to initiate a re-handshake
+// on the current endpoint. The normal SyncPeers on the next cycle restores
+// the original keepalive interval.
+func (m *Manager) PokeKeepalive(pubKeyB64 string) error {
+	pubKey, err := decodeKey(pubKeyB64)
+	if err != nil {
+		return fmt.Errorf("decoding public key: %w", err)
+	}
+	pokeInterval := 1 * time.Second
+	return m.wgClient.ConfigureDevice(m.ifaceName, wgtypes.Config{
+		ReplacePeers: false,
+		Peers: []wgtypes.PeerConfig{{
+			PublicKey:                   pubKey,
+			UpdateOnly:                  true,
+			ReplaceAllowedIPs:           false,
+			PersistentKeepaliveInterval: &pokeInterval,
+		}},
+	})
+}
+
 // GetStats returns per-peer handshake and byte statistics.
 func (m *Manager) GetStats() ([]PeerStats, error) {
 	dev, err := m.wgClient.Device(m.ifaceName)
