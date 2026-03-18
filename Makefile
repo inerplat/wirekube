@@ -8,7 +8,7 @@ GOFLAGS = -ldflags="-s -w"
 ## ─── Build ───────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build: build-agent build-relay build-wirekubectl
+build: build-agent build-relay build-wirekubectl build-stun-server
 
 build-agent:
 	$(GO) build $(GOFLAGS) -o bin/agent ./cmd/agent
@@ -24,6 +24,11 @@ build-wirekubectl:
 	$(GO) build $(GOFLAGS) -o bin/wirekubectl ./cmd/wirekubectl
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-amd64 ./cmd/wirekubectl/
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-arm64 ./cmd/wirekubectl/
+
+build-stun-server:
+	$(GO) build $(GOFLAGS) -o bin/wirekube-stun ./cmd/stun-server
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-stun-linux-amd64 ./cmd/stun-server/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-stun-linux-arm64 ./cmd/stun-server/
 
 ## ─── Generate ────────────────────────────────────────────────────────────────
 
@@ -99,6 +104,34 @@ init-mesh:
 test:
 	$(GO) test ./... -v
 
+# kind-e2e: run end-to-end tests with isolated container networks.
+#
+# Each node runs on a separate 172.x subnet using kindest/node images
+# bootstrapped directly with kubeadm — no kind CLI required. CNI is
+# Cilium (vxlan). Relay deploys on the control-plane node (taint removed).
+#
+# Prerequisites:
+#   kubectl, helm installed
+#   docker or podman
+#   podman pull kindest/node:v1.31.0
+#   podman build -t $(IMG):$(VERSION) .
+#
+# Optional overrides:
+#   WIREKUBE_IMAGE=myrepo/wirekube:tag          # custom agent/relay image
+#   WIREKUBE_KIND_NODE_IMG=kindest/node:v1.30.0 # custom node image
+#   WIREKUBE_E2E_REUSE=1                        # skip teardown for re-runs
+#   WIREKUBE_E2E_SKIP_SETUP=1                   # assume cluster is running
+#   WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan      # (default) kube-proxy + Cilium vxlan
+#   WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan   # Cilium kube-proxy replacement + vxlan
+.PHONY: kind-e2e
+kind-e2e:
+	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
+.PHONY: kind-e2e-all
+kind-e2e-all:
+	WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
 .PHONY: vet
 vet:
 	$(GO) vet ./...
@@ -125,4 +158,6 @@ help:
 	@echo "  undeploy           Remove all WireKube resources"
 	@echo "  label-node         Label a node: NODE_NAME=<name> make label-node"
 	@echo "  init-mesh          Create default WireKubeMesh"
-	@echo "  test               Run tests"
+	@echo "  test               Run unit tests"
+	@echo "  kind-e2e           Run kind-based e2e tests (Cilium CNI, no kind CLI needed)"
+	@echo "  kind-e2e-all       Run e2e in both CNI modes (kube-proxy + no-kube-proxy)"

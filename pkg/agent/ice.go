@@ -38,7 +38,7 @@ const (
 
 // Timing constants for ICE probe evaluation and handshake validation.
 const (
-	handshakeValidWindow = 3 * time.Minute
+	defaultHandshakeValidWindow = 3 * time.Minute
 	activeProbeWait      = 8 * time.Second
 	passiveProbeTimeout  = 60 * time.Second
 	iceCheckTimeout      = 90 * time.Second
@@ -60,7 +60,7 @@ const (
 	// 5 min = 3 min (REKEY_AFTER_TIME) + 2 min (probe timing + re-handshake grace).
 	// After the first successful direct re-handshake, LastHandshake is fresh and
 	// the normal 3-min window applies on subsequent cycles.
-	directConnectedWindow = 5 * time.Minute
+	defaultDirectConnectedWindow = 5 * time.Minute
 )
 
 // Relay mode constants matching WireKubeMesh.spec.relay.mode values.
@@ -79,7 +79,7 @@ var virtualIfacePrefixes = []string{
 // relay suspension is disabled for a peer. After this many failures, probes
 // still run but relay delivery stays active to avoid periodic disruptions
 // in environments where direct connectivity is impossible.
-const maxSuspendedProbes = 2
+const maxSuspendedProbes = 5
 
 // peerICEState tracks ICE negotiation state for a single peer.
 type peerICEState struct {
@@ -89,12 +89,29 @@ type peerICEState struct {
 	BirthdayTried bool
 	// FailCount tracks consecutive isDirectConnected failures.
 	FailCount int
+	// UpgradedAt records when this peer was last upgraded to direct.
+	// Used to provide a grace period for WG to complete the first
+	// direct re-handshake (up to REKEY_AFTER_TIME = 3 min).
+	UpgradedAt time.Time
 
 	// ProbeFailCount tracks consecutive ICE probe failures (active probe
 	// returned directObserved=false). After maxSuspendedProbes failures,
 	// relay delivery is no longer suspended during probes to avoid periodic
 	// 8-second disruptions in environments where direct is impossible.
 	ProbeFailCount int
+
+	// LastHealthProbeOK records the last time an active health probe
+	// confirmed the direct connection is alive despite a stale LastHandshake.
+	// Used as a cooldown to avoid re-probing every sync cycle.
+	LastHealthProbeOK time.Time
+
+	// relaySuspendedForProbe is true when relay delivery was suspended at
+	// the start of an active probe (in startICECheck). evaluateICECheck
+	// resumes delivery when the probe completes. This pre-suspension
+	// prevents relay packets from causing WG to roam to localhost during
+	// the probe window, which is critical after mode=always→auto transitions
+	// where the relay proxy is fully active (not standby).
+	relaySuspendedForProbe bool
 
 	directProbeApplied bool
 
@@ -348,6 +365,13 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 		return
 	}
 
+	// When relay mode is "always", skip all ICE negotiation — peers must stay
+	// on relay unconditionally. Without this guard, the ICE loop would probe
+	// and upgrade peers back to direct, defeating the mode=always intent.
+	if a.relayMode == relayModeAlways {
+		return
+	}
+
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
 		if p.Name == a.nodeName || p.Spec.PublicKey == "" {
@@ -359,9 +383,13 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 		switch state.State {
 		case iceStateConnected:
 			if !a.isDirectConnected(p, statsByKey) {
-				// Relay proxy is always pre-warmed in standby mode.
-				// Activate immediately on first failure for instant failover.
-				fmt.Printf("[ice] peer %s: direct connection lost, activating standby relay\n", p.Name)
+				// Handshake is stale — but the connection may still be alive
+				// (WG re-handshake in progress). Run active health probe before
+				// reverting to relay.
+				if a.probeDirectHealth(p) {
+					continue
+				}
+				fmt.Printf("[ice] peer %s: health probe failed, activating standby relay\n", p.Name)
 				a.revertToRelay(p)
 			}
 			continue
@@ -458,11 +486,26 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		return
 	}
 
+	// Suspend relay delivery before probing so WG doesn't roam to localhost.
+	// Skip after maxSuspendedProbes consecutive failures to avoid periodic
+	// disruptions in environments where direct connectivity is impossible.
+	suspendRelayForProbe := func() {
+		if state.ProbeFailCount < maxSuspendedProbes && a.relayPool != nil {
+			if keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey); err == nil && len(keyBytes) == 32 {
+				var pubKey [32]byte
+				copy(pubKey[:], keyBytes)
+				a.relayPool.SuspendDelivery(pubKey)
+				state.relaySuspendedForProbe = true
+			}
+		}
+	}
+
 	switch {
 	case myNAT != "symmetric" && peerNAT != "symmetric":
 		// Cone ↔ Cone: both endpoints are stable. Active probe is safe and fast
 		// because the peer can reach us at our stable STUN endpoint simultaneously.
 		fmt.Printf("[ice] peer %s: cone↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
+		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
 	case myNAT != "symmetric" && peerNAT == "symmetric":
@@ -488,11 +531,13 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		//   - Both relay proxies are closed before probing, preventing relay
 		//     packets from causing WG to roam back to localhost during the window.
 		fmt.Printf("[ice] peer %s: cone↔symmetric — simultaneous probe to %s (opens NAT filter)\n", peer.Name, peer.Spec.Endpoint)
+		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT != "symmetric":
 		// Symmetric ↔ Cone: we should probe the peer's stable endpoint.
 		fmt.Printf("[ice] peer %s: symmetric↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
+		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT == "symmetric":
@@ -641,6 +686,14 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	}
 	a.directEndpoints[peer.Name] = directEp
 	a.directProbing[peer.Name] = true
+
+	// Immediately force WG to use the direct endpoint. Without this, the
+	// endpoint change only takes effect on the next sync cycle (5s later),
+	// but relay may already be suspended — leaving WG pointing at localhost
+	// with no path for handshakes.
+	if err := a.wgMgr.ForceEndpoint(peer.Spec.PublicKey, directEp); err != nil {
+		fmt.Printf("[ice] peer %s: ForceEndpoint(%s) failed: %v\n", peer.Name, directEp, err)
+	}
 }
 
 
@@ -679,7 +732,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 
 		// Check if WG learned a non-localhost endpoint (peer initiated direct).
 		if hasStats && !s.LastHandshake.IsZero() &&
-			time.Since(s.LastHandshake) < handshakeValidWindow &&
+			time.Since(s.LastHandshake) < a.handshakeValidWindow &&
 			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 
 			delete(a.passiveProbing, peer.Name)
@@ -725,37 +778,89 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 		delete(a.directProbing, peer.Name)
 		delete(a.probeForced, peer.Name)
 
+		// Helper to resume relay delivery if it was pre-suspended in startICECheck.
+		resumeRelayDelivery := func(flush bool) {
+			if state.relaySuspendedForProbe && hasPubKey && a.relayPool != nil {
+				a.relayPool.ResumeDelivery(pubKey, flush)
+				state.relaySuspendedForProbe = false
+			}
+		}
+
+		// When relay was pre-suspended during the probe, WG's keepalive (1s
+		// interval from ForceEndpoint poke) was sent to the direct endpoint.
+		// If the peer responded, WG updated ActualEndpoint to the direct IP.
+		// A full WG re-handshake may NOT have happened (session still valid),
+		// so freshHandshake can be false even though direct works. In this
+		// case, use ActualEndpoint alone to determine direct connectivity.
+		if state.relaySuspendedForProbe && ok &&
+			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
+			resumeRelayDelivery(false)
+			discoveredEp := s.ActualEndpoint
+			state.ProbeFailCount = 0
+			fmt.Printf("[ice] peer %s: active probe succeeded via endpoint check (discovered=%s)\n", peer.Name, discoveredEp)
+			if peer.Status.NATType == "symmetric" && discoveredEp != "" {
+				a.directEndpoints[peer.Name] = discoveredEp
+			}
+			a.upgradeToDirect(peer, "")
+			state.State = iceStateConnected
+			a.setICEState(peer.Name, state)
+			return
+		}
+
 		if freshHandshake {
-			// Phase 2: micro-suspension (200ms) to verify direct connectivity.
-			// A fresh handshake might be relay-mediated (both sides deliver
-			// handshakes via relay simultaneously). Briefly pause relay delivery
-			// so ActualEndpoint settles to the direct-path address.
-			// 200ms is below TCP retransmit thresholds — transparent to apps.
+			// Phase 2: distinguish direct vs relay-mediated handshake.
+			//
+			// Strategy: First check if the relay proxy delivered any WG handshake
+			// packets after the probe started. If not, the handshake was direct.
+			//
+			// If the relay DID deliver packets (common when relay is concurrently
+			// active after a revertToRelay), use a brief micro-suspension (200ms)
+			// to let WG settle and check ActualEndpoint. This handles the case
+			// where both relay and direct paths delivered handshakes simultaneously.
+			directObserved := true
 			discoveredEp := ""
+
+			relayDeliveredSinceProbe := false
 			if hasPubKey && a.relayPool != nil {
-				a.relayPool.SuspendDelivery(pubKey)
-				time.Sleep(200 * time.Millisecond)
-				freshStats, err := a.wgMgr.GetStats()
-				if err == nil {
-					for _, fs := range freshStats {
-						if fs.PublicKeyB64 == peer.Spec.PublicKey &&
-							fs.ActualEndpoint != "" && !isLocalhostEndpoint(fs.ActualEndpoint) {
-							discoveredEp = fs.ActualEndpoint
-							break
+				lastRelayHS := a.relayPool.LastRelayHandshake(pubKey)
+				relayDeliveredSinceProbe = !lastRelayHS.IsZero() && lastRelayHS.After(state.ProbeStartHandshake)
+			}
+
+			if relayDeliveredSinceProbe {
+				// Relay was active during probe — both paths may have delivered
+				// handshakes. Briefly suspend relay to isolate the direct signal.
+				if hasPubKey && a.relayPool != nil {
+					a.relayPool.SuspendDelivery(pubKey)
+					time.Sleep(200 * time.Millisecond)
+					freshStats, err := a.wgMgr.GetStats()
+					if err == nil {
+						for _, fs := range freshStats {
+							if fs.PublicKeyB64 == peer.Spec.PublicKey &&
+								fs.ActualEndpoint != "" && !isLocalhostEndpoint(fs.ActualEndpoint) {
+								discoveredEp = fs.ActualEndpoint
+								break
+							}
 						}
 					}
+					if discoveredEp != "" {
+						a.relayPool.ResumeDelivery(pubKey, false)
+					} else {
+						a.relayPool.ResumeDelivery(pubKey, true)
+						directObserved = false
+					}
 				}
-				if discoveredEp != "" {
-					a.relayPool.ResumeDelivery(pubKey, false)
-				} else {
-					a.relayPool.ResumeDelivery(pubKey, true)
+			} else {
+				// No relay involvement — handshake was direct.
+				if s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
+					discoveredEp = s.ActualEndpoint
 				}
 			}
 
-			if discoveredEp != "" {
+			if directObserved {
+				resumeRelayDelivery(false) // discard buffered relay packets
 				state.ProbeFailCount = 0
 				fmt.Printf("[ice] peer %s: active probe succeeded (discovered=%s)\n", peer.Name, discoveredEp)
-				if peer.Status.NATType == "symmetric" {
+				if peer.Status.NATType == "symmetric" && discoveredEp != "" {
 					a.directEndpoints[peer.Name] = discoveredEp
 				}
 				a.upgradeToDirect(peer, "")
@@ -764,10 +869,11 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 				return
 			}
 
-			fmt.Printf("[ice] peer %s: fresh handshake but endpoint is localhost (relay-mediated)\n", peer.Name)
+			fmt.Printf("[ice] peer %s: fresh handshake but relay-mediated (lastRelayHS after probe start)\n", peer.Name)
 		}
 
-		// Probe failed — relay was never disrupted, no recovery needed.
+		// Probe failed — resume relay delivery if it was suspended.
+		resumeRelayDelivery(true) // flush buffered packets back to WG
 		state.ProbeFailCount++
 		if a.relayedPeers[peer.Name] || a.directEndpoints[peer.Name] != "" {
 			a.enableRelayForPeer(peer)
@@ -890,6 +996,7 @@ func (a *Agent) upgradeToDirect(peer *wirekubev1alpha1.WireKubePeer, proxyAddr s
 	state := a.getICEState(peer.Name)
 	state.State = iceStateConnected
 	state.FailCount = 0
+	state.UpgradedAt = time.Now()
 	a.setICEState(peer.Name, state)
 
 	if proxyAddr != "" {
@@ -916,7 +1023,10 @@ func (a *Agent) revertToRelay(peer *wirekubev1alpha1.WireKubePeer) {
 	delete(a.relayPrewarmed, peer.Name)
 
 	state.State = iceStateRelay
-	state.LastCheck = time.Now()
+	// Set LastCheck far enough in the past so the next sync cycle retries
+	// immediately instead of waiting the full relayRetry interval. This is
+	// critical for fast relay→direct recovery after transient UDP blockage.
+	state.LastCheck = time.Now().Add(-a.relayRetry)
 	state.BirthdayTried = false
 	a.setICEState(peer.Name, state)
 
@@ -927,10 +1037,71 @@ func (a *Agent) revertToRelay(peer *wirekubev1alpha1.WireKubePeer) {
 // prewarmRelayForPeer is retained for compatibility but no longer called
 // directly — the new prewarmAllPeerRelays in agent.go handles global standby.
 
+// probeDirectHealth performs an active connectivity check when isDirectConnected
+// reports a stale handshake. It pokes WG's keepalive (1s interval) to trigger
+// an immediate re-handshake attempt on the current endpoint, then waits briefly
+// to see if the handshake succeeds.
+//
+// This avoids false-positive relay failovers during normal WG REKEY_AFTER_TIME
+// (120s) cycles where the re-handshake is simply delayed by a few seconds.
+// With this probe, handshakeValidWindow can be set much lower (e.g. 10s for
+// tests) without causing flip-flop between direct and relay.
+func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
+	state := a.getICEState(peer.Name)
+
+	// Cooldown: skip if a recent probe already confirmed health.
+	if !state.LastHealthProbeOK.IsZero() && time.Since(state.LastHealthProbeOK) < a.handshakeValidWindow {
+		return true
+	}
+
+	fmt.Printf("[ice] peer %s: handshake stale, starting active health probe (timeout=%v)\n",
+		peer.Name, a.healthProbeTimeout)
+
+	if err := a.wgMgr.PokeKeepalive(peer.Spec.PublicKey); err != nil {
+		fmt.Printf("[ice] peer %s: PokeKeepalive failed: %v\n", peer.Name, err)
+		return false
+	}
+
+	time.Sleep(a.healthProbeTimeout)
+
+	// Re-fetch WG stats after the probe window.
+	stats, err := a.wgMgr.GetStats()
+	if err != nil {
+		fmt.Printf("[ice] peer %s: GetStats failed after probe: %v\n", peer.Name, err)
+		return false
+	}
+	freshStats := make(map[string]wireguard.PeerStats)
+	for _, s := range stats {
+		freshStats[s.PublicKeyB64] = s
+	}
+
+	s, ok := freshStats[peer.Spec.PublicKey]
+	if !ok {
+		return false
+	}
+
+	// Success: handshake completed during the probe window.
+	if !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < a.healthProbeTimeout+2*time.Second {
+		fmt.Printf("[ice] peer %s: health probe succeeded (handshake age=%v)\n",
+			peer.Name, time.Since(s.LastHandshake).Round(time.Second))
+		state.LastHealthProbeOK = time.Now()
+		a.setICEState(peer.Name, state)
+		return true
+	}
+
+	fmt.Printf("[ice] peer %s: health probe failed (lastHS age=%v, endpoint=%s)\n",
+		peer.Name, time.Since(s.LastHandshake).Round(time.Second), s.ActualEndpoint)
+	return false
+}
+
 // isDirectConnected checks if a peer has a recent handshake via a direct
-// (non-localhost) endpoint. Uses directConnectedWindow (5 min) instead of
-// handshakeValidWindow (3 min) to avoid flip-flopping immediately after a
-// relay→direct upgrade.
+// (non-localhost) endpoint.
+//
+// Window selection:
+//   - Within directConnectedWindow (5 min) of upgrade: use the longer window
+//     to allow WG's first direct re-handshake (REKEY_AFTER_TIME = 3 min).
+//   - After the grace period: use handshakeValidWindow (3 min) for faster
+//     detection when UDP is blocked after the direct path is established.
 func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 	stats map[string]wireguard.PeerStats) bool {
 	s, ok := stats[peer.Spec.PublicKey]
@@ -950,10 +1121,20 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 			peer.Name, s.ActualEndpoint)
 		return false
 	}
+
+	// Use a longer window right after upgrade to allow WG to complete its
+	// first direct re-handshake. Once the grace period expires, tighten the
+	// window so UDP failures are detected within ~3 min instead of 5.
+	state := a.getICEState(peer.Name)
+	window := a.handshakeValidWindow
+	if !state.UpgradedAt.IsZero() && time.Since(state.UpgradedAt) < a.directConnectedWindow {
+		window = a.directConnectedWindow
+	}
+
 	age := time.Since(s.LastHandshake)
-	if age >= directConnectedWindow {
+	if age >= window {
 		fmt.Printf("[ice] peer %s: isDirectConnected=false (lastHS age=%v >= window=%v, endpoint=%s)\n",
-			peer.Name, age.Round(time.Second), directConnectedWindow, s.ActualEndpoint)
+			peer.Name, age.Round(time.Second), window, s.ActualEndpoint)
 		return false
 	}
 	return true
