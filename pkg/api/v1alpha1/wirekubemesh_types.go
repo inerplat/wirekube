@@ -92,6 +92,32 @@ type NATTraversalSpec struct {
 	// +kubebuilder:validation:Enum=enabled;disabled
 	// +optional
 	BirthdayAttack string `json:"birthdayAttack,omitempty"`
+
+	// HandshakeValidWindowSeconds is the maximum age of a WireGuard LastHandshake
+	// that still indicates a live direct connection. When exceeded, the agent
+	// runs an active health probe (PokeKeepalive + re-handshake) before reverting
+	// to relay. With active probing, this can safely be set much lower than
+	// WireGuard's REKEY_AFTER_TIME (120s) — e.g. 10s for fast failure detection.
+	// Minimum: 5. Default: 180 (3 minutes).
+	// +kubebuilder:validation:Minimum=5
+	// +optional
+	HandshakeValidWindowSeconds int32 `json:"handshakeValidWindowSeconds,omitempty"`
+
+	// HealthProbeTimeoutSeconds is how long the active health probe waits for
+	// a WireGuard re-handshake after poking keepalive. If the handshake does not
+	// complete within this window, the direct connection is considered dead.
+	// Minimum: 1. Default: 5.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=30
+	// +optional
+	HealthProbeTimeoutSeconds int32 `json:"healthProbeTimeoutSeconds,omitempty"`
+
+	// DirectConnectedWindowSeconds is the grace period after upgrading from relay
+	// to direct. During this window, the agent uses a longer handshake validity
+	// check to allow WG to complete its first direct re-handshake. Must be >=
+	// HandshakeValidWindowSeconds + 30. Default: HandshakeValidWindowSeconds + 120.
+	// +optional
+	DirectConnectedWindowSeconds int32 `json:"directConnectedWindowSeconds,omitempty"`
 }
 
 // RelaySpec configures the WireKube relay for NAT traversal fallback.

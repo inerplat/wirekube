@@ -1,46 +1,50 @@
 //go:build kind_e2e
 
-// Package kind_e2e contains end-to-end tests that spin up a local kind cluster
-// and verify WireKube relay/direct transport transitions under controlled
-// network conditions.
+// Package kind_e2e runs end-to-end tests for WireKube on isolated container
+// networks. Each node runs in a separate 172.x subnet using kindest/node
+// images bootstrapped directly with kubeadm — no kind CLI is required.
 //
-// Infrastructure is managed entirely in-process or via CLI tools (kind, kubectl,
-// docker) — no external image registry access is required at test runtime
-// beyond what is already cached locally.
+// Network topology:
 //
-// Prerequisites (run once before this test suite):
+//	wk-vpc-1 (172.20.0.0/24) ─── wk-cp  (control-plane, 172.20.0.2)
+//	wk-vpc-2 (172.21.0.0/24) ─── wk-w1  (worker,        172.21.0.2)
+//	wk-vpc-3 (172.22.0.0/24) ─── wk-w2  (worker,        172.22.0.2)
 //
-//  1. kind CLI installed (https://kind.sigs.k8s.io/)
-//  2. kubectl installed
-//  3. WireKube image built and available in the local Docker daemon:
-//     make docker-build   (or: make podman-build && podman push to docker)
-//  4. Optionally, pre-pull the kind node image to avoid internet access:
-//     docker pull kindest/node:v1.31.0
+//	Nodes reach each other via L3 routing through the container host kernel.
+//	STUN servers run as processes inside the CP container.
+//	Relay runs as a K8s Pod on the CP (taint removed, hostNetwork).
+//	K8s API on wk-cp:6443, port-forwarded to localhost for the test client.
+//
+// Prerequisites:
+//
+//	docker or podman
+//	kubectl
+//	WireKube image built: podman build -t inerplat/wirekube:<ver> .
+//	kindest/node pulled:  podman pull kindest/node:v1.31.0
 //
 // Run:
 //
 //	make kind-e2e
-//	# or manually:
-//	go test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m
 //
 // Environment variables:
 //
-//	WIREKUBE_IMAGE          WireKube agent image to load into kind
-//	                        (default: value from config/agent/daemonset.yaml)
-//	WIREKUBE_KIND_CLUSTER   kind cluster name to reuse; if set and the cluster
-//	                        exists, setup/teardown are skipped (dev iteration)
-//	WIREKUBE_KIND_NODE_IMG  kindest/node image tag (default: kindest/node:v1.31.0)
+//	WIREKUBE_IMAGE              override agent/relay image
+//	WIREKUBE_KIND_NODE_IMG      override kindest/node image
+//	WIREKUBE_E2E_REUSE=1        skip teardown for faster re-runs
+//	WIREKUBE_E2E_SKIP_SETUP=1   skip cluster creation (assume running)
+//	WIREKUBE_E2E_CNI_MODE       "kube-proxy-vxlan" (default) or "no-kube-proxy-vxlan"
 package kind_e2e
 
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -49,31 +53,44 @@ import (
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 )
 
-// Ports used by in-process test servers (non-standard to avoid conflicts on the host).
-// kind nodes reach these via the Docker bridge gateway IP.
 const (
-	stunPort1 = 13478 // First STUN listener (UDP)
-	stunPort2 = 13480 // Second STUN listener (UDP); NAT detection requires 2+ servers
-	relayPort = 13479 // Relay server (TCP + UDP for NAT probes)
+	stunPort1 = 13478
+	stunPort2 = 13480
 
 	agentNamespace = "wirekube-system"
 	meshName       = "default"
 	wgPort         = 51822
 
-	// Transport state transition timeouts.
-	relayTimeout  = 3 * time.Minute // direct → relay after path block
-	directTimeout = 5 * time.Minute // relay → direct after path restored
-	pollInterval  = 5 * time.Second
+	relayTimeout  = 3 * time.Minute
+	directTimeout = 3 * time.Minute
+	pollInterval  = 2 * time.Second
+
+	defaultNodeImage     = "kindest/node:v1.34.0"
+	defaultWireKubeImage = "inerplat/wirekube:v0.0.8-dev.15"
+
+	cniModeKubeProxyVxlan   = "kube-proxy-vxlan"
+	cniModeNoKubeProxyVxlan = "no-kube-proxy-vxlan"
 )
 
-var (
-	k8sClient     client.Client
-	restConfig    *rest.Config
-	hostGatewayIP string // host IP as seen from inside kind containers
+type nodeConfig struct {
+	name    string
+	network string
+	subnet  string
+	ip      string
+	role    string // "control-plane" or "worker"
+}
 
-	testScheme    = runtime.NewScheme()
-	clusterName   string
-	clusterOwned  bool // true if we created the cluster (responsible for teardown)
+var nodeConfigs = []nodeConfig{
+	{name: "wk-cp", network: "wk-vpc-1", subnet: "172.20.0.0/24", ip: "172.20.0.2", role: "control-plane"},
+	{name: "wk-w1", network: "wk-vpc-2", subnet: "172.21.0.0/24", ip: "172.21.0.2", role: "worker"},
+	{name: "wk-w2", network: "wk-vpc-3", subnet: "172.22.0.0/24", ip: "172.22.0.2", role: "worker"},
+}
+
+var (
+	k8sClient      client.Client
+	restConfig     *rest.Config
+	testScheme     = kruntime.NewScheme()
+	kubeConfigPath string
 )
 
 func init() {
@@ -81,109 +98,109 @@ func init() {
 	utilruntime.Must(wirekubev1alpha1.AddToScheme(testScheme))
 }
 
+func cpNode() nodeConfig { return nodeConfigs[0] }
+
+func repoRoot() string {
+	_, thisFile, _, _ := runtime.Caller(0)
+	dir := filepath.Dir(thisFile)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "."
+		}
+		dir = parent
+	}
+}
+
+func nodeImage() string {
+	if img := os.Getenv("WIREKUBE_KIND_NODE_IMG"); img != "" {
+		return img
+	}
+	return defaultNodeImage
+}
+
+func wireKubeImage() string {
+	if img := os.Getenv("WIREKUBE_IMAGE"); img != "" {
+		return img
+	}
+	return defaultWireKubeImage
+}
+
+func cniMode() string {
+	if mode := os.Getenv("WIREKUBE_E2E_CNI_MODE"); mode != "" {
+		return mode
+	}
+	return cniModeKubeProxyVxlan
+}
+
+func skipKubeProxy() bool {
+	return cniMode() == cniModeNoKubeProxyVxlan
+}
+
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 	code := 1
 	defer func() { os.Exit(code) }()
 
-	// ── 1. Kind cluster ──────────────────────────────────────────────────────
-	var err error
-	clusterName, clusterOwned, err = ensureKindCluster()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: cluster setup: %v\n", err)
+	if err := os.Chdir(repoRoot()); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: chdir: %v\n", err)
 		return
 	}
-	if clusterOwned {
-		defer teardownKindCluster(clusterName)
+
+	// ── 1. Bootstrap K8s cluster on isolated networks ────────────────────────
+	if err := setupCluster(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: cluster setup: %v\n", err)
+		return
+	}
+	if os.Getenv("WIREKUBE_E2E_REUSE") == "" {
+		defer teardownCluster()
 	}
 
-	// ── 2. kubeconfig ────────────────────────────────────────────────────────
-	restConfig, err = kindKubeConfig(clusterName)
+	// ── 2. Kubernetes client (via port-forwarded API on localhost:6443) ──────
+	var err error
+	restConfig, kubeConfigPath, err = extractKubeConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: kubeconfig: %v\n", err)
+		fmt.Fprintf(os.Stderr, "e2e: kubeconfig: %v\n", err)
 		return
 	}
 	k8sClient, err = client.New(restConfig, client.Options{Scheme: testScheme})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: k8s client: %v\n", err)
+		fmt.Fprintf(os.Stderr, "e2e: k8s client: %v\n", err)
 		return
 	}
 
-	// ── 3. Host gateway IP ──────────────────────────────────────────────────
-	hostGatewayIP, err = getHostGatewayIP(clusterName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: host gateway: %v\n", err)
-		return
-	}
-	fmt.Printf("kind_e2e: host gateway IP = %s\n", hostGatewayIP)
-
-	// ── 4. In-process STUN servers ──────────────────────────────────────────
-	// Two instances on different ports so agents detect NAT type correctly
-	// (NAT detection compares mapped ports from ≥2 STUN servers).
-	stunAddr1 := fmt.Sprintf("0.0.0.0:%d", stunPort1)
-	stunAddr2 := fmt.Sprintf("0.0.0.0:%d", stunPort2)
-	stopSTUN1, err := startSTUNServer(stunAddr1)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: STUN server 1: %v\n", err)
-		return
-	}
-	defer stopSTUN1()
-
-	stopSTUN2, err := startSTUNServer(stunAddr2)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: STUN server 2: %v\n", err)
-		return
-	}
-	defer stopSTUN2()
-
-	// ── 5. In-process relay server ──────────────────────────────────────────
-	relayAddr := fmt.Sprintf("0.0.0.0:%d", relayPort)
-	stopRelay, err := startRelayServer(relayAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: relay server: %v\n", err)
-		return
-	}
-	defer stopRelay()
-
-	// ── 6. Deploy WireKube into the cluster ─────────────────────────────────
-	// NOTE: requires the WireKube image to be pre-built locally.
-	// Run `make docker-build` (or `make podman-build`) first.
-	// TODO: consider running `make docker-build` here once internet is available.
-	if err := deployWireKube(ctx, clusterName); err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: deploy: %v\n", err)
+	// ── 3. Deploy WireKube CRDs + RBAC, then create Mesh CR before agents ──
+	if err := deployWireKubeCRDs(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: deploy CRDs: %v\n", err)
 		return
 	}
 
-	// ── 7. WireKubeMesh CR with in-process servers ──────────────────────────
+	// Mesh CR must exist before agents start so they pick up listenPort.
+	cpIP := cpNode().ip
 	stunServers := []string{
-		fmt.Sprintf("stun:%s:%d", hostGatewayIP, stunPort1),
-		fmt.Sprintf("stun:%s:%d", hostGatewayIP, stunPort2),
+		fmt.Sprintf("stun:%s:%d", cpIP, stunPort1),
+		fmt.Sprintf("stun:%s:%d", cpIP, stunPort2),
 	}
-	relayEndpoint := fmt.Sprintf("%s:%d", hostGatewayIP, relayPort)
+	relayEndpoint := fmt.Sprintf("%s:3478", cpIP)
 	if err := applyWireKubeMeshCR(ctx, stunServers, relayEndpoint); err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: WireKubeMesh CR: %v\n", err)
+		fmt.Fprintf(os.Stderr, "e2e: mesh CR: %v\n", err)
 		return
 	}
 
-	// ── 8. Wait for agents ───────────────────────────────────────────────────
-	if err := waitForAgents(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "kind_e2e: agents not ready: %v\n", err)
+	// Now deploy agents + relay (they will read the existing mesh CR)
+	if err := deployWireKubeAgents(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: deploy agents: %v\n", err)
+		return
+	}
+
+	// ── 4. Wait for all agents (CP + workers) ───────────────────────────────
+	if err := waitForAgents(ctx, len(nodeConfigs)); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: agents not ready: %v\n", err)
 		return
 	}
 
 	code = m.Run()
-}
-
-// startSTUNServer starts an in-process STUN server and returns a stop function.
-// kind nodes reach it via hostGatewayIP on the given port.
-func startSTUNServer(addr string) (stop func(), err error) {
-	conn, err := net.ListenPacket("udp4", addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen UDP %s: %w", addr, err)
-	}
-	fmt.Printf("kind_e2e: STUN server listening on %s\n", conn.LocalAddr())
-
-	go serveSTUN(conn)
-
-	return func() { conn.Close() }, nil
 }
