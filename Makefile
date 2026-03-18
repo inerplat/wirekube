@@ -104,19 +104,33 @@ init-mesh:
 test:
 	$(GO) test ./... -v
 
-# kind-e2e: run end-to-end tests in a local kind cluster.
+# kind-e2e: run end-to-end tests with isolated container networks.
 #
-# Prerequisites (one-time setup — requires internet access):
-#   docker pull kindest/node:v1.31.0   # pre-pull kind node image
-#   make docker-build                   # build WireKube image locally
+# Each node runs on a separate 172.x subnet using kindest/node images
+# bootstrapped directly with kubeadm — no kind CLI required. CNI is
+# Cilium (vxlan). Relay deploys on the control-plane node (taint removed).
+#
+# Prerequisites:
+#   kubectl, helm installed
+#   docker or podman
+#   podman pull kindest/node:v1.31.0
+#   podman build -t $(IMG):$(VERSION) .
 #
 # Optional overrides:
-#   WIREKUBE_IMAGE=myrepo/wirekube:tag  # custom agent image
-#   WIREKUBE_KIND_CLUSTER=my-cluster    # reuse an existing kind cluster
-#   WIREKUBE_KIND_NODE_IMG=kindest/node:v1.30.0
+#   WIREKUBE_IMAGE=myrepo/wirekube:tag          # custom agent/relay image
+#   WIREKUBE_KIND_NODE_IMG=kindest/node:v1.30.0 # custom node image
+#   WIREKUBE_E2E_REUSE=1                        # skip teardown for re-runs
+#   WIREKUBE_E2E_SKIP_SETUP=1                   # assume cluster is running
+#   WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan      # (default) kube-proxy + Cilium vxlan
+#   WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan   # Cilium kube-proxy replacement + vxlan
 .PHONY: kind-e2e
 kind-e2e:
-	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m
+	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
+.PHONY: kind-e2e-all
+kind-e2e-all:
+	WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
 
 .PHONY: vet
 vet:
@@ -145,4 +159,5 @@ help:
 	@echo "  label-node         Label a node: NODE_NAME=<name> make label-node"
 	@echo "  init-mesh          Create default WireKubeMesh"
 	@echo "  test               Run unit tests"
-	@echo "  kind-e2e           Run kind-based e2e tests (requires pre-built image + kind CLI)"
+	@echo "  kind-e2e           Run kind-based e2e tests (Cilium CNI, no kind CLI needed)"
+	@echo "  kind-e2e-all       Run e2e in both CNI modes (kube-proxy + no-kube-proxy)"

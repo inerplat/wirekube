@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +41,10 @@ type Agent struct {
 	relayMode    string
 	relayTimeout time.Duration
 	relayRetry   time.Duration
+
+	handshakeValidWindow  time.Duration
+	directConnectedWindow time.Duration
+	healthProbeTimeout    time.Duration
 	// isSymmetricNAT is set during endpoint discovery when STUN detects
 	// endpoint-dependent mapping. When true, relay is preferred for symmetric peers.
 	isSymmetricNAT bool
@@ -101,7 +107,7 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podNa
 		nodeName:           nodeName,
 		podName:            podName,
 		podNamespace:       podNamespace,
-		syncEvery:          30 * time.Second,
+		syncEvery:          parseSyncEvery(),
 		peerFirstSeen:      make(map[string]time.Time),
 		relayedPeers:       make(map[string]bool),
 		directEndpoints:    make(map[string]string),
@@ -114,6 +120,17 @@ func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podNa
 		relayPrewarmed:     make(map[string]bool),
 		probeForced:        make(map[string]bool),
 	}
+}
+
+// parseSyncEvery returns the sync interval from WIREKUBE_SYNC_INTERVAL_SECONDS
+// or defaults to 30s. This allows test environments to use a shorter cycle.
+func parseSyncEvery() time.Duration {
+	if v := os.Getenv("WIREKUBE_SYNC_INTERVAL_SECONDS"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec >= 1 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	return 30 * time.Second
 }
 
 // Run starts the agent loop. Blocks until ctx is cancelled.
@@ -567,6 +584,33 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.wgMgr.AllowFwmarkLoopback()
 	}
 
+	// Re-read relay mode from mesh CR so runtime changes are picked up.
+	if mesh, err := a.getMesh(ctx); err == nil && mesh.Spec.Relay != nil {
+		oldMode := a.relayMode
+		newMode := mesh.Spec.Relay.Mode
+		if oldMode != newMode {
+			fmt.Printf("[sync] relay mode changed: %q → %q\n", oldMode, newMode)
+			a.relayMode = newMode
+			// When switching away from "always", reset ICE states so peers
+			// re-evaluate connectivity immediately instead of waiting for
+			// the relay retry interval. Without this, peers that were forced
+			// to relay by mode=always stay stuck because their ICE state
+			// (iceStateConnected) + relay endpoint causes probe failures.
+			if oldMode == relayModeAlways && newMode != relayModeAlways {
+				for name, state := range a.iceStates {
+					if state.State == iceStateConnected && a.relayedPeers[name] {
+						state.State = iceStateRelay
+						state.LastCheck = time.Time{} // zero → immediate retry
+						a.setICEState(name, state)
+						fmt.Printf("[sync] reset ICE state for %s (mode change always→%s)\n", name, newMode)
+					}
+				}
+			}
+		} else {
+			a.relayMode = newMode
+		}
+	}
+
 	// Invalidate gateway client cache so it's rebuilt with fresh data this cycle
 	a.gwClientCache = nil
 	a.nonGwPeerIPs = nil
@@ -786,7 +830,7 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 		if !ok || s.ActualEndpoint == "" {
 			continue
 		}
-		if time.Since(s.LastHandshake) > handshakeValidWindow {
+		if time.Since(s.LastHandshake) > a.handshakeValidWindow {
 			continue
 		}
 		if s.ActualEndpoint == p.Spec.Endpoint {
@@ -850,7 +894,7 @@ func (a *Agent) updateOwnStatus(ctx context.Context, peerName string, remotePeer
 		if !s.LastHandshake.IsZero() && s.LastHandshake.After(lastHandshake) {
 			lastHandshake = s.LastHandshake
 		}
-		if time.Since(s.LastHandshake) < handshakeValidWindow {
+		if time.Since(s.LastHandshake) < a.handshakeValidWindow {
 			connected = true
 		}
 	}
@@ -940,6 +984,29 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		a.relayRetry = 120 * time.Second
 	}
 
+	// Configurable handshake windows and health probe from NATTraversal spec.
+	a.handshakeValidWindow = defaultHandshakeValidWindow
+	a.directConnectedWindow = defaultDirectConnectedWindow
+	a.healthProbeTimeout = 5 * time.Second
+	if mesh.Spec.NATTraversal != nil {
+		if v := mesh.Spec.NATTraversal.HandshakeValidWindowSeconds; v >= 5 {
+			a.handshakeValidWindow = time.Duration(v) * time.Second
+		}
+		if v := mesh.Spec.NATTraversal.HealthProbeTimeoutSeconds; v >= 1 {
+			a.healthProbeTimeout = time.Duration(v) * time.Second
+		}
+		if v := mesh.Spec.NATTraversal.DirectConnectedWindowSeconds; v > 0 {
+			a.directConnectedWindow = time.Duration(v) * time.Second
+		} else if a.handshakeValidWindow != defaultHandshakeValidWindow {
+			// Auto-derive: handshakeValidWindow + 2 min grace
+			a.directConnectedWindow = a.handshakeValidWindow + 2*time.Minute
+		}
+		// Enforce minimum: directConnectedWindow >= handshakeValidWindow + 30s
+		if a.directConnectedWindow < a.handshakeValidWindow+30*time.Second {
+			a.directConnectedWindow = a.handshakeValidWindow + 30*time.Second
+		}
+	}
+
 	// After restart with a preserved interface, use a shorter initial retry
 	// so direct upgrade probing starts quickly instead of waiting the full 120s.
 	if a.wasInterfacePreserved {
@@ -1011,15 +1078,27 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 	// use the direct endpoint. For symmetric NAT peers, use the NAT-mapped
 	// endpoint discovered during probe Phase 2 (stored in directEndpoints).
 	// If no discovered endpoint exists, return "" so WG keeps its kernel-learned port.
+	//
+	// However, if the WG handshake has expired (no recent handshake or endpoint
+	// is localhost), fall through to relay. This handles the case where WG UDP
+	// is blocked after a successful direct upgrade — without this check, the
+	// peer stays stuck in iceStateConnected with no actual connectivity.
 	iceState := a.getICEState(peer.Name)
 	if iceState.State == iceStateConnected && !a.relayedPeers[peer.Name] {
-		if peer.Status.NATType == "symmetric" {
-			if ep := a.directEndpoints[peer.Name]; ep != "" && !isLocalhostEndpoint(ep) {
-				return ep
+		s, hasStats := stats[peer.Spec.PublicKey]
+		handshakeAlive := hasStats && !s.LastHandshake.IsZero() &&
+			time.Since(s.LastHandshake) < a.directConnectedWindow &&
+			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint)
+		if handshakeAlive {
+			if peer.Status.NATType == "symmetric" {
+				if ep := a.directEndpoints[peer.Name]; ep != "" && !isLocalhostEndpoint(ep) {
+					return ep
+				}
+				return ""
 			}
-			return ""
+			return peer.Spec.Endpoint
 		}
-		return peer.Spec.Endpoint
+		// Handshake expired or endpoint is localhost — fall through to relay.
 	}
 
 	// If peer is being probed for direct connectivity, temporarily use direct.
@@ -1040,7 +1119,7 @@ func (a *Agent) resolveEndpointForPeer(peer *wirekubev1alpha1.WireKubePeer, stat
 
 	// Check if peer already has a healthy direct connection.
 	s, hasStats := stats[peer.Spec.PublicKey]
-	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < handshakeValidWindow
+	hasRecentHandshake := hasStats && !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < a.handshakeValidWindow
 	if hasRecentHandshake && !a.relayedPeers[peer.Name] && s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 		iceState.State = iceStateConnected
 		a.setICEState(peer.Name, iceState)
@@ -1065,10 +1144,12 @@ func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, st
 
 func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	if a.relayPool == nil {
+		fmt.Printf("[relay-debug] enableRelayForPeer(%s): relayPool is nil, returning direct\n", peer.Name)
 		return peer.Spec.Endpoint
 	}
 
 	if !a.relayPool.IsConnected() {
+		fmt.Printf("[relay-debug] enableRelayForPeer(%s): relayPool not connected, returning direct\n", peer.Name)
 		return peer.Spec.Endpoint
 	}
 
@@ -1324,7 +1405,7 @@ func (a *Agent) recoverICEStateFromWG() {
 
 	recovered := 0
 	for _, s := range stats {
-		if s.LastHandshake.IsZero() || time.Since(s.LastHandshake) > handshakeValidWindow {
+		if s.LastHandshake.IsZero() || time.Since(s.LastHandshake) > a.handshakeValidWindow {
 			continue
 		}
 		if s.ActualEndpoint == "" || isLocalhostEndpoint(s.ActualEndpoint) {
