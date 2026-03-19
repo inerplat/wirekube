@@ -66,7 +66,7 @@ const (
 	pollInterval  = 2 * time.Second
 
 	defaultNodeImage     = "kindest/node:v1.34.0"
-	defaultWireKubeImage = "inerplat/wirekube:v0.0.8-dev.15"
+	defaultWireKubeImage = "inerplat/wirekube:v0.0.9-dev.1"
 
 	cniModeKubeProxyVxlan   = "kube-proxy-vxlan"
 	cniModeNoKubeProxyVxlan = "no-kube-proxy-vxlan"
