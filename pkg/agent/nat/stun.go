@@ -4,6 +4,7 @@ package nat
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"time"
@@ -20,10 +21,10 @@ var defaultSTUNServers = []string{
 type NATType string
 
 const (
-	NATUnknown             NATType = ""
-	NATCone                NATType = "cone"
-	NATPortRestrictedCone  NATType = "port-restricted-cone"
-	NATSymmetric           NATType = "symmetric"
+	NATUnknown            NATType = ""
+	NATCone               NATType = "cone"
+	NATPortRestrictedCone NATType = "port-restricted-cone"
+	NATSymmetric          NATType = "symmetric"
 )
 
 // PortPrediction describes the NAT's port allocation pattern observed via STUN.
@@ -145,7 +146,7 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 	}
 
 	if len(results) == 1 {
-		fmt.Printf("[stun] warning: only 1 STUN server responded — cannot detect Symmetric NAT (need 2+ servers)\n")
+		log.Printf("[stun] warning: only 1 STUN server responded — cannot detect Symmetric NAT (need 2+ servers)\n")
 		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATUnknown}, nil
 	}
 
@@ -173,7 +174,7 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 
 	// Symmetric NAT detected — build port prediction model.
 	pp := buildPortPrediction(samplePorts)
-	fmt.Printf("[stun] symmetric NAT detected: ports %v (increment=%d, jitter=%d)\n",
+	log.Printf("[stun] symmetric NAT detected: ports %v (increment=%d, jitter=%d)\n",
 		samplePorts, pp.Increment, pp.Jitter)
 
 	return &STUNResult{
@@ -236,7 +237,7 @@ func querySTUN(ctx context.Context, conn *net.UDPConn, server string) (string, e
 	if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
 		return "", err
 	}
-	defer conn.SetDeadline(time.Time{})
+	defer conn.SetDeadline(time.Time{}) //nolint:errcheck
 
 	// Build and send STUN Binding Request
 	msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
@@ -327,7 +328,7 @@ func DetectPortRestriction(ctx context.Context, stunServers []string, relayIP st
 	}
 
 	// Wait for probe packets. Track which probes we received.
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
 	buf := make([]byte, 256)
 	gotVerify := false
 	gotTest := false
@@ -344,10 +345,10 @@ func DetectPortRestriction(ctx context.Context, stunServers []string, relayIP st
 		payload := string(buf[:n])
 		if payload == "WIREKUBE_NAT_VERIFY" && addr.Port == relayAddr.Port {
 			gotVerify = true
-			fmt.Printf("[stun] port-restriction test: received verify probe from %s\n", addr)
+			log.Printf("[stun] port-restriction test: received verify probe from %s\n", addr)
 		} else if payload == "WIREKUBE_NAT_PROBE" && addr.Port != relayAddr.Port {
 			gotTest = true
-			fmt.Printf("[stun] port-restriction test: received test probe from %s\n", addr)
+			log.Printf("[stun] port-restriction test: received test probe from %s\n", addr)
 		}
 
 		if gotVerify && gotTest {
@@ -356,15 +357,15 @@ func DetectPortRestriction(ctx context.Context, stunServers []string, relayIP st
 	}
 
 	if gotVerify && gotTest {
-		fmt.Printf("[stun] port-restriction test: both probes received → cone (not port-restricted)\n")
+		log.Printf("[stun] port-restriction test: both probes received → cone (not port-restricted)\n")
 		return NATCone, nil
 	}
 	if gotVerify && !gotTest {
-		fmt.Printf("[stun] port-restriction test: only verify probe received → port-restricted-cone\n")
+		log.Printf("[stun] port-restriction test: only verify probe received → port-restricted-cone\n")
 		return NATPortRestrictedCone, nil
 	}
 	// Neither probe received — the path itself is blocked (firewall), not NAT.
-	fmt.Printf("[stun] port-restriction test: no probes received (firewall likely blocking) → keeping cone\n")
+	log.Printf("[stun] port-restriction test: no probes received (firewall likely blocking) → keeping cone\n")
 	return NATCone, nil
 }
 

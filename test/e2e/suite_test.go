@@ -11,6 +11,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -53,7 +54,7 @@ func TestMain(m *testing.M) {
 
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		assets = "/tmp/wirekube-envtest-bins/k8s/1.30.0-darwin-arm64"
+		assets = fmt.Sprintf("/tmp/wirekube-envtest-bins/k8s/1.30.0-%s-%s", runtime.GOOS, runtime.GOARCH)
 	}
 
 	testEnv = &envtest.Environment{
@@ -73,8 +74,8 @@ func TestMain(m *testing.M) {
 	}
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                testScheme,
-		Metrics:               metricsserver.Options{BindAddress: "0"},
+		Scheme:                 testScheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 	})
 	if err != nil {

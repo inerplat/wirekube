@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Server is a WireKube relay server that forwards WireGuard UDP packets
@@ -19,6 +20,10 @@ type Server struct {
 	// NAT verification probes. Agents open their NAT filter for this port,
 	// so a probe from here distinguishes "firewall blocked" from "NAT blocked".
 	probeConn *net.UDPConn
+
+	// probeSem limits concurrent NAT probe goroutines to prevent unbounded
+	// goroutine creation from rapid probe requests.
+	probeSem chan struct{}
 }
 
 type clientConn struct {
@@ -30,7 +35,8 @@ type clientConn struct {
 
 func NewServer() *Server {
 	return &Server{
-		peers: make(map[[PubKeySize]byte]*clientConn),
+		peers:    make(map[[PubKeySize]byte]*clientConn),
+		probeSem: make(chan struct{}, 16),
 	}
 }
 
@@ -57,12 +63,23 @@ func (s *Server) ListenAndServe(addr string) error {
 
 	log.Printf("relay: listening on %s", addr)
 
+	var acceptBackoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("relay: accept error: %v", err)
+			if acceptBackoff == 0 {
+				acceptBackoff = 5 * time.Millisecond
+			} else {
+				acceptBackoff *= 2
+				if acceptBackoff > time.Second {
+					acceptBackoff = time.Second
+				}
+			}
+			time.Sleep(acceptBackoff)
 			continue
 		}
+		acceptBackoff = 0
 		go s.handleConn(conn)
 	}
 }
@@ -70,7 +87,7 @@ func (s *Server) ListenAndServe(addr string) error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+		tc.SetNoDelay(true) //nolint:errcheck
 	}
 	reader := bufio.NewReader(conn)
 
@@ -161,7 +178,15 @@ func (s *Server) handleConn(conn net.Conn) {
 				log.Printf("relay: bad NAT probe frame from %x: %v", pubKey[:8], err)
 				continue
 			}
-			go s.sendNATProbe(ip, port, pubKey)
+			select {
+			case s.probeSem <- struct{}{}:
+				go func() {
+					defer func() { <-s.probeSem }()
+					s.sendNATProbe(ip, port, pubKey)
+				}()
+			default:
+				log.Printf("relay: NAT probe dropped for %x (concurrency limit reached)", pubKey[:8])
+			}
 
 		case MsgKeepalive:
 			// no-op

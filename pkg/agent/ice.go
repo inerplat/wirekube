@@ -12,8 +12,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 	"github.com/wirekube/wirekube/pkg/agent/nat"
+	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -39,9 +39,9 @@ const (
 // Timing constants for ICE probe evaluation and handshake validation.
 const (
 	defaultHandshakeValidWindow = 3 * time.Minute
-	activeProbeWait      = 8 * time.Second
-	passiveProbeTimeout  = 60 * time.Second
-	iceCheckTimeout      = 90 * time.Second
+	activeProbeWait             = 8 * time.Second
+	passiveProbeTimeout         = 60 * time.Second
+	iceCheckTimeout             = 90 * time.Second
 	// restartRelayRetry is the shortened retry interval used immediately after
 	// agent restart to quickly re-evaluate direct connectivity for peers that
 	// were relayed before the restart.
@@ -127,8 +127,8 @@ type peerICEState struct {
 
 // holePunchProxy bridges WireGuard traffic through a birthday-attack hole-punched path.
 type holePunchProxy struct {
-	localConn *net.UDPConn         // receives from WG (localhost:random → localhost:wgport)
-	holeConn  *net.UDPConn         // the hole-punched socket
+	localConn *net.UDPConn                // receives from WG (localhost:random → localhost:wgport)
+	holeConn  *net.UDPConn                // the hole-punched socket
 	peerAddr  atomic.Pointer[net.UDPAddr] // peer's NAT-mapped address; updated on rebind
 	wgPort    int
 	stopCh    chan struct{}
@@ -172,7 +172,7 @@ func (hp *holePunchProxy) forwardWGToHole() {
 			return
 		default:
 		}
-		hp.localConn.SetReadDeadline(time.Now().Add(time.Second))
+		hp.localConn.SetReadDeadline(time.Now().Add(time.Second)) //nolint:errcheck
 		n, err := hp.localConn.Read(buf)
 		if err != nil {
 			continue
@@ -189,7 +189,7 @@ func (hp *holePunchProxy) forwardHoleToWG() {
 			return
 		default:
 		}
-		hp.holeConn.SetReadDeadline(time.Now().Add(time.Second))
+		hp.holeConn.SetReadDeadline(time.Now().Add(time.Second)) //nolint:errcheck
 		n, addr, err := hp.holeConn.ReadFromUDP(buf)
 		if err != nil {
 			continue
@@ -202,7 +202,7 @@ func (hp *holePunchProxy) forwardHoleToWG() {
 		if addr.Port != current.Port {
 			hp.peerAddr.Store(addr)
 		}
-		hp.localConn.Write(buf[:n])
+		hp.localConn.Write(buf[:n]) //nolint:errcheck
 	}
 }
 
@@ -389,7 +389,7 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 				if a.probeDirectHealth(p) {
 					continue
 				}
-				fmt.Printf("[ice] peer %s: health probe failed, activating standby relay\n", p.Name)
+				a.log.Info("health probe failed, activating standby relay", "peer", p.Name)
 				a.revertToRelay(p)
 			}
 			continue
@@ -480,7 +480,7 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 	// comes from a port that port-restricted cone NAT hasn't opened a filter
 	// for. Neither side can complete the handshake — skip probe entirely.
 	if isPortRestrictedSymmetricPair(myNAT, peerNAT) {
-		fmt.Printf("[ice] peer %s: port-restricted-cone↔symmetric — direct P2P impossible, staying on relay permanently\n", peer.Name)
+		a.log.Info("port-restricted-cone↔symmetric — direct P2P impossible, staying on relay permanently", "peer", peer.Name)
 		state.State = iceStateFailed
 		a.setICEState(peer.Name, state)
 		return
@@ -504,7 +504,7 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 	case myNAT != "symmetric" && peerNAT != "symmetric":
 		// Cone ↔ Cone: both endpoints are stable. Active probe is safe and fast
 		// because the peer can reach us at our stable STUN endpoint simultaneously.
-		fmt.Printf("[ice] peer %s: cone↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
+		a.log.V(1).Info("cone↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
 		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
@@ -530,27 +530,28 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		//     filter now open their probe gets through and the handshake completes.
 		//   - Both relay proxies are closed before probing, preventing relay
 		//     packets from causing WG to roam back to localhost during the window.
-		fmt.Printf("[ice] peer %s: cone↔symmetric — simultaneous probe to %s (opens NAT filter)\n", peer.Name, peer.Spec.Endpoint)
+		a.log.V(1).Info("cone↔symmetric — simultaneous probe (opens NAT filter)", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
 		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT != "symmetric":
 		// Symmetric ↔ Cone: we should probe the peer's stable endpoint.
-		fmt.Printf("[ice] peer %s: symmetric↔cone — active probe to %s\n", peer.Name, peer.Spec.Endpoint)
+		a.log.V(1).Info("symmetric↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
 		suspendRelayForProbe()
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT == "symmetric":
-		if !a.isBirthdayAttackEnabled(peer) {
-			fmt.Printf("[ice] peer %s: symmetric↔symmetric — birthday attack disabled, staying on relay\n", peer.Name)
+		switch {
+		case !a.isBirthdayAttackEnabled(peer):
+			a.log.Info("symmetric↔symmetric — birthday attack disabled, staying on relay", "peer", peer.Name)
 			state.State = iceStateFailed
-		} else if !state.BirthdayTried {
-			fmt.Printf("[ice] peer %s: symmetric↔symmetric — initiating birthday attack\n", peer.Name)
+		case !state.BirthdayTried:
+			a.log.Info("symmetric↔symmetric — initiating birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
 			go a.runBirthdayAttack(ctx, peer)
-		} else {
-			fmt.Printf("[ice] peer %s: symmetric↔symmetric — birthday attack already attempted, staying on relay\n", peer.Name)
+		default:
+			a.log.Info("symmetric↔symmetric — birthday attack already attempted, staying on relay", "peer", peer.Name)
 			state.State = iceStateFailed
 		}
 	}
@@ -609,11 +610,11 @@ func (a *Agent) trySameNATDirect(peer *wirekubev1alpha1.WireKubePeer) bool {
 		}
 	}
 	if hostAddr == "" {
-		fmt.Printf("[ice] peer %s: same NAT (%s) but no host candidate available\n", peer.Name, myPublicIP)
+		a.log.V(1).Info("same NAT but no host candidate available", "peer", peer.Name, "publicIP", myPublicIP)
 		return false
 	}
 
-	fmt.Printf("[ice] peer %s: same NAT detected (%s) — probing via LAN endpoint %s\n", peer.Name, myPublicIP, hostAddr)
+	a.log.Info("same NAT detected — probing via LAN endpoint", "peer", peer.Name, "publicIP", myPublicIP, "lanEndpoint", hostAddr)
 	a.directEndpoints[peer.Name] = hostAddr
 	a.directProbing[peer.Name] = true
 	return true
@@ -656,15 +657,6 @@ func (a *Agent) isBirthdayAttackEnabled(peer *wirekubev1alpha1.WireKubePeer) boo
 	return false
 }
 
-// startPassiveProbe begins observing whether the peer initiates a direct
-// WireGuard handshake. The relay proxy and WG endpoint are left unchanged,
-// so there is zero traffic disruption. If the peer's agent runs an active
-// probe towards our stable STUN endpoint, the kernel will learn the peer's
-// actual NAT-mapped address, which we detect in evaluateICECheck.
-func (a *Agent) startPassiveProbe(peer *wirekubev1alpha1.WireKubePeer) {
-	a.passiveProbing[peer.Name] = time.Now()
-}
-
 // probeDirectEndpoint switches WG to the peer's direct endpoint for a
 // handshake probe while keeping relay fully active — zero traffic disruption.
 //
@@ -692,10 +684,9 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	// but relay may already be suspended — leaving WG pointing at localhost
 	// with no path for handshakes.
 	if err := a.wgMgr.ForceEndpoint(peer.Spec.PublicKey, directEp); err != nil {
-		fmt.Printf("[ice] peer %s: ForceEndpoint(%s) failed: %v\n", peer.Name, directEp, err)
+		a.log.Error(err, "ForceEndpoint failed", "peer", peer.Name, "endpoint", directEp)
 	}
 }
-
 
 // processRelayGrace marks peers as non-relayed after upgrading to direct.
 // Relay proxies remain in standby mode for instant failover.
@@ -705,7 +696,7 @@ func (a *Agent) processRelayGrace() {
 	for name := range a.relayGracePeers {
 		delete(a.relayedPeers, name)
 		delete(a.relayGracePeers, name)
-		fmt.Printf("[ice] peer %s: relay proxy moved to standby (grace complete)\n", name)
+		a.log.Info("relay proxy moved to standby (grace complete)", "peer", name)
 	}
 }
 
@@ -736,7 +727,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 
 			delete(a.passiveProbing, peer.Name)
-			fmt.Printf("[ice] peer %s: passive probe detected direct path (%s)\n", peer.Name, s.ActualEndpoint)
+			a.log.Info("passive probe detected direct path", "peer", peer.Name, "endpoint", s.ActualEndpoint)
 			a.upgradeToDirect(peer, "")
 			state.State = iceStateConnected
 			a.setICEState(peer.Name, state)
@@ -745,7 +736,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 
 		if time.Since(passiveStart) > passiveProbeTimeout {
 			delete(a.passiveProbing, peer.Name)
-			fmt.Printf("[ice] peer %s: passive probe timed out, escalating to active probe\n", peer.Name)
+			a.log.Info("passive probe timed out, escalating to active probe", "peer", peer.Name)
 			a.probeDirectEndpoint(peer)
 			state.LastCheck = time.Now()
 			state.directProbeApplied = false
@@ -797,7 +788,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			resumeRelayDelivery(false)
 			discoveredEp := s.ActualEndpoint
 			state.ProbeFailCount = 0
-			fmt.Printf("[ice] peer %s: active probe succeeded via endpoint check (discovered=%s)\n", peer.Name, discoveredEp)
+			a.log.Info("active probe succeeded via endpoint check", "peer", peer.Name, "discoveredEndpoint", discoveredEp)
 			if peer.Status.NATType == "symmetric" && discoveredEp != "" {
 				a.directEndpoints[peer.Name] = discoveredEp
 			}
@@ -859,7 +850,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			if directObserved {
 				resumeRelayDelivery(false) // discard buffered relay packets
 				state.ProbeFailCount = 0
-				fmt.Printf("[ice] peer %s: active probe succeeded (discovered=%s)\n", peer.Name, discoveredEp)
+				a.log.Info("active probe succeeded", "peer", peer.Name, "discoveredEndpoint", discoveredEp)
 				if peer.Status.NATType == "symmetric" && discoveredEp != "" {
 					a.directEndpoints[peer.Name] = discoveredEp
 				}
@@ -869,7 +860,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 				return
 			}
 
-			fmt.Printf("[ice] peer %s: fresh handshake but relay-mediated (lastRelayHS after probe start)\n", peer.Name)
+			a.log.V(1).Info("fresh handshake but relay-mediated (lastRelayHS after probe start)", "peer", peer.Name)
 		}
 
 		// Probe failed — resume relay delivery if it was suspended.
@@ -880,7 +871,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 		}
 
 		if a.detectedNATType == "symmetric" && peer.Status.NATType == "symmetric" && !state.BirthdayTried {
-			fmt.Printf("[ice] peer %s: active probe failed, trying birthday attack\n", peer.Name)
+			a.log.Info("active probe failed, trying birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
 			a.setICEState(peer.Name, state)
@@ -888,8 +879,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			return
 		}
 
-		fmt.Printf("[ice] peer %s: active probe failed (failures=%d), reverting to relay\n",
-			peer.Name, state.ProbeFailCount)
+		a.log.Info("active probe failed, reverting to relay", "peer", peer.Name, "failures", state.ProbeFailCount)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		a.setICEState(peer.Name, state)
@@ -911,7 +901,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	// Get peer's port prediction and public IP.
 	peerPP := peer.Status.PortPrediction
 	if peerPP == nil || len(peerPP.SamplePorts) == 0 {
-		fmt.Printf("[birthday] peer %s: no port prediction data available\n", peer.Name)
+		a.log.Info("no port prediction data available", "peer", peer.Name)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		return
@@ -925,7 +915,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 		}
 	}
 	if peerPublicIP == "" {
-		fmt.Printf("[birthday] peer %s: cannot determine public IP\n", peer.Name)
+		a.log.Info("cannot determine public IP for birthday attack", "peer", peer.Name)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		return
@@ -958,12 +948,11 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	}
 	copy(peerPubKey[:], peerKeyBytes)
 
-	fmt.Printf("[birthday] peer %s: starting attack (IP=%s, %d candidate ports)\n",
-		peer.Name, peerPublicIP, len(candidatePorts))
+	a.log.Info("starting birthday attack", "peer", peer.Name, "peerIP", peerPublicIP, "candidatePorts", len(candidatePorts))
 
 	result, err := nat.BirthdayAttack(ctx, myPubKey, peerPubKey, peerPublicIP, candidatePorts)
 	if err != nil {
-		fmt.Printf("[birthday] peer %s: failed: %v\n", peer.Name, err)
+		a.log.Error(err, "birthday attack failed", "peer", peer.Name)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
 		return
@@ -972,7 +961,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	// Create a hole-punch proxy to bridge WG through the discovered path.
 	proxy, err := newHolePunchProxy(result, a.wgMgr.ListenPort())
 	if err != nil {
-		fmt.Printf("[birthday] peer %s: proxy creation failed: %v\n", peer.Name, err)
+		a.log.Error(err, "birthday attack proxy creation failed", "peer", peer.Name)
 		result.LocalConn.Close()
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
@@ -983,8 +972,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	state.holePunch = proxy
 	state.State = iceStateConnected
 	a.upgradeToDirect(peer, proxy.ListenAddr())
-	fmt.Printf("[birthday] peer %s: hole-punched path established via %s\n",
-		peer.Name, proxy.ListenAddr())
+	a.log.Info("hole-punched path established", "peer", peer.Name, "proxyAddr", proxy.ListenAddr())
 }
 
 // upgradeToDirect switches a peer from relay to direct transport.
@@ -1006,7 +994,7 @@ func (a *Agent) upgradeToDirect(peer *wirekubev1alpha1.WireKubePeer, proxyAddr s
 	if a.relayedPeers[peer.Name] {
 		a.relayGracePeers[peer.Name] = true
 		delete(a.relayedPeers, peer.Name)
-		fmt.Printf("[ice] peer %s: upgraded to direct (relay proxy in standby)\n", peer.Name)
+		a.log.Info("upgraded to direct (relay proxy in standby)", "peer", peer.Name)
 	}
 }
 
@@ -1054,11 +1042,10 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 		return true
 	}
 
-	fmt.Printf("[ice] peer %s: handshake stale, starting active health probe (timeout=%v)\n",
-		peer.Name, a.healthProbeTimeout)
+	a.log.V(1).Info("handshake stale, starting active health probe", "peer", peer.Name, "timeout", a.healthProbeTimeout)
 
 	if err := a.wgMgr.PokeKeepalive(peer.Spec.PublicKey); err != nil {
-		fmt.Printf("[ice] peer %s: PokeKeepalive failed: %v\n", peer.Name, err)
+		a.log.Error(err, "PokeKeepalive failed", "peer", peer.Name)
 		return false
 	}
 
@@ -1067,7 +1054,7 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 	// Re-fetch WG stats after the probe window.
 	stats, err := a.wgMgr.GetStats()
 	if err != nil {
-		fmt.Printf("[ice] peer %s: GetStats failed after probe: %v\n", peer.Name, err)
+		a.log.Error(err, "GetStats failed after health probe", "peer", peer.Name)
 		return false
 	}
 	freshStats := make(map[string]wireguard.PeerStats)
@@ -1082,15 +1069,13 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 
 	// Success: handshake completed during the probe window.
 	if !s.LastHandshake.IsZero() && time.Since(s.LastHandshake) < a.healthProbeTimeout+2*time.Second {
-		fmt.Printf("[ice] peer %s: health probe succeeded (handshake age=%v)\n",
-			peer.Name, time.Since(s.LastHandshake).Round(time.Second))
+		a.log.V(1).Info("health probe succeeded", "peer", peer.Name, "handshakeAge", time.Since(s.LastHandshake).Round(time.Second))
 		state.LastHealthProbeOK = time.Now()
 		a.setICEState(peer.Name, state)
 		return true
 	}
 
-	fmt.Printf("[ice] peer %s: health probe failed (lastHS age=%v, endpoint=%s)\n",
-		peer.Name, time.Since(s.LastHandshake).Round(time.Second), s.ActualEndpoint)
+	a.log.Info("health probe failed", "peer", peer.Name, "lastHandshakeAge", time.Since(s.LastHandshake).Round(time.Second), "endpoint", s.ActualEndpoint)
 	return false
 }
 
@@ -1106,19 +1091,18 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 	stats map[string]wireguard.PeerStats) bool {
 	s, ok := stats[peer.Spec.PublicKey]
 	if !ok {
-		fmt.Printf("[ice] peer %s: isDirectConnected=false (peer not in WG stats)\n", peer.Name)
+		a.log.V(1).Info("isDirectConnected=false (peer not in WG stats)", "peer", peer.Name)
 		return false
 	}
 	if s.LastHandshake.IsZero() {
-		fmt.Printf("[ice] peer %s: isDirectConnected=false (no WG handshake yet)\n", peer.Name)
+		a.log.V(1).Info("isDirectConnected=false (no WG handshake yet)", "peer", peer.Name)
 		return false
 	}
 	// A localhost ActualEndpoint means WG is communicating via relay proxy,
 	// not via a direct path. This catches cases where the relay proxy was
 	// re-activated (e.g. pre-warmed standby) and WG roamed to it.
 	if isLocalhostEndpoint(s.ActualEndpoint) {
-		fmt.Printf("[ice] peer %s: isDirectConnected=false (endpoint=%s is localhost/relay)\n",
-			peer.Name, s.ActualEndpoint)
+		a.log.V(1).Info("isDirectConnected=false (endpoint is localhost/relay)", "peer", peer.Name, "endpoint", s.ActualEndpoint)
 		return false
 	}
 
@@ -1133,8 +1117,7 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 
 	age := time.Since(s.LastHandshake)
 	if age >= window {
-		fmt.Printf("[ice] peer %s: isDirectConnected=false (lastHS age=%v >= window=%v, endpoint=%s)\n",
-			peer.Name, age.Round(time.Second), window, s.ActualEndpoint)
+		a.log.V(1).Info("isDirectConnected=false (handshake too old)", "peer", peer.Name, "lastHandshakeAge", age.Round(time.Second), "window", window, "endpoint", s.ActualEndpoint)
 		return false
 	}
 	return true

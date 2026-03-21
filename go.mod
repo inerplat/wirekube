@@ -3,8 +3,10 @@ module github.com/wirekube/wirekube
 go 1.23
 
 require (
+	github.com/go-logr/logr v1.4.2
 	github.com/huin/goupnp v1.3.0
 	github.com/pion/stun/v3 v3.0.0
+	github.com/prometheus/client_golang v1.19.1
 	github.com/spf13/cobra v1.8.1
 	github.com/vishvananda/netlink v1.3.0
 	golang.org/x/crypto v0.26.0
@@ -23,7 +25,6 @@ require (
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
 	github.com/evanphx/json-patch/v5 v5.9.0 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
-	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/jsonreference v0.21.0 // indirect
@@ -54,7 +55,6 @@ require (
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.19.1 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect

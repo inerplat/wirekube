@@ -10,4 +10,5 @@ site/
 /agent
 /operator
 /wirekubectl
+/stun-server
 internal/

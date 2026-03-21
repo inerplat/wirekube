@@ -16,10 +16,10 @@ func TestPeer_CreateAndGet(t *testing.T) {
 	peer := &wirekubev1alpha1.WireKubePeer{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-peer-create"},
 		Spec: wirekubev1alpha1.WireKubePeerSpec{
-			PublicKey:            "dGVzdHB1YmtleTEK",
-			Endpoint:             "198.51.100.1:51820",
-			AllowedIPs:           []string{"10.10.0.0/16"},
-			PersistentKeepalive:  25,
+			PublicKey:           "dGVzdHB1YmtleTEK",
+			Endpoint:            "198.51.100.1:51820",
+			AllowedIPs:          []string{"10.10.0.0/16"},
+			PersistentKeepalive: 25,
 		},
 	}
 	if err := k8sClient.Create(ctx, peer); err != nil {
@@ -48,9 +48,9 @@ func TestPeer_UpdateAllowedIPs(t *testing.T) {
 	peer := &wirekubev1alpha1.WireKubePeer{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-peer-update"},
 		Spec: wirekubev1alpha1.WireKubePeerSpec{
-			PublicKey:   "dXBkYXRla2V5MQo=",
-			Endpoint:    "198.51.100.2:51820",
-			AllowedIPs:  []string{"172.20.2.7/32"},
+			PublicKey:  "dXBkYXRla2V5MQo=",
+			Endpoint:   "198.51.100.2:51820",
+			AllowedIPs: []string{"172.20.2.7/32"},
 		},
 	}
 	if err := k8sClient.Create(ctx, peer); err != nil {
@@ -123,9 +123,9 @@ func TestPeer_MultipleAllowedIPs(t *testing.T) {
 		peer := &wirekubev1alpha1.WireKubePeer{
 			ObjectMeta: metav1.ObjectMeta{Name: tc.name},
 			Spec: wirekubev1alpha1.WireKubePeerSpec{
-				PublicKey:   "bXVsdGlrZXkK",
-				Endpoint:    "198.51.100.10:51820",
-				AllowedIPs:  tc.allowedIPs,
+				PublicKey:  "bXVsdGlrZXkK",
+				Endpoint:   "198.51.100.10:51820",
+				AllowedIPs: tc.allowedIPs,
 			},
 		}
 		if err := k8sClient.Create(ctx, peer); err != nil {
