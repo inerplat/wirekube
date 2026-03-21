@@ -415,6 +415,13 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	pod := agentPodForNode(ctx, t, subject)
 
+	expectedMetrics := []string{
+		"wirekube_peer_connected",
+		"wirekube_peers_total",
+		"wirekube_peer_transport_mode",
+		"wirekube_node_nat_type",
+	}
+
 	var metricsOut string
 	eventually(t, func() bool {
 		out, err := execInPod(ctx, t, pod, "agent",
@@ -423,21 +430,16 @@ func TestMetricsEndpoint(t *testing.T) {
 			t.Logf("metrics fetch: %v", err)
 			return false
 		}
+		for _, metric := range expectedMetrics {
+			if !strings.Contains(out, metric) {
+				t.Logf("metrics missing %q (%d bytes)", metric, len(out))
+				return false
+			}
+		}
 		metricsOut = out
 		return true
-	}, 1*time.Minute, 5*time.Second, "metrics endpoint should be reachable")
+	}, 1*time.Minute, 5*time.Second, "metrics endpoint should return all expected metrics")
 
-	expectedMetrics := []string{
-		"wirekube_peer_connected",
-		"wirekube_peers_total",
-		"wirekube_peer_transport_mode",
-		"wirekube_node_nat_type",
-	}
-	for _, metric := range expectedMetrics {
-		if !strings.Contains(metricsOut, metric) {
-			t.Errorf("metrics missing %q", metric)
-		}
-	}
 	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(metricsOut))
 }
 
