@@ -1,0 +1,43 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gosimple
+    - gocritic
+    - misspell
+    - gofmt
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (*net.UDPConn).SetReadDeadline
+      - (*net.UDPConn).SetDeadline
+      - (*net.UDPConn).Close
+      - (*net.UDPConn).WriteTo
+      - (*net.UDPConn).WriteToUDP
+      - (net.Conn).Close
+      - (*net.TCPConn).SetNoDelay
+      - (*os.File).Close
+      - (io.Closer).Close
+
+issues:
+  exclude-rules:
+    # Test files can have longer functions and more relaxed style
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+    # Generated files
+    - path: zz_generated
+      linters:
+        - all
+    # Build tags for e2e tests
+    - path: test/kind_e2e/
+      linters:
+        - errcheck

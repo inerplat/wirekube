@@ -3,6 +3,7 @@ package wireguard
 import (
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -346,9 +347,9 @@ func (m *Manager) ForceEndpoint(pubKeyB64 string, endpoint string) error {
 		ReplacePeers: false,
 		Peers: []wgtypes.PeerConfig{{
 			PublicKey:                   pubKey,
-			UpdateOnly:                 true,
-			Endpoint:                   ep,
-			ReplaceAllowedIPs:          false,
+			UpdateOnly:                  true,
+			Endpoint:                    ep,
+			ReplaceAllowedIPs:           false,
 			PersistentKeepaliveInterval: &pokeKeepalive,
 		}},
 	})
@@ -431,11 +432,11 @@ func (m *Manager) setRpFilter() {
 	}
 	for _, path := range paths {
 		if err := os.WriteFile(path, []byte("2"), 0644); err == nil {
-			fmt.Printf("[wireguard] rp_filter=2 set on %s\n", m.ifaceName)
+			log.Printf("[wireguard] rp_filter=2 set on %s\n", m.ifaceName)
 			return
 		}
 	}
-	fmt.Printf("[wireguard] warning: could not set rp_filter on %s\n", m.ifaceName)
+	log.Printf("[wireguard] warning: could not set rp_filter on %s\n", m.ifaceName)
 }
 
 // setLoAcceptLocal enables accept_local on the loopback interface so that the
@@ -450,11 +451,11 @@ func (m *Manager) setLoAcceptLocal() {
 	}
 	for _, path := range paths {
 		if err := os.WriteFile(path, []byte("1"), 0644); err == nil {
-			fmt.Printf("[wireguard] accept_local=1 set on lo\n")
+			log.Printf("[wireguard] accept_local=1 set on lo\n")
 			return
 		}
 	}
-	fmt.Printf("[wireguard] warning: could not set accept_local on lo\n")
+	log.Printf("[wireguard] warning: could not set accept_local on lo\n")
 }
 
 // AllowFwmarkLoopback adds an iptables exception in the KUBE-FIREWALL chain
@@ -490,7 +491,7 @@ func (m *Manager) AllowFwmarkLoopback() {
 		m.fwmarkClean = false
 		return
 	}
-	fmt.Printf("[wireguard] KUBE-FIREWALL exception added for fwmark %s → loopback\n", mark)
+	log.Printf("[wireguard] KUBE-FIREWALL exception added for fwmark %s → loopback\n", mark)
 }
 
 func (m *Manager) disableXfrm() {
@@ -511,10 +512,10 @@ func (m *Manager) disableXfrm() {
 			}
 		}
 		if !set {
-			fmt.Printf("[wireguard] warning: could not set %s on %s\n", sysctl, m.ifaceName)
+			log.Printf("[wireguard] warning: could not set %s on %s\n", sysctl, m.ifaceName)
 		}
 	}
-	fmt.Printf("[wireguard] xfrm bypass enabled on %s\n", m.ifaceName)
+	log.Printf("[wireguard] xfrm bypass enabled on %s\n", m.ifaceName)
 }
 
 func (m *Manager) removeRoutingRules() {
@@ -602,7 +603,7 @@ func (m *Manager) SyncRoutes(desired []string) error {
 	// Add missing routes (including those just deleted for src mismatch)
 	for _, cidr := range desired {
 		if err := m.AddRoute(cidr); err != nil {
-			fmt.Printf("warning: adding route %s: %v\n", cidr, err)
+			log.Printf("warning: adding route %s: %v\n", cidr, err)
 		}
 	}
 	return nil

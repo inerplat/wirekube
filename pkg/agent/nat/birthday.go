@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -23,9 +24,9 @@ const (
 
 // HolePunchResult describes a successfully hole-punched UDP path.
 type HolePunchResult struct {
-	LocalConn  *net.UDPConn
-	PeerAddr   *net.UDPAddr
-	LocalAddr  string // local listener address for WG endpoint
+	LocalConn *net.UDPConn
+	PeerAddr  *net.UDPAddr
+	LocalAddr string // local listener address for WG endpoint
 }
 
 // BirthdayAttack attempts NAT traversal via the birthday attack technique.
@@ -47,7 +48,7 @@ func BirthdayAttack(ctx context.Context, myPubKey [32]byte, peerPubKey [32]byte,
 	defer cancel()
 
 	var nonce [8]byte
-	rand.Read(nonce[:])
+	rand.Read(nonce[:]) //nolint:errcheck
 
 	// Open multiple local sockets for sending probes.
 	sockets := make([]*net.UDPConn, 0, numLocalSockets)
@@ -67,7 +68,7 @@ func BirthdayAttack(ctx context.Context, myPubKey [32]byte, peerPubKey [32]byte,
 		}
 	}()
 
-	fmt.Printf("[birthday] opened %d probe sockets, targeting %d candidate ports on %s\n",
+	log.Printf("[birthday] opened %d probe sockets, targeting %d candidate ports on %s\n",
 		len(sockets), len(peerCandidatePorts), peerPublicIP)
 
 	// Build probe packet: magic + our pubkey + nonce
@@ -91,7 +92,7 @@ func BirthdayAttack(ctx context.Context, myPubKey [32]byte, peerPubKey [32]byte,
 					return
 				default:
 				}
-				conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
 				n, addr, err := conn.ReadFromUDP(buf)
 				if err != nil {
 					continue
@@ -111,7 +112,7 @@ func BirthdayAttack(ctx context.Context, myPubKey [32]byte, peerPubKey [32]byte,
 					continue
 				}
 				// Found a probe from our peer.
-				fmt.Printf("[birthday] received probe from %s on local socket %d\n", addr, sockIdx)
+				log.Printf("[birthday] received probe from %s on local socket %d\n", addr, sockIdx)
 				res := &HolePunchResult{
 					LocalConn: conn,
 					PeerAddr:  addr,
@@ -150,7 +151,7 @@ func BirthdayAttack(ctx context.Context, myPubKey [32]byte, peerPubKey [32]byte,
 				}
 			}
 			// One full round done; re-randomize nonce and repeat.
-			rand.Read(nonce[:])
+			rand.Read(nonce[:]) //nolint:errcheck
 			copy(probe[36:44], nonce[:])
 			time.Sleep(100 * time.Millisecond)
 		}

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os/exec"
 	"strconv"
@@ -252,9 +251,4 @@ func pingHost(ip string) float64 {
 		}
 	}
 	return -1
-}
-
-func init() {
-	// Ensure metrics are registered (promauto handles this).
-	_ = fmt.Sprintf
 }
