@@ -414,11 +414,18 @@ func TestMetricsEndpoint(t *testing.T) {
 	}, 2*time.Minute, pollInterval, "connections established")
 
 	pod := agentPodForNode(ctx, t, subject)
-	out, err := execInPod(ctx, t, pod, "agent",
-		[]string{"wget", "-qO-", "http://127.0.0.1:9090/metrics"})
-	if err != nil {
-		t.Fatalf("metrics fetch: %v (%s)", err, out)
-	}
+
+	var metricsOut string
+	eventually(t, func() bool {
+		out, err := execInPod(ctx, t, pod, "agent",
+			[]string{"wget", "-qO-", "http://127.0.0.1:9090/metrics"})
+		if err != nil {
+			t.Logf("metrics fetch: %v", err)
+			return false
+		}
+		metricsOut = out
+		return true
+	}, 1*time.Minute, 5*time.Second, "metrics endpoint should be reachable")
 
 	expectedMetrics := []string{
 		"wirekube_peer_connected",
@@ -427,11 +434,11 @@ func TestMetricsEndpoint(t *testing.T) {
 		"wirekube_node_nat_type",
 	}
 	for _, metric := range expectedMetrics {
-		if !strings.Contains(out, metric) {
+		if !strings.Contains(metricsOut, metric) {
 			t.Errorf("metrics missing %q", metric)
 		}
 	}
-	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(out))
+	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(metricsOut))
 }
 
 // TestRelayReconnect breaks and restores the relay endpoint.
