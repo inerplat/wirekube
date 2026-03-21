@@ -31,7 +31,7 @@ type gatewayState struct {
 func (a *Agent) setupGateway(ctx context.Context) error {
 	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
 	if err := a.client.List(ctx, gwList); err != nil {
-		fmt.Printf("[gateway] list error: %v\n", err)
+		a.log.Error(err, "gateway list error")
 		return nil
 	}
 	if len(gwList.Items) == 0 {
@@ -46,7 +46,7 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 		gw := &gwList.Items[i]
 
 		activePeer := a.electActivePeer(ctx, gw)
-		fmt.Printf("[gateway] %s: elected=%s, me=%s\n", gw.Name, activePeer, myPeerName)
+		a.log.V(1).Info("gateway election result", "gateway", gw.Name, "elected", activePeer, "me", myPeerName)
 		if activePeer == "" {
 			continue
 		}
@@ -76,7 +76,7 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 	}
 
 	if err := enableIPForwarding(); err != nil {
-		fmt.Printf("[gateway] warning: enabling IP forwarding: %v\n", err)
+		a.log.Error(err, "enabling IP forwarding")
 	}
 
 	a.syncSNATRules(desiredSNATCIDRs)
@@ -136,7 +136,9 @@ func (a *Agent) injectGatewayRoutes(ctx context.Context, gw *wirekubev1alpha1.Wi
 		}
 	}
 
-	newAllowed := append(userCIDRs, sortedKeys(desiredGW)...)
+	newAllowed := make([]string, 0, len(userCIDRs)+len(desiredGW))
+	newAllowed = append(newAllowed, userCIDRs...)
+	newAllowed = append(newAllowed, sortedKeys(desiredGW)...)
 
 	// Check if anything changed.
 	if equalStringSlice(peer.Spec.AllowedIPs, newAllowed) {
@@ -145,12 +147,12 @@ func (a *Agent) injectGatewayRoutes(ctx context.Context, gw *wirekubev1alpha1.Wi
 
 	for cidr := range desiredGW {
 		if !prevInjected[cidr] {
-			fmt.Printf("[gateway] injecting route %s into peer %s\n", cidr, peerName)
+			a.log.Info("injecting gateway route", "cidr", cidr, "peer", peerName)
 		}
 	}
 	for cidr := range prevInjected {
 		if !desiredGW[cidr] {
-			fmt.Printf("[gateway] removing stale route %s from peer %s\n", cidr, peerName)
+			a.log.Info("removing stale gateway route", "cidr", cidr, "peer", peerName)
 		}
 	}
 
@@ -161,7 +163,7 @@ func (a *Agent) injectGatewayRoutes(ctx context.Context, gw *wirekubev1alpha1.Wi
 	peer.Annotations[annKey] = strings.Join(sortedKeys(desiredGW), ",")
 
 	if err := a.client.Update(ctx, peer); err != nil {
-		fmt.Printf("[gateway] warning: updating peer %s allowedIPs: %v\n", peerName, err)
+		a.log.Error(err, "updating peer allowedIPs", "peer", peerName)
 	}
 }
 
@@ -215,7 +217,7 @@ func (a *Agent) updateGatewayStatus(ctx context.Context, gw *wirekubev1alpha1.Wi
 	gw.Status.Ready = true
 	gw.Status.RoutesInjected = int32(len(gw.Spec.Routes))
 	if err := a.client.Status().Patch(ctx, gw, patch); err != nil {
-		fmt.Printf("[gateway] warning: updating gateway status: %v\n", err)
+		a.log.Error(err, "updating gateway status")
 	}
 }
 
@@ -244,11 +246,11 @@ func (a *Agent) syncSNATRules(desired map[string]bool) {
 	for cidr := range desired {
 		if !a.gwState.snatRules[cidr] {
 			if err := addMasqueradeRule(cidr, ifaceName); err != nil {
-				fmt.Printf("[gateway] warning: adding MASQUERADE for %s: %v\n", cidr, err)
+				a.log.Error(err, "adding MASQUERADE rule", "cidr", cidr)
 				continue
 			}
 			a.gwState.snatRules[cidr] = true
-			fmt.Printf("[gateway] MASQUERADE added for %s\n", cidr)
+			a.log.Info("MASQUERADE added", "cidr", cidr)
 		}
 	}
 
@@ -257,7 +259,7 @@ func (a *Agent) syncSNATRules(desired map[string]bool) {
 		if !desired[cidr] {
 			removeMasqueradeRule(cidr, ifaceName)
 			delete(a.gwState.snatRules, cidr)
-			fmt.Printf("[gateway] MASQUERADE removed for %s\n", cidr)
+			a.log.Info("MASQUERADE removed", "cidr", cidr)
 		}
 	}
 }
@@ -316,63 +318,6 @@ func removeMasqueradeRule(cidr, _ string) {
 		"-j", "MASQUERADE",
 	}
 	_ = exec.Command("iptables", args...).Run()
-}
-
-// getGatewayCIDRs returns all CIDR routes from WireKubeGateway CRs that
-// reference the given peer as active gateway. Used during sync to include
-// gateway routes in the kernel routing table.
-func (a *Agent) getGatewayCIDRs(ctx context.Context) []string {
-	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
-	if err := a.client.List(ctx, gwList); err != nil {
-		return nil
-	}
-
-	var cidrs []string
-	for i := range gwList.Items {
-		gw := &gwList.Items[i]
-		for _, route := range gw.Spec.Routes {
-			cidrs = append(cidrs, route.CIDR)
-		}
-	}
-	return cidrs
-}
-
-// isGatewayNode returns true if this node is the active gateway for any WireKubeGateway.
-func (a *Agent) isGatewayNode() bool {
-	return a.gwState != nil && len(a.gwState.gatewayNames) > 0
-}
-
-// listActiveGateways lists the WireKubeGateway CRs for which this node is active.
-func (a *Agent) listActiveGateways(ctx context.Context) ([]wirekubev1alpha1.WireKubeGateway, error) {
-	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
-	if err := a.client.List(ctx, gwList); err != nil {
-		return nil, err
-	}
-
-	myPeerName := a.nodeName
-	var active []wirekubev1alpha1.WireKubeGateway
-	for _, gw := range gwList.Items {
-		if gw.Status.ActivePeer == myPeerName {
-			active = append(active, gw)
-		}
-	}
-	return active, nil
-}
-
-// performGatewayHealthCheck runs health check probes for gateways where
-// this node is the active peer. Results are reported back to the gateway status.
-func (a *Agent) performGatewayHealthCheck(ctx context.Context) {
-	gateways, err := a.listActiveGateways(ctx)
-	if err != nil || len(gateways) == 0 {
-		return
-	}
-
-	for i := range gateways {
-		gw := &gateways[i]
-		if gw.Spec.HealthCheck == nil || !gw.Spec.HealthCheck.Enabled {
-			continue
-		}
-	}
 }
 
 // shouldSkipGatewayRoute decides if a given CIDR (from a remote peer's AllowedIPs)
