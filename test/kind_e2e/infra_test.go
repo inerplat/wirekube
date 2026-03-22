@@ -119,14 +119,17 @@ func setupCluster(_ context.Context) error {
 	// Raise containerd memlock so Cilium (eBPF) can set RLIMIT_MEMLOCK in
 	// pods. Without this, containerd inherits 8MB from systemd defaults,
 	// which Cilium's agent cannot raise inside user namespaces.
-	for _, n := range nodeConfigs {
-		if err := raiseContainerdMemlock(n.name); err != nil {
-			return fmt.Errorf("raise memlock on %s: %w", n.name, err)
+	// Only Cilium needs this; Flannel and Calico do not.
+	if !isFlannel() && !isCalico() {
+		for _, n := range nodeConfigs {
+			if err := raiseContainerdMemlock(n.name); err != nil {
+				return fmt.Errorf("raise memlock on %s: %w", n.name, err)
+			}
 		}
-	}
-	for _, n := range nodeConfigs {
-		if err := waitForContainerd(n.name, 1*time.Minute); err != nil {
-			return fmt.Errorf("containerd not ready after memlock fix on %s: %w", n.name, err)
+		for _, n := range nodeConfigs {
+			if err := waitForContainerd(n.name, 1*time.Minute); err != nil {
+				return fmt.Errorf("containerd not ready after memlock fix on %s: %w", n.name, err)
+			}
 		}
 	}
 
@@ -158,9 +161,22 @@ func setupCluster(_ context.Context) error {
 		}
 	}
 
-	fmt.Println("e2e: installing Cilium CNI…")
-	if err := installCilium(); err != nil {
-		return fmt.Errorf("install Cilium: %w", err)
+	switch {
+	case isFlannel():
+		fmt.Println("e2e: installing Flannel CNI…")
+		if err := installFlannel(); err != nil {
+			return fmt.Errorf("install Flannel: %w", err)
+		}
+	case isCalico():
+		fmt.Println("e2e: installing Calico CNI…")
+		if err := installCalico(); err != nil {
+			return fmt.Errorf("install Calico: %w", err)
+		}
+	default:
+		fmt.Println("e2e: installing Cilium CNI…")
+		if err := installCilium(); err != nil {
+			return fmt.Errorf("install Cilium: %w", err)
+		}
 	}
 
 	fmt.Println("e2e: waiting for nodes Ready…")
@@ -673,6 +689,111 @@ func installCilium() error {
 
 	fmt.Println("e2e: waiting for Cilium pods to be ready…")
 	return waitForCiliumReady(5 * time.Minute)
+}
+
+const flannelManifestURL = "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+
+func installFlannel() error {
+	// Download the Flannel manifest on the host and copy it into the CP container.
+	out, err := runCmd("curl", "-fsSL", flannelManifestURL)
+	if err != nil {
+		return fmt.Errorf("download flannel manifest: %w", err)
+	}
+
+	if err := writeToContainer(cpNode().name, "/tmp/flannel.yaml", out); err != nil {
+		return fmt.Errorf("write flannel manifest: %w", err)
+	}
+
+	if _, err := kubectlInCP("apply", "-f", "/tmp/flannel.yaml"); err != nil {
+		return fmt.Errorf("kubectl apply flannel: %w", err)
+	}
+
+	fmt.Println("e2e: waiting for Flannel pods to be ready…")
+	return waitForFlannelReady(5 * time.Minute)
+}
+
+func waitForFlannelReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := kubectlInCP("get", "pods", "-n", "kube-flannel",
+			"-l", "app=flannel", "--no-headers")
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		allRunning := true
+		for _, line := range lines {
+			if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
+				allRunning = false
+				break
+			}
+		}
+		if allRunning && len(lines) >= len(nodeConfigs) {
+			fmt.Printf("e2e: Flannel ready (%d pods)\n", len(lines))
+			return nil
+		}
+		fmt.Printf("e2e: Flannel pods: %d/%d ready…\n", countReady(lines), len(nodeConfigs))
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for Flannel pods")
+}
+
+const calicoManifestURL = "https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/calico.yaml"
+
+func installCalico() error {
+	cp := cpNode().name
+
+	// Download inside the container and patch IPIP → VXLAN (IPIP may not
+	// work in nested container environments like kindest/node on Docker).
+	dlCmd := fmt.Sprintf(
+		`curl -fsSL %s | sed 's/"CALICO_IPV4POOL_IPIP"/"CALICO_IPV4POOL_VXLAN"/g' > /tmp/calico.yaml`,
+		calicoManifestURL)
+	if _, err := ctrExec("exec", cp, "sh", "-c", dlCmd); err != nil {
+		return fmt.Errorf("download calico manifest: %w", err)
+	}
+
+	if _, err := kubectlInCP("apply", "-f", "/tmp/calico.yaml"); err != nil {
+		return fmt.Errorf("kubectl apply calico: %w", err)
+	}
+
+	fmt.Println("e2e: waiting for Calico pods to be ready…")
+	return waitForCalicoReady(5 * time.Minute)
+}
+
+func waitForCalicoReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := kubectlInCP("get", "pods", "-n", "kube-system",
+			"-l", "k8s-app=calico-node", "--no-headers")
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		allRunning := true
+		for _, line := range lines {
+			if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
+				allRunning = false
+				break
+			}
+		}
+		if allRunning && len(lines) >= len(nodeConfigs) {
+			fmt.Printf("e2e: Calico ready (%d pods)\n", len(lines))
+			return nil
+		}
+		fmt.Printf("e2e: Calico pods: %d/%d ready…\n", countReady(lines), len(nodeConfigs))
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for Calico pods")
 }
 
 func waitForCiliumReady(timeout time.Duration) error {
