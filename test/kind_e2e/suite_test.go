@@ -6,9 +6,11 @@
 //
 // Network topology:
 //
-//	wk-vpc-1 (172.20.0.0/24) ─── wk-cp  (control-plane, 172.20.0.2)
-//	wk-vpc-2 (172.21.0.0/24) ─── wk-w1  (worker,        172.21.0.2)
-//	wk-vpc-3 (172.22.0.0/24) ─── wk-w2  (worker,        172.22.0.2)
+//	{p}-vpc-1 (172.{base}.0.0/24)   ─── {p}-cp  (control-plane)
+//	{p}-vpc-2 (172.{base+1}.0.0/24) ─── {p}-w1  (worker)
+//	{p}-vpc-3 (172.{base+2}.0.0/24) ─── {p}-w2  (worker)
+//
+//	{p} and {base} vary by CNI mode so matrix jobs can run in parallel.
 //
 //	Nodes reach each other via L3 routing through the container host kernel.
 //	STUN servers run as processes inside the CP container.
@@ -82,10 +84,32 @@ type nodeConfig struct {
 	role    string // "control-plane" or "worker"
 }
 
-var nodeConfigs = []nodeConfig{
-	{name: "wk-cp", network: "wk-vpc-1", subnet: "172.20.0.0/24", ip: "172.20.0.2", role: "control-plane"},
-	{name: "wk-w1", network: "wk-vpc-2", subnet: "172.21.0.0/24", ip: "172.21.0.2", role: "worker"},
-	{name: "wk-w2", network: "wk-vpc-3", subnet: "172.22.0.0/24", ip: "172.22.0.2", role: "worker"},
+// nodeConfigs is initialized in init() with CNI-mode-specific names and subnets
+// to allow parallel matrix jobs on the same host without collisions.
+var nodeConfigs []nodeConfig
+
+func init() {
+	// Each CNI mode gets a unique subnet offset and name prefix so parallel
+	// matrix jobs don't collide on the same Docker host.
+	var subnetOffset int
+	var prefix string
+	switch cniMode() {
+	case cniModeFlannel:
+		subnetOffset, prefix = 0, "fl"
+	case cniModeKubeProxyVxlan:
+		subnetOffset, prefix = 3, "ck"
+	case cniModeNoKubeProxyVxlan:
+		subnetOffset, prefix = 6, "cn"
+	case cniModeCalico:
+		subnetOffset, prefix = 9, "ca"
+	default:
+		subnetOffset, prefix = 0, "wk"
+	}
+	nodeConfigs = []nodeConfig{
+		{name: prefix + "-cp", network: prefix + "-vpc-1", subnet: fmt.Sprintf("172.%d.0.0/24", 20+subnetOffset), ip: fmt.Sprintf("172.%d.0.2", 20+subnetOffset), role: "control-plane"},
+		{name: prefix + "-w1", network: prefix + "-vpc-2", subnet: fmt.Sprintf("172.%d.0.0/24", 21+subnetOffset), ip: fmt.Sprintf("172.%d.0.2", 21+subnetOffset), role: "worker"},
+		{name: prefix + "-w2", network: prefix + "-vpc-3", subnet: fmt.Sprintf("172.%d.0.0/24", 22+subnetOffset), ip: fmt.Sprintf("172.%d.0.2", 22+subnetOffset), role: "worker"},
+	}
 }
 
 var (
