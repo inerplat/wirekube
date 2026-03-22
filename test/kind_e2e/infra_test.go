@@ -18,9 +18,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -815,7 +815,7 @@ func loadImageToAllNodes(image string) error {
 		dockerRef := "docker.io/" + image
 		ctrExec("exec", n.name,
 			"ctr", "-n=k8s.io", "images", "tag", "localhost/"+image, dockerRef) //nolint:errcheck
-		ctrExec("exec", n.name, "rm", ctrTarPath)                               //nolint:errcheck
+		ctrExec("exec", n.name, "rm", ctrTarPath) //nolint:errcheck
 		fmt.Printf("e2e: loaded %s into %s\n", image, n.name)
 	}
 	return nil

@@ -44,8 +44,8 @@ func tryIGDv2(ctx context.Context, port int) (*UPnPForwardResult, error) {
 
 	leaseDuration := uint32(3600) // 1 hour; renew periodically
 	if err := client.AddPortMappingCtx(ctx,
-		"",               // remote host (empty = any)
-		uint16(port),     // external port
+		"",           // remote host (empty = any)
+		uint16(port), // external port
 		"UDP",
 		uint16(port), // internal port
 		localIP,
