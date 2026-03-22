@@ -22,16 +22,6 @@ func makeNode(annotations map[string]string, addresses []corev1.NodeAddress) *co
 	}
 }
 
-// requireNoNetwork skips the test if the environment allows outbound network
-// (i.e., STUN or UPnP might succeed, making fallback tests non-deterministic).
-// Set WIREKUBE_NETWORK_TESTS=1 to run these as integration tests.
-func requireNetworkTestsDisabled(t *testing.T) {
-	t.Helper()
-	if os.Getenv("WIREKUBE_NETWORK_TESTS") == "1" {
-		t.Skip("skipping: WIREKUBE_NETWORK_TESTS=1 enables network-dependent tests separately")
-	}
-}
-
 // ─── Pure-logic tests (no network) ────────────────────────────────────────────
 
 func TestDiscoverEndpoint_ManualAnnotation(t *testing.T) {
@@ -79,10 +69,10 @@ func TestIsPublicIPv6(t *testing.T) {
 		addr string
 		want bool
 	}{
-		{"::1", false},      // loopback
-		{"fe80::1", false},  // link-local
-		{"fc00::1", false},  // unique local (private)
-		{"fd00::1", false},  // unique local (private)
+		{"::1", false},     // loopback
+		{"fe80::1", false}, // link-local
+		{"fc00::1", false}, // unique local (private)
+		{"fd00::1", false}, // unique local (private)
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.addr)

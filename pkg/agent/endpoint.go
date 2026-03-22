@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -18,12 +19,12 @@ import (
 type DiscoveryMethod string
 
 const (
-	MethodManual       DiscoveryMethod = "manual"
-	MethodIPv6         DiscoveryMethod = "ipv6"
-	MethodSTUN         DiscoveryMethod = "stun"
-	MethodAWSMetadata  DiscoveryMethod = "aws-metadata"
-	MethodUPnP         DiscoveryMethod = "upnp"
-	MethodInternalIP   DiscoveryMethod = "internal-ip"
+	MethodManual      DiscoveryMethod = "manual"
+	MethodIPv6        DiscoveryMethod = "ipv6"
+	MethodSTUN        DiscoveryMethod = "stun"
+	MethodAWSMetadata DiscoveryMethod = "aws-metadata"
+	MethodUPnP        DiscoveryMethod = "upnp"
+	MethodInternalIP  DiscoveryMethod = "internal-ip"
 )
 
 // EndpointResult holds a discovered endpoint and how it was found.
@@ -203,7 +204,7 @@ func discoverViaSTUN(ctx context.Context, listenPort int, stunServers []string) 
 	if err != nil {
 		return nil, nat.NATUnknown
 	}
-	fmt.Printf("[endpoint] STUN on listen port failed; NAT type detected via ephemeral port: %s\n", sr.NATType)
+	log.Printf("[endpoint] STUN on listen port failed; NAT type detected via ephemeral port: %s", sr.NATType)
 	return buildSTUNResult(sr, listenPort, true), sr.NATType
 }
 

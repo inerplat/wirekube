@@ -22,6 +22,7 @@ import (
 //     with exponential backoff (1s → 30s cap).
 //   - Proxies survive reconnections — they are bound to the Client, not the
 //     TCP connection, and resume forwarding once the new connection is up.
+//
 // DataHandler is called when a Data frame arrives. If nil, the Client falls
 // back to its own proxy map. Pool sets this to route data through its own
 // proxy map instead.
@@ -83,7 +84,7 @@ func (c *Client) dial(ctx context.Context) error {
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+		tc.SetNoDelay(true) //nolint:errcheck
 	}
 
 	writer := bufio.NewWriterSize(conn, 64*1024)
