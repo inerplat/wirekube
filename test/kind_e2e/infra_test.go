@@ -748,10 +748,18 @@ const calicoManifestURL = "https://raw.githubusercontent.com/projectcalico/calic
 func installCalico() error {
 	cp := cpNode().name
 
-	// Download inside the container and patch IPIP → VXLAN (IPIP may not
-	// work in nested container environments like kindest/node on Docker).
+	// Download inside the container and patch for nested container environments:
+	// 1. Replace IPIP encap with VXLAN (IPIP may not work inside Docker containers)
+	// 2. Set CALICO_IPV4POOL_CIDR to match kubeadm's podSubnet (10.244.0.0/16)
+	//    Calico defaults to 192.168.0.0/16 which won't match node podCIDR allocations.
 	dlCmd := fmt.Sprintf(
-		`curl -fsSL %s | sed 's/"CALICO_IPV4POOL_IPIP"/"CALICO_IPV4POOL_VXLAN"/g' > /tmp/calico.yaml`,
+		`curl -fsSL %s | `+
+			`sed 's/"CALICO_IPV4POOL_IPIP"/"CALICO_IPV4POOL_VXLAN"/g' | `+
+			`sed 's/value: "Always"/value: "CrossSubnet"/g' | `+
+			`sed '/CALICO_IPV4POOL_VXLAN/{n;s|value:.*|value: "CrossSubnet"|}' | `+
+			`sed 's|# - name: CALICO_IPV4POOL_CIDR|- name: CALICO_IPV4POOL_CIDR|g' | `+
+			`sed 's|#   value: "192.168.0.0/16"|  value: "10.244.0.0/16"|g' `+
+			`> /tmp/calico.yaml`,
 		calicoManifestURL)
 	if _, err := ctrExec("exec", cp, "sh", "-c", dlCmd); err != nil {
 		return fmt.Errorf("download calico manifest: %w", err)
@@ -790,8 +798,29 @@ func waitForCalicoReady(timeout time.Duration) error {
 			fmt.Printf("e2e: Calico ready (%d pods)\n", len(lines))
 			return nil
 		}
-		fmt.Printf("e2e: Calico pods: %d/%d ready…\n", countReady(lines), len(nodeConfigs))
+		ready := countReady(lines)
+		fmt.Printf("e2e: Calico pods: %d/%d ready…\n", ready, len(nodeConfigs))
+		// Print pod details on first iteration and periodically to aid debugging.
+		if ready == 0 && time.Until(deadline) > 4*time.Minute {
+			for _, line := range lines {
+				fmt.Printf("e2e:   %s\n", line)
+			}
+		}
 		time.Sleep(5 * time.Second)
+	}
+	// Dump final pod state for debugging before returning error.
+	if out, err := kubectlInCP("get", "pods", "-n", "kube-system",
+		"-l", "k8s-app=calico-node", "-o", "wide"); err == nil {
+		fmt.Printf("e2e: Calico final pod state:\n%s\n", out)
+	}
+	if out, err := kubectlInCP("describe", "pods", "-n", "kube-system",
+		"-l", "k8s-app=calico-node"); err == nil {
+		// Only print last 60 lines to avoid noise.
+		descLines := strings.Split(out, "\n")
+		if len(descLines) > 60 {
+			descLines = descLines[len(descLines)-60:]
+		}
+		fmt.Printf("e2e: Calico pod describe (tail):\n%s\n", strings.Join(descLines, "\n"))
 	}
 	return fmt.Errorf("timed out waiting for Calico pods")
 }
