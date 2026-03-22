@@ -55,6 +55,7 @@ nav:
   - Home: index.md
   - Getting Started:
     - Quick Start: getting-started/quickstart.md
+    - Local Playground: getting-started/local-playground.md
     - Installation: getting-started/installation.md
     - Configuration: getting-started/configuration.md
     - EKS Hybrid Nodes: getting-started/eks-hybrid-nodes.md

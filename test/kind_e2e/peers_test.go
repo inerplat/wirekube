@@ -4,6 +4,7 @@ package kind_e2e
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ func allPeers(ctx context.Context, t *testing.T) []string {
 	for _, p := range list.Items {
 		names = append(names, p.Name)
 	}
+	sort.Strings(names) // ensure deterministic order; wk-cp sorts before wk-w*
 	return names
 }
 
