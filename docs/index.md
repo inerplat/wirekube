@@ -67,7 +67,7 @@ No coordination server, no external etcd, no control plane beyond the Kubernetes
 ## Quick Links
 
 - [Quick Start](getting-started/quickstart.md) — Get a mesh running in minutes
-- [Local Playground](getting-started/local-playground.md) — Try WireKube with Docker containers
+- [Local Playground](guides/local-playground.md) — Try WireKube with Docker containers
 - [Installation](getting-started/installation.md) — Detailed setup guide
 - [Configuration](getting-started/configuration.md) — WireKubeMesh spec, relay modes, annotations
 - [Architecture](architecture/overview.md) — How WireKube works under the hood

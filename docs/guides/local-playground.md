@@ -376,7 +376,7 @@ kubectl delete -f config/crd/ --ignore-not-found
 
 ## Next Steps
 
-- [Configuration](configuration.md) — Relay modes, STUN servers, and mesh options
+- [Configuration](../getting-started/configuration.md) — Relay modes, STUN servers, and mesh options
 - [NAT Traversal](../architecture/nat-traversal.md) — How WireKube handles different NAT types
 - [EKS Hybrid Nodes](eks-hybrid-nodes.md) — Production deployment with EKS
 - [Monitoring](../operations/monitoring.md) — Prometheus metrics and Grafana dashboards
