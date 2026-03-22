@@ -39,7 +39,7 @@ EKS Hybrid Nodes are external worker nodes (on-premises, other clouds) managed
 by an EKS control plane. WireKube provides full mesh connectivity including
 relay-based fallback and a VGW gateway for `kubectl exec/logs`.
 
-See the [EKS Hybrid Nodes Guide](../getting-started/eks-hybrid-nodes.md) for
+See the [EKS Hybrid Nodes Guide](../guides/eks-hybrid-nodes.md) for
 a complete deployment walkthrough.
 
 | Aspect | Detail |

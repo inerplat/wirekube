@@ -4,8 +4,6 @@
 
 WireKube builds a WireGuard mesh between your Kubernetes nodes using only CRDs for coordination. It automatically handles NAT traversal, falls back to TCP relay when direct P2P isn't possible, and preserves WireGuard's end-to-end encryption throughout.
 
-> **Status: Alpha** — Suitable for testing and non-production environments.
-
 **[Documentation](https://inerplat.github.io/wirekube/)**
 
 ## When Do You Need WireKube?
@@ -109,14 +107,7 @@ For details on NAT traversal, routing design, and the relay protocol, see the [A
 
 ## Documentation
 
-- [Local Playground](https://inerplat.github.io/wirekube/getting-started/local-playground/) — Try WireKube with Docker containers
-- [Installation](https://inerplat.github.io/wirekube/getting-started/installation/) — Detailed setup guide
-- [Configuration](https://inerplat.github.io/wirekube/getting-started/configuration/) — WireKubeMesh spec, relay modes, annotations
-- [NAT Traversal](https://inerplat.github.io/wirekube/architecture/nat-traversal/) — STUN, ICE negotiation, relay protocol
-- [Gateway](https://inerplat.github.io/wirekube/architecture/gateway/) — Cross-VPC routing with WireKubeGateway
-- [Monitoring](https://inerplat.github.io/wirekube/operations/monitoring/) — Prometheus metrics and Grafana dashboards
-- [Troubleshooting](https://inerplat.github.io/wirekube/operations/troubleshooting/) — Common issues and fixes
-- [CRD Reference](https://inerplat.github.io/wirekube/reference/crds/) — Complete API specification
+Full documentation is available at **[inerplat.github.io/wirekube](https://inerplat.github.io/wirekube/)**.
 
 ## Building from Source
 
