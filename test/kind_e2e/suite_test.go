@@ -32,7 +32,7 @@
 //	WIREKUBE_KIND_NODE_IMG      override kindest/node image
 //	WIREKUBE_E2E_REUSE=1        skip teardown for faster re-runs
 //	WIREKUBE_E2E_SKIP_SETUP=1   skip cluster creation (assume running)
-//	WIREKUBE_E2E_CNI_MODE       "kube-proxy-vxlan" (default) or "no-kube-proxy-vxlan"
+//	WIREKUBE_E2E_CNI_MODE       "cilium-kube-proxy" (default), "cilium-no-kube-proxy", "flannel", or "calico"
 package kind_e2e
 
 import (
@@ -68,8 +68,10 @@ const (
 	defaultNodeImage     = "kindest/node:v1.34.0"
 	defaultWireKubeImage = "inerplat/wirekube:v0.0.9-dev.1"
 
-	cniModeKubeProxyVxlan   = "kube-proxy-vxlan"
-	cniModeNoKubeProxyVxlan = "no-kube-proxy-vxlan"
+	cniModeKubeProxyVxlan   = "cilium-kube-proxy"
+	cniModeNoKubeProxyVxlan = "cilium-no-kube-proxy"
+	cniModeFlannel          = "flannel"
+	cniModeCalico           = "calico"
 )
 
 type nodeConfig struct {
@@ -138,6 +140,14 @@ func cniMode() string {
 
 func skipKubeProxy() bool {
 	return cniMode() == cniModeNoKubeProxyVxlan
+}
+
+func isFlannel() bool {
+	return cniMode() == cniModeFlannel
+}
+
+func isCalico() bool {
+	return cniMode() == cniModeCalico
 }
 
 func TestMain(m *testing.M) {

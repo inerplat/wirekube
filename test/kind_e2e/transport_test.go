@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
@@ -137,7 +138,7 @@ func TestAllNodesReachable(t *testing.T) {
 			}
 			_ = out
 			return true
-		}, 1*time.Minute, 5*time.Second,
+		}, 2*time.Minute, 5*time.Second,
 			fmt.Sprintf("ping %s → %s (%s)", subject, rem, remoteIP))
 		t.Logf("ping %s → %s OK", subject, rem)
 	}
@@ -315,7 +316,7 @@ func TestBidirectionalPing(t *testing.T) {
 			}
 			_ = out
 			return true
-		}, 1*time.Minute, 5*time.Second,
+		}, 2*time.Minute, 5*time.Second,
 			fmt.Sprintf("ping %s → %s (%s)", subject, r, remoteIP))
 
 		t.Logf("ping %s → %s OK", subject, r)
@@ -413,7 +414,13 @@ func TestMetricsEndpoint(t *testing.T) {
 		return connectionMode(ctx, t, subject, peers[1]) != ""
 	}, 2*time.Minute, pollInterval, "connections established")
 
-	pod := agentPodForNode(ctx, t, subject)
+	// Agent pod may have been restarted by a previous test — wait for a
+	// running pod before attempting to fetch metrics.
+	var pod corev1.Pod
+	eventually(t, func() bool {
+		pod = agentPodForNode(ctx, t, subject)
+		return pod.Status.Phase == corev1.PodRunning
+	}, 2*time.Minute, pollInterval, "agent pod running on "+subject)
 
 	expectedMetrics := []string{
 		"wirekube_peer_connected",
@@ -438,7 +445,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		}
 		metricsOut = out
 		return true
-	}, 1*time.Minute, 5*time.Second, "metrics endpoint should return all expected metrics")
+	}, 2*time.Minute, 5*time.Second, "metrics endpoint should return all expected metrics")
 
 	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(metricsOut))
 }
