@@ -9,14 +9,15 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 	"github.com/wirekube/wirekube/pkg/agent/nat"
 	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
+	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 )
@@ -30,6 +31,7 @@ import (
 //   - Agent syncs all WireKubePeer CRDs into WireGuard peer config + kernel routes.
 //   - No IPAM, no mesh IP assignment, no kubelet modification.
 type Agent struct {
+	log          logr.Logger
 	client       client.Client
 	wgMgr        *wireguard.Manager
 	nodeName     string
@@ -100,8 +102,9 @@ type Agent struct {
 }
 
 // NewAgent creates a new Agent.
-func NewAgent(k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podName, podNamespace string) *Agent {
+func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr *wireguard.Manager, nodeName, podName, podNamespace string) *Agent {
 	return &Agent{
+		log:                log,
 		client:             k8sClient,
 		wgMgr:              wgMgr,
 		nodeName:           nodeName,
@@ -146,7 +149,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	const maxBackoff = 60 * time.Second
 	for {
 		if err := a.setup(ctx); err != nil {
-			fmt.Printf("[agent] setup failed (retrying in %s): %v\n", backoff, err)
+			a.log.Error(err, "setup failed, retrying", "backoff", backoff)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -173,7 +176,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			if err := a.sync(ctx); err != nil {
-				fmt.Printf("sync error: %v\n", err)
+				a.log.Error(err, "sync error")
 			}
 		}
 	}
@@ -185,7 +188,7 @@ func (a *Agent) Run(ctx context.Context) error {
 // Full interface teardown (routes + link deletion) is deferred to an explicit
 // cleanup job or CR deletion — see config/cleanup/ and docs.
 func (a *Agent) cleanup() {
-	fmt.Printf("[cleanup] releasing user-space resources (WireGuard interface %s preserved)\n", a.wgMgr.InterfaceName())
+	a.log.Info("releasing user-space resources", "interface", a.wgMgr.InterfaceName())
 	for name, state := range a.iceStates {
 		if state.holePunch != nil {
 			state.holePunch.Close()
@@ -216,7 +219,7 @@ func (a *Agent) setup(ctx context.Context) error {
 	}
 
 	if err := a.applyMeshDefaults(ctx, mesh); err != nil {
-		fmt.Printf("warning: applying mesh defaults: %v\n", err)
+		a.log.Error(err, "applying mesh defaults")
 	}
 
 	// If the WireGuard interface survives from a previous run, validate that
@@ -224,12 +227,16 @@ func (a *Agent) setup(ctx context.Context) error {
 	// regenerated) requires a full teardown before reconfiguration.
 	if a.wgMgr.InterfaceExists() {
 		if a.wgMgr.ConfigMatchesKey(kp) {
-			fmt.Printf("[setup] existing WireGuard interface %s matches key — reusing\n", a.wgMgr.InterfaceName())
+			a.log.Info("existing WireGuard interface matches key, reusing", "interface", a.wgMgr.InterfaceName())
 			a.wasInterfacePreserved = true
 		} else {
-			fmt.Printf("[setup] key mismatch on existing interface — recreating\n")
-			_ = a.wgMgr.SyncRoutes(nil)
-			_ = a.wgMgr.DeleteInterface()
+			a.log.Info("key mismatch on existing interface, recreating")
+			if err := a.wgMgr.SyncRoutes(nil); err != nil {
+				a.log.Error(err, "clearing routes during interface recreation")
+			}
+			if err := a.wgMgr.DeleteInterface(); err != nil {
+				a.log.Error(err, "deleting interface during recreation")
+			}
 		}
 	}
 
@@ -249,15 +256,15 @@ func (a *Agent) setup(ctx context.Context) error {
 
 	epResult, err := DiscoverEndpoint(ctx, node, int(mesh.Spec.ListenPort), mesh.Spec.STUNServers)
 	if err != nil {
-		fmt.Printf("warning: endpoint discovery failed: %v\n", err)
+		a.log.Error(err, "endpoint discovery failed")
 	}
 	if epResult != nil {
 		a.detectedNATType = string(epResult.NATType)
 		if epResult.NATType == nat.NATSymmetric {
 			a.isSymmetricNAT = true
-			fmt.Printf("[setup] symmetric NAT detected — relay for symmetric peers, direct for cone/public peers\n")
+			a.log.Info("symmetric NAT detected, relay for symmetric peers, direct for cone/public peers")
 		} else if epResult.NATType == nat.NATCone {
-			fmt.Printf("[setup] cone NAT detected — direct P2P for all peers\n")
+			a.log.Info("cone NAT detected, direct P2P for all peers")
 		}
 	}
 
@@ -285,7 +292,7 @@ func (a *Agent) setup(ctx context.Context) error {
 	if epResult != nil && epResult.PortEstimated {
 		existing := &wirekubev1alpha1.WireKubePeer{}
 		if getErr := a.client.Get(ctx, client.ObjectKey{Name: peerName}, existing); getErr == nil && existing.Spec.Endpoint != "" {
-			fmt.Printf("[endpoint] preserved interface restart: keeping existing endpoint %s (ephemeral STUN port unreliable for cone NAT)\n", existing.Spec.Endpoint)
+			a.log.Info("preserved interface restart: keeping existing endpoint (ephemeral STUN port unreliable for cone NAT)", "endpoint", existing.Spec.Endpoint)
 			epResult.Endpoint = existing.Spec.Endpoint
 			epResult.PortEstimated = false
 		}
@@ -297,31 +304,31 @@ func (a *Agent) setup(ctx context.Context) error {
 
 	// Initialize relay client if configured (relay-first: connect immediately).
 	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64()); err != nil {
-		fmt.Printf("warning: relay init failed (will retry): %v\n", err)
+		a.log.Error(err, "relay init failed, will retry")
 	}
 
 	// If initial STUN detected cone NAT and relay is available, refine detection
 	// to distinguish port-restricted cone from address-restricted cone.
 	if a.detectedNATType == string(nat.NATCone) && a.relayPool != nil && a.relayPool.IsConnected() {
 		relayIP := a.relayPool.RelayIP()
-		fmt.Printf("[setup] starting port-restriction detection (relayIP=%s)\n", relayIP)
+		a.log.Info("starting port-restriction detection", "relayIP", relayIP)
 		if relayIP != "" {
 			probeFunc := func(ip net.IP, port int) error {
 				return a.relayPool.SendNATProbe(ip, port)
 			}
 			refinedType, err := nat.DetectPortRestriction(ctx, mesh.Spec.STUNServers, relayIP, probeFunc)
 			if err != nil {
-				fmt.Printf("[setup] port-restriction detection failed: %v (keeping cone)\n", err)
+				a.log.Error(err, "port-restriction detection failed, keeping cone")
 			} else {
 				a.detectedNATType = string(refinedType)
 				if refinedType == nat.NATPortRestrictedCone {
-					fmt.Printf("[setup] port-restricted cone NAT detected — direct retry disabled for incompatible peers\n")
+					a.log.Info("port-restricted cone NAT detected, direct retry disabled for incompatible peers")
 				} else {
-					fmt.Printf("[setup] address-restricted cone NAT confirmed — direct P2P possible\n")
+					a.log.Info("address-restricted cone NAT confirmed, direct P2P possible")
 				}
 				// Update CRD with refined NAT type.
 				if err := a.updateDiscoveryMethod(ctx, peerName, "stun"); err != nil {
-					fmt.Printf("warning: updating NAT type in CRD: %v\n", err)
+					a.log.Error(err, "updating NAT type in CRD")
 				}
 			}
 		}
@@ -340,7 +347,7 @@ func (a *Agent) setup(ctx context.Context) error {
 		natPP = epResult.PortPrediction
 	}
 	if err := a.publishICEState(ctx, peerName, candidates, natPP, iceStateGathering); err != nil {
-		fmt.Printf("warning: publishing ICE state: %v\n", err)
+		a.log.Error(err, "publishing ICE state")
 	}
 
 	// Initial sync
@@ -375,12 +382,14 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 				PersistentKeepalive: 25,
 			},
 		}
-		applyAutoAllowedIPs(mesh, node, &peer.Spec)
+		applyAutoAllowedIPs(a.log, mesh, node, &peer.Spec)
 		if createErr := a.client.Create(ctx, peer); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return fmt.Errorf("creating own WireKubePeer: %w", createErr)
 		}
 		if method != "" {
-			_ = a.updateDiscoveryMethod(ctx, name, method)
+			if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
+				a.log.V(1).Info("updating discovery method", "error", err, "peer", name)
+			}
 		}
 		return nil
 	}
@@ -394,12 +403,14 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if endpoint != "" {
 		existing.Spec.Endpoint = endpoint
 	}
-	applyAutoAllowedIPs(mesh, node, &existing.Spec)
+	applyAutoAllowedIPs(a.log, mesh, node, &existing.Spec)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
 		return fmt.Errorf("patching own WireKubePeer: %w", patchErr)
 	}
 	if method != "" {
-		_ = a.updateDiscoveryMethod(ctx, name, method)
+		if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
+			a.log.V(1).Info("updating discovery method", "error", err, "peer", name)
+		}
 	}
 	return nil
 }
@@ -407,7 +418,7 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 // applyAutoAllowedIPs applies automatic AllowedIPs settings from the mesh config to a peer spec.
 // autoAllowedIPs.strategy=node-internal-ip: sets InternalIP/32 only when AllowedIPs is empty.
 // podCIDRRouting.enabled=true: appends Node.Spec.PodCIDR if not already present.
-func applyAutoAllowedIPs(mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node, spec *wirekubev1alpha1.WireKubePeerSpec) {
+func applyAutoAllowedIPs(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node, spec *wirekubev1alpha1.WireKubePeerSpec) {
 	if mesh == nil || node == nil {
 		return
 	}
@@ -428,7 +439,7 @@ func applyAutoAllowedIPs(mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node,
 				continue
 			}
 			if tunnelIPs[addr.Address] {
-				fmt.Printf("[autoAllowedIPs] skipping %s (belongs to tunnel/virtual interface)\n", addr.Address)
+				log.V(1).Info("skipping address belonging to tunnel/virtual interface", "address", addr.Address)
 				continue
 			}
 			spec.AllowedIPs = []string{addr.Address + "/32"}
@@ -440,7 +451,7 @@ func applyAutoAllowedIPs(mesh *wirekubev1alpha1.WireKubeMesh, node *corev1.Node,
 		if len(spec.AllowedIPs) == 0 {
 			if privateIP := discoverHostPrivateIP(node); privateIP != "" {
 				spec.AllowedIPs = []string{privateIP + "/32"}
-				fmt.Printf("[autoAllowedIPs] discovered private IP %s from host interface\n", privateIP)
+				log.Info("discovered private IP from host interface", "ip", privateIP)
 			}
 		}
 	}
@@ -589,7 +600,7 @@ func (a *Agent) sync(ctx context.Context) error {
 		oldMode := a.relayMode
 		newMode := mesh.Spec.Relay.Mode
 		if oldMode != newMode {
-			fmt.Printf("[sync] relay mode changed: %q → %q\n", oldMode, newMode)
+			a.log.Info("relay mode changed", "oldMode", oldMode, "newMode", newMode)
 			a.relayMode = newMode
 			// When switching away from "always", reset ICE states so peers
 			// re-evaluate connectivity immediately instead of waiting for
@@ -602,7 +613,7 @@ func (a *Agent) sync(ctx context.Context) error {
 						state.State = iceStateRelay
 						state.LastCheck = time.Time{} // zero → immediate retry
 						a.setICEState(name, state)
-						fmt.Printf("[sync] reset ICE state for %s (mode change always→%s)\n", name, newMode)
+						a.log.Info("reset ICE state due to mode change", "peer", name, "newMode", newMode)
 					}
 				}
 			}
@@ -716,7 +727,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	if !ownAllowedIPsSet {
 		allRoutes = nil
 		a.wgMgr.SetPreferredSrc("")
-		fmt.Printf("[sync] own allowedIPs empty — passive mode (handshake only, no routes)\n")
+		a.log.Info("own allowedIPs empty, passive mode (handshake only, no routes)")
 	}
 
 	if err := a.wgMgr.SyncPeers(wgPeers); err != nil {
@@ -730,13 +741,13 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	// Update own peer status
 	if err := a.updateOwnStatus(ctx, myPeerName, remotePeerNames); err != nil {
-		fmt.Printf("warning: updating own peer status: %v\n", err)
+		a.log.Error(err, "updating own peer status")
 	}
 
 	// Sync pod CIDR into own AllowedIPs if podCIDRRouting is enabled.
 	// Runs every cycle to pick up PodCIDR assigned by CNI after agent startup.
 	if err := a.syncOwnPodCIDR(ctx); err != nil {
-		fmt.Printf("warning: syncing own pod CIDR: %v\n", err)
+		a.log.Error(err, "syncing own pod CIDR")
 	}
 
 	// Process relay grace for peers upgraded to direct.
@@ -772,7 +783,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			if a.relayRetry == 0 {
 				a.relayRetry = 120 * time.Second
 			}
-			fmt.Printf("[relay] restoring normal relay retry interval %s\n", a.relayRetry)
+			a.log.Info("restoring normal relay retry interval", "interval", a.relayRetry)
 		}
 		a.wasInterfacePreserved = false
 	}
@@ -782,7 +793,7 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	// Configure gateway networking if this node is an active VGW
 	if err := a.setupGateway(ctx); err != nil {
-		fmt.Printf("[gateway] setup error: %v\n", err)
+		a.log.Error(err, "gateway setup error")
 	}
 
 	// Update Prometheus metrics.
@@ -863,12 +874,11 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 			}
 		}
 
-		fmt.Printf("[nat-reflect] peer %s: CRD=%s actual=%s → patching\n",
-			p.Name, p.Spec.Endpoint, s.ActualEndpoint)
+		a.log.V(1).Info("NAT endpoint reflection, patching peer", "peer", p.Name, "crdEndpoint", p.Spec.Endpoint, "actualEndpoint", s.ActualEndpoint)
 		patch := client.MergeFrom(p.DeepCopy())
 		p.Spec.Endpoint = s.ActualEndpoint
 		if patchErr := a.client.Patch(ctx, p, patch); patchErr != nil {
-			fmt.Printf("[nat-reflect] warning: patching peer %s: %v\n", p.Name, patchErr)
+			a.log.Error(patchErr, "NAT endpoint reflection patch failed", "peer", p.Name)
 		}
 	}
 }
@@ -1011,7 +1021,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	// so direct upgrade probing starts quickly instead of waiting the full 120s.
 	if a.wasInterfacePreserved {
 		a.relayRetry = restartRelayRetry
-		fmt.Printf("[relay] interface preserved — using shortened relay retry %s for initial probing\n", a.relayRetry)
+		a.log.Info("interface preserved, using shortened relay retry for initial probing", "interval", a.relayRetry)
 	}
 
 	var endpoint string
@@ -1042,14 +1052,14 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	copy(pubKey[:], keyBytes)
 
 	wgPort := a.wgMgr.ListenPort()
-	fmt.Printf("[relay] proxy wgPort=%d (wg listen port)\n", wgPort)
+	a.log.Info("relay proxy configured", "wgPort", wgPort)
 	a.relayPool = agentrelay.NewPool(endpoint, pubKey, wgPort)
 	if err := a.relayPool.Connect(ctx); err != nil {
-		fmt.Printf("[relay] initial connect to %s failed (will retry in background): %v\n", endpoint, err)
+		a.log.Error(err, "relay initial connect failed, will retry in background", "endpoint", endpoint)
 		return nil
 	}
 
-	fmt.Printf("[relay] connected to %s (mode=%s)\n", endpoint, a.relayMode)
+	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
 	return nil
 }
 
@@ -1144,12 +1154,12 @@ func (a *Agent) tryDirectUpgrade(peerList *wirekubev1alpha1.WireKubePeerList, st
 
 func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	if a.relayPool == nil {
-		fmt.Printf("[relay-debug] enableRelayForPeer(%s): relayPool is nil, returning direct\n", peer.Name)
+		a.log.V(2).Info("enableRelayForPeer: relayPool is nil, returning direct", "peer", peer.Name)
 		return peer.Spec.Endpoint
 	}
 
 	if !a.relayPool.IsConnected() {
-		fmt.Printf("[relay-debug] enableRelayForPeer(%s): relayPool not connected, returning direct\n", peer.Name)
+		a.log.V(2).Info("enableRelayForPeer: relayPool not connected, returning direct", "peer", peer.Name)
 		return peer.Spec.Endpoint
 	}
 
@@ -1162,34 +1172,17 @@ func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 
 	proxy, err := a.relayPool.GetOrCreateProxy(pubKey)
 	if err != nil {
-		fmt.Printf("[relay] failed to create proxy for %s: %v\n", peer.Name, err)
+		a.log.Error(err, "failed to create relay proxy", "peer", peer.Name)
 		return peer.Spec.Endpoint
 	}
 
 	if !a.relayedPeers[peer.Name] {
 		a.directEndpoints[peer.Name] = peer.Spec.Endpoint
 		a.relayedPeers[peer.Name] = true
-		fmt.Printf("[relay] peer %s: falling back to relay via %s\n", peer.Name, proxy.ListenAddr())
+		a.log.Info("peer falling back to relay", "peer", peer.Name, "proxyAddr", proxy.ListenAddr())
 	}
 
 	return proxy.ListenAddr()
-}
-
-func (a *Agent) disableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) {
-	if a.relayPool == nil {
-		return
-	}
-
-	var pubKey [relayproto.PubKeySize]byte
-	keyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
-	if err != nil {
-		return
-	}
-	copy(pubKey[:], keyBytes)
-
-	a.relayPool.RemoveProxy(pubKey)
-	delete(a.relayedPeers, peer.Name)
-	delete(a.directEndpoints, peer.Name)
 }
 
 // discoverManagedRelay queries the wirekube-relay Service to find an externally
@@ -1212,7 +1205,7 @@ func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
 		parsed := net.ParseIP(ip)
 		if parsed != nil && !parsed.IsPrivate() {
 			ep := fmt.Sprintf("%s:%d", ip, port)
-			fmt.Printf("[relay] using externalIP: %s\n", ep)
+			a.log.Info("relay using externalIP", "endpoint", ep)
 			return ep
 		}
 	}
@@ -1221,12 +1214,12 @@ func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
 		if ing.IP != "" {
 			ep := fmt.Sprintf("%s:%d", ing.IP, port)
-			fmt.Printf("[relay] using LB ingress IP: %s\n", ep)
+			a.log.Info("relay using LB ingress IP", "endpoint", ep)
 			return ep
 		}
 		if ing.Hostname != "" {
 			ep := fmt.Sprintf("%s:%d", ing.Hostname, port)
-			fmt.Printf("[relay] using LB ingress hostname: %s\n", ep)
+			a.log.Info("relay using LB ingress hostname", "endpoint", ep)
 			return ep
 		}
 	}
@@ -1263,7 +1256,7 @@ func (a *Agent) findNodePortEndpoint(ctx context.Context, nodePort int32) string
 		for _, addr := range n.Status.Addresses {
 			if addr.Type == corev1.NodeExternalIP {
 				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
-				fmt.Printf("[relay] using NodePort (ExternalIP): %s\n", ep)
+				a.log.Info("relay using NodePort via ExternalIP", "endpoint", ep)
 				return ep
 			}
 		}
@@ -1277,7 +1270,7 @@ func (a *Agent) findNodePortEndpoint(ctx context.Context, nodePort int32) string
 			ip := net.ParseIP(addr.Address)
 			if ip != nil && !ip.IsPrivate() {
 				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
-				fmt.Printf("[relay] using NodePort (public InternalIP): %s\n", ep)
+				a.log.Info("relay using NodePort via public InternalIP", "endpoint", ep)
 				return ep
 			}
 		}
@@ -1311,7 +1304,7 @@ func (a *Agent) prewarmAllPeerRelays(peerList *wirekubev1alpha1.WireKubePeerList
 		}
 		copy(pubKey[:], keyBytes)
 		if _, err := a.relayPool.GetOrCreateProxy(pubKey); err != nil {
-			fmt.Printf("[relay-standby] failed to pre-warm proxy for %s: %v\n", p.Name, err)
+			a.log.Error(err, "failed to pre-warm relay proxy", "peer", p.Name)
 		}
 	}
 }
@@ -1389,7 +1382,7 @@ func (a *Agent) syncOwnPodCIDR(ctx context.Context) error {
 	}
 	patch := client.MergeFrom(peer.DeepCopy())
 	peer.Spec.AllowedIPs = append(peer.Spec.AllowedIPs, node.Spec.PodCIDR)
-	fmt.Printf("[sync] pod CIDR %s added to own AllowedIPs\n", node.Spec.PodCIDR)
+	a.log.Info("pod CIDR added to own AllowedIPs", "podCIDR", node.Spec.PodCIDR)
 	return a.client.Patch(ctx, peer, patch)
 }
 
@@ -1425,7 +1418,7 @@ func (a *Agent) recoverICEStateFromWG() {
 	}
 
 	if recovered > 0 {
-		fmt.Printf("[setup] recovered %d peer(s) with existing direct connections\n", recovered)
+		a.log.Info("recovered peers with existing direct connections", "count", recovered)
 	}
 }
 
@@ -1459,7 +1452,7 @@ func nodeInternalIP(node *corev1.Node) string {
 func (a *Agent) annotateOwnPod(ctx context.Context, internalIP string) {
 	pod := &corev1.Pod{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: a.podName, Namespace: a.podNamespace}, pod); err != nil {
-		fmt.Printf("warning: getting own pod for metrics annotation: %v\n", err)
+		a.log.Error(err, "getting own pod for metrics annotation")
 		return
 	}
 	if pod.Annotations != nil && pod.Annotations["wirekube.io/node-internal-ip"] == internalIP {
@@ -1471,6 +1464,6 @@ func (a *Agent) annotateOwnPod(ctx context.Context, internalIP string) {
 	}
 	pod.Annotations["wirekube.io/node-internal-ip"] = internalIP
 	if err := a.client.Patch(ctx, pod, patch); err != nil {
-		fmt.Printf("warning: annotating own pod with node internal IP: %v\n", err)
+		a.log.Error(err, "annotating own pod with node internal IP")
 	}
 }
