@@ -198,7 +198,7 @@ sudo modprobe wireguard && echo "OK" || echo "FAIL"
 
 !!! warning "WSL2 Kernel WireGuard Support"
     The default WSL2 kernel (5.15+) includes WireGuard. If `modprobe`
-    fails, see [Custom WSL2 Kernel](#appendix-custom-wsl2-kernel-optional).
+    fails, update WSL2 with `wsl --update` and retry.
 
 ### 2.6 Install Kubernetes Components
 
@@ -388,6 +388,15 @@ WSL2 requires special handling for driver and toolkit components.
 
 ### 5.1 Install GPU Operator via Helm
 
+WSL2 requires two flags that differ from standard deployments:
+
+- **`driver.enabled=false`** — WSL2 uses the Windows host GPU driver, not an
+  in-cluster driver pod.
+- **`toolkit.enabled=false`** — The operator's toolkit DaemonSet tries to
+  create `/dev/nvidia*` device nodes, which don't exist on WSL2 (GPU is
+  exposed via `/dev/dxg`). We already installed nvidia-container-toolkit
+  manually in Phase 2.5.
+
 ```bash
 helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
 helm repo update
@@ -395,31 +404,26 @@ helm repo update
 helm install gpu-operator nvidia/gpu-operator \
   --namespace gpu-operator \
   --create-namespace \
-  --set driver.enabled=false
+  --set driver.enabled=false \
+  --set toolkit.enabled=false
 ```
 
 ### 5.2 Label the WSL2 Node for GPU Discovery
 
 WSL2 has no PCI bus, so NFD (Node Feature Discovery) cannot auto-detect the
-GPU. Add the NVIDIA PCI vendor label manually, and disable the toolkit
-DaemonSet on this node (we installed nvidia-container-toolkit manually in
-Phase 2.5 because the operator's toolkit fails on WSL2 — it tries to create
-`/dev/nvidia*` device nodes which don't exist in WSL2):
+GPU. Add the NVIDIA PCI vendor label manually:
 
 ```bash
 NODE_NAME=<wsl2-node-name>
 
 # NFD PCI label (triggers GPU Operator to deploy on this node)
 kubectl label node ${NODE_NAME} feature.node.kubernetes.io/pci-10de.present=true
-
-# Disable toolkit DaemonSet on WSL2 (already installed manually)
-kubectl label node ${NODE_NAME} nvidia.com/gpu.deploy.container-toolkit=false --overwrite
 ```
 
 ### 5.3 Verify GPU Operator
 
 ```bash
-# All pods on WSL2 node should be Running (except toolkit)
+# All pods on WSL2 node should be Running
 kubectl get pods -n gpu-operator -o wide --field-selector spec.nodeName=<wsl2-node-name>
 
 # Check GPU is allocatable
@@ -501,15 +505,6 @@ spec:
 EOF
 ```
 
-!!! tip "Model selection by VRAM"
-    | VRAM | Recommended Model |
-    |------|-------------------|
-    | 8GB | `Qwen/Qwen3-4B-AWQ` (AWQ 4-bit, ~3GB) |
-    | 16GB+ | `Qwen/Qwen2.5-7B-Instruct` (FP16) |
-
-    `--enforce-eager` disables CUDA graph capture, reducing VRAM usage at the
-    cost of some throughput. Remove it if you have enough memory headroom.
-
 Wait for the model to load (~3-5 min for first pull):
 
 ```bash
@@ -578,14 +573,6 @@ Then `wsl --shutdown` and verify `stat /sys/fs/cgroup/cgroup.controllers`.
 
 **Fix:** See Phase 2.3 — `/etc/wsl.conf` `command=` with `mount --make-shared`.
 
-### kubeadm join fails: extraArgs unmarshal error
-
-**Cause:** Cluster kubeadm-config uses v1beta3 map-style `extraArgs` but
-kubeadm v1.34+ expects v1beta4 array-style.
-
-**Fix:** Either update the cluster's `kubeadm-config` ConfigMap to use
-array-style `extraArgs`, or use a JoinConfiguration file (see Phase 3).
-
 ### Cilium iptables error: unknown option "--transparent"
 
 **Symptom:** `iptables: unknown option "--transparent"` in cilium-agent logs.
@@ -612,20 +599,6 @@ mount the GPU devices into the container.
 
 **Fix:** Add `runtimeClassName: nvidia` to the pod spec (see Phase 6).
 
-### GPU Operator toolkit DaemonSet CrashLoopBackOff
-
-**Symptom:** `nvidia-container-toolkit-daemonset` pod on WSL2 node is in
-CrashLoopBackOff, trying to create `/dev/nvidia*` device nodes.
-
-**Cause:** WSL2 does not have `/dev/nvidia*` — GPU access is via `/dev/dxg`.
-
-**Fix:** Disable the toolkit DaemonSet on the WSL2 node and install
-nvidia-container-toolkit manually (see Phase 2.5 and 5.2):
-
-```bash
-kubectl label node <wsl2-node-name> nvidia.com/gpu.deploy.container-toolkit=false
-```
-
 ### Cilium not ready after WSL2 restart
 
 **Symptom:** Cilium agent shows 0/1 ready after `wsl --shutdown` and restart.
@@ -644,12 +617,8 @@ sudo systemctl restart kubelet
 
 **Cause:** WSL2 kernel too old or missing module.
 
-```bash
-uname -r
-# Needs 5.15+ with CONFIG_WIREGUARD
-```
-
-See [Appendix: Custom WSL2 Kernel](#appendix-custom-wsl2-kernel-optional).
+**Fix:** Update WSL2 from PowerShell: `wsl --update`, then `wsl --shutdown`
+and retry. The default WSL2 kernel 5.15+ includes WireGuard.
 
 ### NAT traversal: double NAT
 
@@ -659,46 +628,6 @@ If WireKube detects Symmetric NAT and cannot establish direct P2P:
 2. Consider port-forwarding UDP 51822 on your router to the Windows PC
 3. Deploy a WireKube relay if not already running
 4. Check NAT type: `kubectl get wirekubepeer <node> -o jsonpath='{.status.natType}'`
-
----
-
-## Appendix: Custom WSL2 Kernel (Optional)
-
-Only needed if `modprobe wireguard` fails on the default kernel.
-
-```bash
-# Install build dependencies
-sudo apt install -y build-essential flex bison libssl-dev libelf-dev \
-  bc dwarves pahole
-
-# Clone WSL2 kernel source
-KERNEL_VERSION=$(uname -r | sed 's/-microsoft.*//')
-git clone --depth 1 --branch linux-msft-wsl-${KERNEL_VERSION} \
-  https://github.com/microsoft/WSL2-Linux-Kernel.git
-cd WSL2-Linux-Kernel
-
-# Use current config as base
-zcat /proc/config.gz > .config
-
-# Enable WireGuard
-scripts/config --module CONFIG_WIREGUARD
-
-# Build
-make -j$(nproc)
-
-# Install
-sudo make modules_install
-cp arch/x86/boot/bzImage /mnt/c/Users/<USERNAME>/wsl-kernel
-```
-
-Add to `C:\Users\<USERNAME>\.wslconfig`:
-
-```ini
-[wsl2]
-kernel=C:\\Users\\<USERNAME>\\wsl-kernel
-```
-
-Restart WSL2: `wsl --shutdown`
 
 ---
 

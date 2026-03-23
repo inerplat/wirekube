@@ -30,14 +30,12 @@ flowchart LR
     end
     subgraph Home["On-Prem / Home Lab"]
         N4[node-4]
-        N5[node-5]
     end
     R[relay]
     N1 <-->|direct| N2
     N1 -.->|relay| R -.->|relay| N3
     N4 <-->|direct P2P| N1
     N4 <-->|direct P2P| N3
-    N4 <-->|direct P2P| N5
 ```
 
 ## Key Features
