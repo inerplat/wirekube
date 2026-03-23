@@ -10,62 +10,115 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.62
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test $(go list ./... | grep -v /test/e2e) -v -coverprofile=coverage.out
-
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -1
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Build all binaries
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/agent/
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay/
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/wirekubectl/
 
       - name: Check go mod tidy
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
 
-  e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
+      - name: Run go vet
+        run: go vet ./...
 
-      - uses: actions/setup-go@v6
+      - name: Run go fmt check
+        run: |
+          gofmt_output=$(gofmt -l .)
+          if [ -n "$gofmt_output" ]; then
+            echo "Files not formatted:"
+            echo "$gofmt_output"
+            exit 1
+          fi
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test $(go list ./... | grep -v /test/e2e) -v -coverprofile=coverage.out
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/agent/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/wirekubectl/
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/agent/
+
+      - name: Build Docker image
+        run: docker build -t inerplat/wirekube:ci-${{ github.sha }} .
+
+      - name: Save Docker image
+        run: docker save inerplat/wirekube:ci-${{ github.sha }} -o /tmp/wirekube-ci.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wirekube-image
+          path: /tmp/wirekube-ci.tar
+          retention-days: 1
+
+  e2e:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cni-mode:
+          - cilium-kube-proxy
+          - cilium-no-kube-proxy
+          - flannel
+          - calico
+        include:
+          - cni-mode: cilium-kube-proxy
+            need-helm: true
+          - cni-mode: cilium-no-kube-proxy
+            need-helm: true
+          - cni-mode: flannel
+            need-helm: false
+          - cni-mode: calico
+            need-helm: false
+            experimental: true
+    name: e2e (${{ matrix.cni-mode }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -75,16 +128,24 @@ jobs:
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/
 
       - name: Install helm
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        if: matrix.need-helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Pull kindest/node image
         run: docker pull kindest/node:v1.34.0
 
-      - name: Build wirekube image
-        run: docker build -t inerplat/wirekube:ci-${{ github.sha }} .
+      - name: Download wirekube image
+        uses: actions/download-artifact@v8
+        with:
+          name: wirekube-image
+          path: /tmp
+
+      - name: Load wirekube image
+        run: docker load -i /tmp/wirekube-ci.tar
 
       - name: Run e2e tests
+        continue-on-error: ${{ matrix.experimental || false }}
         run: |
           WIREKUBE_IMAGE=inerplat/wirekube:ci-${{ github.sha }} \
+          WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
           go test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m

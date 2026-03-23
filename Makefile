@@ -108,7 +108,8 @@ test:
 #
 # Each node runs on a separate 172.x subnet using kindest/node images
 # bootstrapped directly with kubeadm — no kind CLI required. CNI is
-# Cilium (vxlan). Relay deploys on the control-plane node (taint removed).
+# Cilium (vxlan) by default, or Flannel via WIREKUBE_E2E_CNI_MODE=flannel.
+# Relay deploys on the control-plane node (taint removed).
 #
 # Prerequisites:
 #   kubectl, helm installed
@@ -121,16 +122,26 @@ test:
 #   WIREKUBE_KIND_NODE_IMG=kindest/node:v1.30.0 # custom node image
 #   WIREKUBE_E2E_REUSE=1                        # skip teardown for re-runs
 #   WIREKUBE_E2E_SKIP_SETUP=1                   # assume cluster is running
-#   WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan      # (default) kube-proxy + Cilium vxlan
-#   WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan   # Cilium kube-proxy replacement + vxlan
+#   WIREKUBE_E2E_CNI_MODE=cilium-kube-proxy      # (default) kube-proxy + Cilium vxlan
+#   WIREKUBE_E2E_CNI_MODE=cilium-no-kube-proxy   # Cilium kube-proxy replacement + vxlan
 .PHONY: kind-e2e
 kind-e2e:
 	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
 
+.PHONY: kind-e2e-flannel
+kind-e2e-flannel:
+	WIREKUBE_E2E_CNI_MODE=flannel $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
+.PHONY: kind-e2e-calico
+kind-e2e-calico:
+	WIREKUBE_E2E_CNI_MODE=calico $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
 .PHONY: kind-e2e-all
 kind-e2e-all:
-	WIREKUBE_E2E_CNI_MODE=kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
-	WIREKUBE_E2E_CNI_MODE=no-kube-proxy-vxlan $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=cilium-kube-proxy $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=cilium-no-kube-proxy $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=flannel $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_CNI_MODE=calico $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
 
 .PHONY: vet
 vet:
@@ -160,4 +171,6 @@ help:
 	@echo "  init-mesh          Create default WireKubeMesh"
 	@echo "  test               Run unit tests"
 	@echo "  kind-e2e           Run kind-based e2e tests (Cilium CNI, no kind CLI needed)"
-	@echo "  kind-e2e-all       Run e2e in both CNI modes (kube-proxy + no-kube-proxy)"
+	@echo "  kind-e2e-flannel   Run kind-based e2e tests with Flannel CNI"
+	@echo "  kind-e2e-calico    Run kind-based e2e tests with Calico CNI"
+	@echo "  kind-e2e-all       Run e2e in all CNI modes (Cilium + Flannel + Calico)"
