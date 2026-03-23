@@ -749,16 +749,15 @@ func installCalico() error {
 	cp := cpNode().name
 
 	// Download inside the container and patch for nested container environments:
-	// 1. Replace IPIP encap with VXLAN (IPIP may not work inside Docker containers)
+	// 1. Swap IPIP=Always→Never and VXLAN=Never→Always (IPIP doesn't work in Docker)
 	// 2. Set CALICO_IPV4POOL_CIDR to match kubeadm's podSubnet (10.244.0.0/16)
 	//    Calico defaults to 192.168.0.0/16 which won't match node podCIDR allocations.
 	dlCmd := fmt.Sprintf(
 		`curl -fsSL %s | `+
-			`sed 's/"CALICO_IPV4POOL_IPIP"/"CALICO_IPV4POOL_VXLAN"/g' | `+
-			`sed 's/value: "Always"/value: "CrossSubnet"/g' | `+
-			`sed '/CALICO_IPV4POOL_VXLAN/{n;s|value:.*|value: "CrossSubnet"|}' | `+
-			`sed 's|# - name: CALICO_IPV4POOL_CIDR|- name: CALICO_IPV4POOL_CIDR|g' | `+
-			`sed 's|#   value: "192.168.0.0/16"|  value: "10.244.0.0/16"|g' `+
+			`sed -e '/CALICO_IPV4POOL_IPIP/{n;s/Always/Never/}' `+
+			`    -e '/CALICO_IPV4POOL_VXLAN/{n;s/Never/Always/}' `+
+			`    -e 's|# - name: CALICO_IPV4POOL_CIDR|- name: CALICO_IPV4POOL_CIDR|' `+
+			`    -e 's|#   value: "192.168.0.0/16"|  value: "10.244.0.0/16"|' `+
 			`> /tmp/calico.yaml`,
 		calicoManifestURL)
 	if _, err := ctrExec("exec", cp, "sh", "-c", dlCmd); err != nil {
