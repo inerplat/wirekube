@@ -57,7 +57,10 @@ nav:
     - Quick Start: getting-started/quickstart.md
     - Installation: getting-started/installation.md
     - Configuration: getting-started/configuration.md
-    - EKS Hybrid Nodes: getting-started/eks-hybrid-nodes.md
+  - Guides:
+    - Local Playground: guides/local-playground.md
+    - EKS Hybrid Nodes: guides/eks-hybrid-nodes.md
+    - WSL2 GPU Node: guides/wsl2-gpu-node.md
   - Architecture:
     - Overview: architecture/overview.md
     - NAT Traversal: architecture/nat-traversal.md
