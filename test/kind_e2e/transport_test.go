@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
@@ -137,7 +138,7 @@ func TestAllNodesReachable(t *testing.T) {
 			}
 			_ = out
 			return true
-		}, 1*time.Minute, 5*time.Second,
+		}, 2*time.Minute, 5*time.Second,
 			fmt.Sprintf("ping %s → %s (%s)", subject, rem, remoteIP))
 		t.Logf("ping %s → %s OK", subject, rem)
 	}
@@ -286,7 +287,7 @@ func TestBidirectionalPing(t *testing.T) {
 	peers := waitForPeers(ctx, t, 3)
 	subject := peers[0] // CP node
 
-	// Wait for CP to have connections to all workers.
+	// Wait for CP to have connections to all workers and be connected.
 	for _, r := range peers {
 		if subject == r {
 			continue
@@ -297,6 +298,16 @@ func TestBidirectionalPing(t *testing.T) {
 			return m == "direct" || m == "relay"
 		}, 3*time.Minute, pollInterval, subject+" → "+rem+" should be connected")
 	}
+
+	// Wait for CP peer to report Connected=true (data plane ready).
+	eventually(t, func() bool {
+		var p wirekubev1alpha1.WireKubePeer
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: subject}, &p); err != nil {
+			return false
+		}
+		t.Logf("%s: connected=%v connections=%v", subject, p.Status.Connected, p.Status.Connections)
+		return p.Status.Connected
+	}, 3*time.Minute, pollInterval, subject+" should be connected")
 
 	// Ping from CP to each worker.
 	for _, r := range peers {
@@ -315,7 +326,7 @@ func TestBidirectionalPing(t *testing.T) {
 			}
 			_ = out
 			return true
-		}, 1*time.Minute, 5*time.Second,
+		}, 2*time.Minute, 5*time.Second,
 			fmt.Sprintf("ping %s → %s (%s)", subject, r, remoteIP))
 
 		t.Logf("ping %s → %s OK", subject, r)
@@ -335,8 +346,17 @@ func TestDataPlaneUnderRelay(t *testing.T) {
 	defer restore()
 
 	eventually(t, func() bool {
-		return connectionMode(ctx, t, subject, remote) == "relay"
-	}, relayTimeout, pollInterval, subject+" → "+remote+" should be relay")
+		mode := connectionMode(ctx, t, subject, remote)
+		if mode != "relay" {
+			return false
+		}
+		var p wirekubev1alpha1.WireKubePeer
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: subject}, &p); err != nil {
+			return false
+		}
+		t.Logf("%s: connected=%v mode=%s", subject, p.Status.Connected, mode)
+		return p.Status.Connected
+	}, relayTimeout, pollInterval, subject+" → "+remote+" should be relay and connected")
 
 	remoteIP := nodeIPForPeer(t, remote)
 	pod := agentPodForNode(ctx, t, subject)
@@ -413,7 +433,13 @@ func TestMetricsEndpoint(t *testing.T) {
 		return connectionMode(ctx, t, subject, peers[1]) != ""
 	}, 2*time.Minute, pollInterval, "connections established")
 
-	pod := agentPodForNode(ctx, t, subject)
+	// Agent pod may have been restarted by a previous test — wait for a
+	// running pod before attempting to fetch metrics.
+	var pod corev1.Pod
+	eventually(t, func() bool {
+		pod = agentPodForNode(ctx, t, subject)
+		return pod.Status.Phase == corev1.PodRunning
+	}, 2*time.Minute, pollInterval, "agent pod running on "+subject)
 
 	expectedMetrics := []string{
 		"wirekube_peer_connected",
@@ -424,10 +450,17 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	var metricsOut string
 	eventually(t, func() bool {
+		// Re-fetch the pod each iteration; the agent may have been
+		// restarted by a previous test, replacing the pod.
+		pod = agentPodForNode(ctx, t, subject)
+		if pod.Status.Phase != corev1.PodRunning {
+			t.Logf("agent pod %s phase=%s, waiting…", pod.Name, pod.Status.Phase)
+			return false
+		}
 		out, err := execInPod(ctx, t, pod, "agent",
 			[]string{"wget", "-qO-", "http://127.0.0.1:9090/metrics"})
 		if err != nil {
-			t.Logf("metrics fetch: %v", err)
+			t.Logf("metrics fetch from %s: %v", pod.Name, err)
 			return false
 		}
 		for _, metric := range expectedMetrics {
@@ -438,7 +471,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		}
 		metricsOut = out
 		return true
-	}, 1*time.Minute, 5*time.Second, "metrics endpoint should return all expected metrics")
+	}, 2*time.Minute, 5*time.Second, "metrics endpoint should return all expected metrics")
 
 	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(metricsOut))
 }
