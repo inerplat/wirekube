@@ -20,23 +20,18 @@ WireKube builds a WireGuard mesh between your Kubernetes nodes using only CRDs f
 
 ```mermaid
 flowchart LR
-    subgraph VPC-A["Cloud VPC A"]
+    subgraph VPC-A["Cloud VPC"]
         N1[node-1]
+    end
+    subgraph VPC-B["Another VPC"]
         N2[node-2]
     end
-    subgraph VPC-B["Cloud VPC B"]
+    subgraph Home["On-Prem"]
         N3[node-3]
     end
-    subgraph Home["On-Prem / Home Lab"]
-        N4[node-4]
-        N5[node-5]
-    end
-    R[relay]
-    N1 <-->|direct| N2
-    N1 -.->|relay| R -.->|relay| N3
-    N4 <-->|direct P2P| N1
-    N4 <-->|direct P2P| N3
-    N4 <-->|direct P2P| N5
+    N1 <-->|"WireGuard P2P"| N2
+    N1 <-->|"WireGuard P2P"| N3
+    N2 <-->|"WireGuard P2P"| N3
 ```
 
 1. An **Agent DaemonSet** runs on each node, creates a WireGuard interface, and discovers its public endpoint via STUN.
