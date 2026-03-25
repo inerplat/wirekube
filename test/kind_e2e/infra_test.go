@@ -138,8 +138,9 @@ func setupCluster(_ context.Context) error {
 		return fmt.Errorf("kubeadm init: %w", err)
 	}
 
-	if !skipKubeProxy() && isUserNamespace(cpNode().name) {
-		fmt.Println("e2e: patching kube-proxy for user namespace (conntrack disabled)…")
+	needConntrackPatch := !skipKubeProxy() && !canWriteConntrack(cpNode().name)
+	if needConntrackPatch {
+		fmt.Println("e2e: patching kube-proxy (conntrack sysctl not writable)…")
 		if err := patchKubeProxy(); err != nil {
 			return fmt.Errorf("patch kube-proxy: %w", err)
 		}
@@ -158,6 +159,13 @@ func setupCluster(_ context.Context) error {
 		fmt.Printf("e2e: kubeadm join %s…\n", n.name)
 		if err := kubeadmJoin(n, token); err != nil {
 			return fmt.Errorf("kubeadm join %s: %w", n.name, err)
+		}
+	}
+
+	if needConntrackPatch && !skipKubeProxy() {
+		fmt.Println("e2e: waiting for kube-proxy to be ready…")
+		if err := waitForKubeProxyReady(2 * time.Minute); err != nil {
+			return fmt.Errorf("kube-proxy not ready: %w", err)
 		}
 	}
 
@@ -522,6 +530,15 @@ func isUserNamespace(containerName string) bool {
 	return !strings.Contains(out, "4294967295")
 }
 
+// canWriteConntrack tests whether the container can write to
+// /proc/sys/net/netfilter/nf_conntrack_max. This fails in user namespaces
+// and on Docker Desktop macOS where /proc/sys is read-only in the VM.
+func canWriteConntrack(containerName string) bool {
+	_, err := ctrExec("exec", containerName, "sh", "-c",
+		"cat /proc/sys/net/netfilter/nf_conntrack_max > /proc/sys/net/netfilter/nf_conntrack_max")
+	return err == nil
+}
+
 func kubeadmInit() error {
 	cp := cpNode()
 
@@ -866,12 +883,51 @@ func countReady(lines []string) int {
 }
 
 func patchKubeProxy() error {
-	// Add --conntrack-max-per-core=0 to skip conntrack sysctl writes
-	// that fail in user namespaces.
-	patch := `[{"op":"add","path":"/spec/template/spec/containers/0/command/-","value":"--conntrack-max-per-core=0"}]`
-	_, err := kubectlInCP("patch", "daemonset", "kube-proxy",
-		"-n", "kube-system", "--type=json", "-p", patch)
+	// Set conntrack.maxPerCore=0 in the kube-proxy ConfigMap to skip
+	// conntrack sysctl writes that fail in user namespaces and Docker
+	// Desktop macOS where /proc/sys is read-only.
+	cp := cpNode().name
+
+	// Read existing config, patch maxPerCore, write back via dry-run + apply.
+	patchCmd := `kubectl --kubeconfig=/etc/kubernetes/admin.conf ` +
+		`get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' ` +
+		`| sed 's/maxPerCore: null/maxPerCore: 0/' > /tmp/kp-config.conf && ` +
+		`kubectl --kubeconfig=/etc/kubernetes/admin.conf ` +
+		`create configmap kube-proxy -n kube-system ` +
+		`--from-file=config.conf=/tmp/kp-config.conf ` +
+		`--dry-run=client -o yaml | ` +
+		`kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -`
+	if _, err := ctrExec("exec", cp, "sh", "-c", patchCmd); err != nil {
+		return fmt.Errorf("patch kube-proxy configmap: %w", err)
+	}
+
+	// Delete existing pods so they pick up the ConfigMap change.
+	_, err := kubectlInCP("delete", "pods", "-n", "kube-system", "-l", "k8s-app=kube-proxy")
 	return err
+}
+
+func waitForKubeProxyReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := kubectlInCP("get", "pods", "-n", "kube-system",
+			"-l", "k8s-app=kube-proxy", "--no-headers")
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			allRunning := len(lines) > 0 && lines[0] != ""
+			for _, line := range lines {
+				if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
+					allRunning = false
+					break
+				}
+			}
+			if allRunning {
+				fmt.Printf("e2e: kube-proxy ready (%d pods)\n", len(lines))
+				return nil
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for kube-proxy pods")
 }
 
 func removeCPTaint() error {
