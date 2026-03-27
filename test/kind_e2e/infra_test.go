@@ -886,17 +886,14 @@ func patchKubeProxy() error {
 	// Set conntrack.maxPerCore=0 in the kube-proxy ConfigMap to skip
 	// conntrack sysctl writes that fail in user namespaces and Docker
 	// Desktop macOS where /proc/sys is read-only.
+	// We get the full ConfigMap as YAML, sed the value, and re-apply.
+	// This preserves all other keys (kubeconfig.conf etc.).
 	cp := cpNode().name
 
-	// Read existing config, patch maxPerCore, write back via dry-run + apply.
 	patchCmd := `kubectl --kubeconfig=/etc/kubernetes/admin.conf ` +
-		`get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' ` +
-		`| sed 's/maxPerCore: null/maxPerCore: 0/' > /tmp/kp-config.conf && ` +
-		`kubectl --kubeconfig=/etc/kubernetes/admin.conf ` +
-		`create configmap kube-proxy -n kube-system ` +
-		`--from-file=config.conf=/tmp/kp-config.conf ` +
-		`--dry-run=client -o yaml | ` +
-		`kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -`
+		`get configmap kube-proxy -n kube-system -o yaml ` +
+		`| sed 's/maxPerCore: null/maxPerCore: 0/' ` +
+		`| kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -`
 	if _, err := ctrExec("exec", cp, "sh", "-c", patchCmd); err != nil {
 		return fmt.Errorf("patch kube-proxy configmap: %w", err)
 	}
