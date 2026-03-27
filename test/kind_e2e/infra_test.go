@@ -523,7 +523,6 @@ func isUserNamespace(containerName string) bool {
 	return !strings.Contains(out, "4294967295")
 }
 
-
 func kubeadmInit() error {
 	cp := cpNode()
 
