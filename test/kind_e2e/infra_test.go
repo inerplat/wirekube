@@ -138,6 +138,13 @@ func setupCluster(_ context.Context) error {
 		return fmt.Errorf("kubeadm init: %w", err)
 	}
 
+	if !skipKubeProxy() && isUserNamespace(cpNode().name) {
+		fmt.Println("e2e: patching kube-proxy for user namespace (conntrack disabled)…")
+		if err := patchKubeProxy(); err != nil {
+			return fmt.Errorf("patch kube-proxy: %w", err)
+		}
+	}
+
 	token, err := createJoinToken()
 	if err != nil {
 		return fmt.Errorf("create join token: %w", err)
@@ -151,14 +158,6 @@ func setupCluster(_ context.Context) error {
 		fmt.Printf("e2e: kubeadm join %s…\n", n.name)
 		if err := kubeadmJoin(n, token); err != nil {
 			return fmt.Errorf("kubeadm join %s: %w", n.name, err)
-		}
-	}
-
-	// Wait for kube-proxy pods, patching only if they crash (conntrack issue
-	// in user namespaces or Docker Desktop macOS where /proc/sys is read-only).
-	if !skipKubeProxy() {
-		if err := ensureKubeProxyReady(2 * time.Minute); err != nil {
-			return fmt.Errorf("kube-proxy not ready: %w", err)
 		}
 	}
 
@@ -867,64 +866,12 @@ func countReady(lines []string) int {
 }
 
 func patchKubeProxy() error {
-	// Set conntrack.maxPerCore=0 in the kube-proxy ConfigMap to skip
-	// conntrack sysctl writes that fail in user namespaces and Docker
-	// Desktop macOS where /proc/sys is read-only.
-	// We get the full ConfigMap as YAML, sed the value, and re-apply.
-	// This preserves all other keys (kubeconfig.conf etc.).
-	cp := cpNode().name
-
-	patchCmd := `kubectl --kubeconfig=/etc/kubernetes/admin.conf ` +
-		`get configmap kube-proxy -n kube-system -o yaml ` +
-		`| sed 's/maxPerCore: null/maxPerCore: 0/' ` +
-		`| kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -`
-	if _, err := ctrExec("exec", cp, "sh", "-c", patchCmd); err != nil {
-		return fmt.Errorf("patch kube-proxy configmap: %w", err)
-	}
-
-	// Delete existing pods so they pick up the ConfigMap change.
-	_, err := kubectlInCP("delete", "pods", "-n", "kube-system", "-l", "k8s-app=kube-proxy")
+	// Add --conntrack-max-per-core=0 to skip conntrack sysctl writes
+	// that fail in user namespaces.
+	patch := `[{"op":"add","path":"/spec/template/spec/containers/0/command/-","value":"--conntrack-max-per-core=0"}]`
+	_, err := kubectlInCP("patch", "daemonset", "kube-proxy",
+		"-n", "kube-system", "--type=json", "-p", patch)
 	return err
-}
-
-// ensureKubeProxyReady waits for kube-proxy pods to become ready.
-// If pods enter CrashLoopBackOff (typically conntrack sysctl permission error),
-// it patches the kube-proxy ConfigMap (maxPerCore: 0) and restarts pods.
-// Only CrashLoopBackOff triggers patching — transient "Error" states during
-// node join are normal and resolve on their own.
-func ensureKubeProxyReady(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	patched := false
-	for time.Now().Before(deadline) {
-		out, err := kubectlInCP("get", "pods", "-n", "kube-system",
-			"-l", "k8s-app=kube-proxy", "--no-headers")
-		if err == nil {
-			lines := strings.Split(strings.TrimSpace(out), "\n")
-			allRunning := len(lines) > 0 && lines[0] != ""
-			hasCrashLoop := false
-			for _, line := range lines {
-				if strings.Contains(line, "CrashLoopBackOff") {
-					hasCrashLoop = true
-				}
-				if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
-					allRunning = false
-				}
-			}
-			if allRunning {
-				fmt.Printf("e2e: kube-proxy ready (%d pods)\n", len(lines))
-				return nil
-			}
-			if hasCrashLoop && !patched {
-				fmt.Println("e2e: kube-proxy CrashLoopBackOff, patching ConfigMap (maxPerCore: 0)…")
-				if err := patchKubeProxy(); err != nil {
-					return fmt.Errorf("patch kube-proxy: %w", err)
-				}
-				patched = true
-			}
-		}
-		time.Sleep(5 * time.Second)
-	}
-	return fmt.Errorf("timed out waiting for kube-proxy pods")
 }
 
 func removeCPTaint() error {
