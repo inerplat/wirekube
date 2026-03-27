@@ -138,14 +138,6 @@ func setupCluster(_ context.Context) error {
 		return fmt.Errorf("kubeadm init: %w", err)
 	}
 
-	needConntrackPatch := !skipKubeProxy() && !canWriteConntrack(cpNode().name)
-	if needConntrackPatch {
-		fmt.Println("e2e: patching kube-proxy (conntrack sysctl not writable)…")
-		if err := patchKubeProxy(); err != nil {
-			return fmt.Errorf("patch kube-proxy: %w", err)
-		}
-	}
-
 	token, err := createJoinToken()
 	if err != nil {
 		return fmt.Errorf("create join token: %w", err)
@@ -162,9 +154,10 @@ func setupCluster(_ context.Context) error {
 		}
 	}
 
-	if needConntrackPatch && !skipKubeProxy() {
-		fmt.Println("e2e: waiting for kube-proxy to be ready…")
-		if err := waitForKubeProxyReady(2 * time.Minute); err != nil {
+	// Wait for kube-proxy pods, patching only if they crash (conntrack issue
+	// in user namespaces or Docker Desktop macOS where /proc/sys is read-only).
+	if !skipKubeProxy() {
+		if err := ensureKubeProxyReady(2 * time.Minute); err != nil {
 			return fmt.Errorf("kube-proxy not ready: %w", err)
 		}
 	}
@@ -530,14 +523,6 @@ func isUserNamespace(containerName string) bool {
 	return !strings.Contains(out, "4294967295")
 }
 
-// canWriteConntrack tests whether the container can write to
-// /proc/sys/net/netfilter/nf_conntrack_max. This fails in user namespaces
-// and on Docker Desktop macOS where /proc/sys is read-only in the VM.
-func canWriteConntrack(containerName string) bool {
-	_, err := ctrExec("exec", containerName, "sh", "-c",
-		"cat /proc/sys/net/netfilter/nf_conntrack_max > /proc/sys/net/netfilter/nf_conntrack_max")
-	return err == nil
-}
 
 func kubeadmInit() error {
 	cp := cpNode()
@@ -903,23 +888,37 @@ func patchKubeProxy() error {
 	return err
 }
 
-func waitForKubeProxyReady(timeout time.Duration) error {
+// ensureKubeProxyReady waits for kube-proxy pods to become ready.
+// If pods enter CrashLoopBackOff (typically conntrack sysctl permission error),
+// it patches the kube-proxy ConfigMap (maxPerCore: 0) and restarts pods.
+func ensureKubeProxyReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	patched := false
 	for time.Now().Before(deadline) {
 		out, err := kubectlInCP("get", "pods", "-n", "kube-system",
 			"-l", "k8s-app=kube-proxy", "--no-headers")
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			allRunning := len(lines) > 0 && lines[0] != ""
+			hasCrash := false
 			for _, line := range lines {
+				if strings.Contains(line, "CrashLoopBackOff") || strings.Contains(line, "Error") {
+					hasCrash = true
+				}
 				if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
 					allRunning = false
-					break
 				}
 			}
 			if allRunning {
 				fmt.Printf("e2e: kube-proxy ready (%d pods)\n", len(lines))
 				return nil
+			}
+			if hasCrash && !patched {
+				fmt.Println("e2e: kube-proxy crashing, patching ConfigMap (maxPerCore: 0)…")
+				if err := patchKubeProxy(); err != nil {
+					return fmt.Errorf("patch kube-proxy: %w", err)
+				}
+				patched = true
 			}
 		}
 		time.Sleep(5 * time.Second)
