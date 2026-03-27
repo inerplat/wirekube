@@ -890,6 +890,8 @@ func patchKubeProxy() error {
 // ensureKubeProxyReady waits for kube-proxy pods to become ready.
 // If pods enter CrashLoopBackOff (typically conntrack sysctl permission error),
 // it patches the kube-proxy ConfigMap (maxPerCore: 0) and restarts pods.
+// Only CrashLoopBackOff triggers patching — transient "Error" states during
+// node join are normal and resolve on their own.
 func ensureKubeProxyReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	patched := false
@@ -899,10 +901,10 @@ func ensureKubeProxyReady(timeout time.Duration) error {
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			allRunning := len(lines) > 0 && lines[0] != ""
-			hasCrash := false
+			hasCrashLoop := false
 			for _, line := range lines {
-				if strings.Contains(line, "CrashLoopBackOff") || strings.Contains(line, "Error") {
-					hasCrash = true
+				if strings.Contains(line, "CrashLoopBackOff") {
+					hasCrashLoop = true
 				}
 				if !strings.Contains(line, "Running") || !strings.Contains(line, "1/1") {
 					allRunning = false
@@ -912,8 +914,8 @@ func ensureKubeProxyReady(timeout time.Duration) error {
 				fmt.Printf("e2e: kube-proxy ready (%d pods)\n", len(lines))
 				return nil
 			}
-			if hasCrash && !patched {
-				fmt.Println("e2e: kube-proxy crashing, patching ConfigMap (maxPerCore: 0)…")
+			if hasCrashLoop && !patched {
+				fmt.Println("e2e: kube-proxy CrashLoopBackOff, patching ConfigMap (maxPerCore: 0)…")
 				if err := patchKubeProxy(); err != nil {
 					return fmt.Errorf("patch kube-proxy: %w", err)
 				}
