@@ -182,13 +182,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// cleanup releases user-space resources on shutdown.
-// The WireGuard kernel interface and routes are intentionally preserved so that
-// direct P2P tunnels continue forwarding traffic across agent restarts.
-// Full interface teardown (routes + link deletion) is deferred to an explicit
-// cleanup job or CR deletion — see config/cleanup/ and docs.
+// cleanup tears down all WireGuard kernel state and releases user-space
+// resources on graceful shutdown (SIGTERM). This runs on every normal pod
+// termination so that rolling updates and node removals always start with a
+// clean interface rather than inheriting stale peer/route state.
 func (a *Agent) cleanup() {
-	a.log.Info("releasing user-space resources", "interface", a.wgMgr.InterfaceName())
+	a.log.Info("shutting down: tearing down WireGuard interface", "interface", a.wgMgr.InterfaceName())
 	for name, state := range a.iceStates {
 		if state.holePunch != nil {
 			state.holePunch.Close()
@@ -199,6 +198,12 @@ func (a *Agent) cleanup() {
 	a.cleanupGateway()
 	if a.relayPool != nil {
 		a.relayPool.Close()
+	}
+	if err := a.wgMgr.SyncRoutes(nil); err != nil {
+		a.log.Error(err, "flushing routes on shutdown")
+	}
+	if err := a.wgMgr.DeleteInterface(); err != nil {
+		a.log.Error(err, "deleting WireGuard interface on shutdown")
 	}
 }
 
@@ -1413,6 +1418,9 @@ func (a *Agent) recoverICEStateFromWG() {
 		state := a.getICEState(peerName)
 		state.State = iceStateConnected
 		state.FailCount = 0
+		// Set UpgradedAt so isDirectConnected uses the 5-min grace window,
+		// giving WG time to complete its first re-handshake after restart.
+		state.UpgradedAt = time.Now()
 		a.setICEState(peerName, state)
 		recovered++
 	}
