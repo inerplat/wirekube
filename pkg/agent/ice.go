@@ -1079,14 +1079,22 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 	return false
 }
 
-// isDirectConnected checks if a peer has a recent handshake via a direct
-// (non-localhost) endpoint.
+// isDirectConnected checks if an ICE-connected peer's WireGuard tunnel is
+// alive. It returns true when traffic has flowed recently (recent handshake),
+// regardless of whether the WG endpoint is direct or via the standby relay
+// proxy. When the remote peer's agent is still sending via relay (common
+// during the ~30s window before both sides upgrade), WG roams the endpoint
+// to the local relay proxy address. The handshake stays fresh via that relay
+// path, so the tunnel IS alive — only suppressing the false-positive fallback.
+//
+// A localhost endpoint with a STALE handshake is still treated as disconnected
+// because that means neither direct nor relay is delivering packets.
 //
 // Window selection:
 //   - Within directConnectedWindow (5 min) of upgrade: use the longer window
 //     to allow WG's first direct re-handshake (REKEY_AFTER_TIME = 3 min).
 //   - After the grace period: use handshakeValidWindow (3 min) for faster
-//     detection when UDP is blocked after the direct path is established.
+//     detection when UDP is truly blocked.
 func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 	stats map[string]wireguard.PeerStats) bool {
 	s, ok := stats[peer.Spec.PublicKey]
@@ -1096,13 +1104,6 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 	}
 	if s.LastHandshake.IsZero() {
 		a.log.V(1).Info("isDirectConnected=false (no WG handshake yet)", "peer", peer.Name)
-		return false
-	}
-	// A localhost ActualEndpoint means WG is communicating via relay proxy,
-	// not via a direct path. This catches cases where the relay proxy was
-	// re-activated (e.g. pre-warmed standby) and WG roamed to it.
-	if isLocalhostEndpoint(s.ActualEndpoint) {
-		a.log.V(1).Info("isDirectConnected=false (endpoint is localhost/relay)", "peer", peer.Name, "endpoint", s.ActualEndpoint)
 		return false
 	}
 
@@ -1117,8 +1118,19 @@ func (a *Agent) isDirectConnected(peer *wirekubev1alpha1.WireKubePeer,
 
 	age := time.Since(s.LastHandshake)
 	if age >= window {
-		a.log.V(1).Info("isDirectConnected=false (handshake too old)", "peer", peer.Name, "lastHandshakeAge", age.Round(time.Second), "window", window, "endpoint", s.ActualEndpoint)
+		// Localhost endpoint: relay proxy is keeping the endpoint roamed but
+		// handshake is stale → truly disconnected (relay also not delivering).
+		// Non-localhost endpoint: direct path has gone quiet.
+		a.log.V(1).Info("isDirectConnected=false (handshake too old)", "peer", peer.Name,
+			"lastHandshakeAge", age.Round(time.Second), "window", window, "endpoint", s.ActualEndpoint)
 		return false
+	}
+
+	// Handshake is recent. If the endpoint roamed to the relay proxy, traffic
+	// is flowing via the standby relay — tunnel is alive, no fallback needed.
+	if isLocalhostEndpoint(s.ActualEndpoint) {
+		a.log.V(1).Info("isDirectConnected=true (relay-assisted, handshake fresh)", "peer", peer.Name,
+			"handshakeAge", age.Round(time.Second), "endpoint", s.ActualEndpoint)
 	}
 	return true
 }
