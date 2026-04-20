@@ -295,11 +295,13 @@ func enforceVPCIsolation() error {
 			}
 		}
 
-		// Allow API server (OUTPUT from workers, INPUT on CP)
+		// Allow API server and relay (OUTPUT from workers, INPUT on CP)
 		if self.name != cp.name {
-			if _, err := ctrExec("exec", self.name, "iptables", "-A", "OUTPUT",
-				"-d", cp.ip, "-p", "tcp", "--dport", "6443", "-j", "ACCEPT"); err != nil {
-				return fmt.Errorf("allow API on %s: %w", self.name, err)
+			for _, port := range []int{6443, 3478} {
+				if _, err := ctrExec("exec", self.name, "iptables", "-A", "OUTPUT",
+					"-d", cp.ip, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
+					return fmt.Errorf("allow tcp/%d on %s: %w", port, self.name, err)
+				}
 			}
 		}
 
@@ -381,6 +383,19 @@ func enforceVPCIsolation() error {
 
 func teardownCluster() {
 	fmt.Println("e2e: tearing down…")
+	// Dump agent and relay logs before destroying containers.
+	for _, n := range nodeConfigs {
+		fmt.Printf("e2e: === %s agent log (last 30 lines) ===\n", n.name)
+		out, _ := ctrExec("exec", n.name, "sh", "-c",
+			`find /var/log/pods -name "*.log" -path "*wirekube-agent*" -exec tail -30 {} \;`)
+		fmt.Println(out)
+		if n.name == nodeConfigs[0].name {
+			fmt.Printf("e2e: === %s relay log ===\n", n.name)
+			out, _ = ctrExec("exec", n.name, "sh", "-c",
+				`find /var/log/pods -name "*.log" -path "*wirekube-relay*" -exec tail -30 {} \;`)
+			fmt.Println(out)
+		}
+	}
 	for i := len(nodeConfigs) - 1; i >= 0; i-- {
 		ctrExec("rm", "-f", nodeConfigs[i].name) //nolint:errcheck
 	}
@@ -691,13 +706,35 @@ func installCilium() error {
 	return waitForCiliumReady(5 * time.Minute)
 }
 
-const flannelManifestURL = "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+const flannelVersion = "v0.27.4"
+
+var flannelManifestURLs = []string{
+	"https://github.com/flannel-io/flannel/releases/download/" + flannelVersion + "/kube-flannel.yml",
+	"https://raw.githubusercontent.com/flannel-io/flannel/" + flannelVersion + "/Documentation/kube-flannel.yml",
+}
 
 func installFlannel() error {
-	// Download the Flannel manifest on the host and copy it into the CP container.
-	out, err := runCmd("curl", "-fsSL", flannelManifestURL)
-	if err != nil {
-		return fmt.Errorf("download flannel manifest: %w", err)
+	// Pin Flannel to a known-good version so the e2e suite validates WireKube
+	// behavior rather than the availability of flannel's moving "latest"
+	// redirect. Keep a raw GitHub fallback because Actions occasionally sees
+	// transient failures on the release CDN.
+	var out string
+	var lastErr error
+	for _, url := range flannelManifestURLs {
+		for attempt := 1; attempt <= 3; attempt++ {
+			out, lastErr = runCmd("curl", "-fsSL", "--retry", "3", "--retry-all-errors", "--connect-timeout", "10", url)
+			if lastErr == nil {
+				break
+			}
+			fmt.Printf("e2e: flannel manifest download failed (%s, attempt %d/3): %v\n", url, attempt, lastErr)
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		if lastErr == nil {
+			break
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("download flannel manifest: %w", lastErr)
 	}
 
 	if err := writeToContainer(cpNode().name, "/tmp/flannel.yaml", out); err != nil {
@@ -747,6 +784,27 @@ const calicoManifestURL = "https://raw.githubusercontent.com/projectcalico/calic
 
 func installCalico() error {
 	cp := cpNode().name
+
+	// Calico containers reference a ConfigMap "kubernetes-services-endpoint"
+	// via envFrom (optional: true). When present, it overrides
+	// KUBERNETES_SERVICE_HOST/PORT. Before CNI is installed, kube-proxy may
+	// not have set up ClusterIP DNAT rules yet, so install-cni's API call to
+	// 10.96.0.1:443 times out. Create this ConfigMap with the CP's direct IP
+	// so all Calico containers bypass ClusterIP.
+	cmYaml := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubernetes-services-endpoint
+  namespace: kube-system
+data:
+  KUBERNETES_SERVICE_HOST: "%s"
+  KUBERNETES_SERVICE_PORT: "6443"`, cpNode().ip)
+	if err := writeToContainer(cp, "/tmp/calico-svc-ep.yaml", cmYaml); err != nil {
+		return fmt.Errorf("write kubernetes-services-endpoint ConfigMap: %w", err)
+	}
+	if _, err := kubectlInCP("apply", "-f", "/tmp/calico-svc-ep.yaml"); err != nil {
+		return fmt.Errorf("apply kubernetes-services-endpoint ConfigMap: %w", err)
+	}
 
 	// Download inside the container and patch for nested container environments:
 	// 1. Swap IPIP=Always→Never and VXLAN=Never→Always (IPIP doesn't work in Docker)
@@ -820,6 +878,21 @@ func waitForCalicoReady(timeout time.Duration) error {
 			descLines = descLines[len(descLines)-60:]
 		}
 		fmt.Printf("e2e: Calico pod describe (tail):\n%s\n", strings.Join(descLines, "\n"))
+	}
+	// Dump init container logs to diagnose install-cni CrashLoopBackOff.
+	if out, err := kubectlInCP("get", "pods", "-n", "kube-system",
+		"-l", "k8s-app=calico-node", "--no-headers", "-o", "custom-columns=NAME:.metadata.name"); err == nil {
+		for _, podName := range strings.Split(strings.TrimSpace(out), "\n") {
+			if podName == "" {
+				continue
+			}
+			for _, initCtr := range []string{"install-cni", "upgrade-ipam", "flexvol-driver"} {
+				if clog, err := kubectlInCP("logs", "-n", "kube-system", podName, "-c", initCtr); err == nil && clog != "" {
+					fmt.Printf("e2e: Calico %s/%s logs:\n%s\n", podName, initCtr, clog)
+				}
+			}
+			break // one pod is enough for diagnosis
+		}
 	}
 	return fmt.Errorf("timed out waiting for Calico pods")
 }
@@ -952,18 +1025,38 @@ func loadImageToAllNodes(image string) error {
 	// causes docker cp to write to the overlay layer which is invisible
 	// from inside the container's tmpfs mount.
 	const ctrTarPath = "/var/tmp/image.tar"
+	dockerRef := "docker.io/" + image
 	for _, n := range nodeConfigs {
 		if _, err := ctrExec("cp", tarPath, n.name+":"+ctrTarPath); err != nil {
 			return fmt.Errorf("copy tar to %s: %w", n.name, err)
+		}
+		// Remove ALL existing wirekube images (tag + digest refs) so ctr
+		// import actually replaces the content. Without this, containerd
+		// keeps the old layers via content-addressable dedup and the new
+		// image tag points to a manifest-only stub (856 B, no layers).
+		existingImages, _ := ctrExec("exec", n.name,
+			"ctr", "-n=k8s.io", "images", "ls", "-q")
+		for _, ref := range strings.Split(existingImages, "\n") {
+			ref = strings.TrimSpace(ref)
+			if strings.Contains(ref, "inerplat/wirekube") {
+				ctrExec("exec", n.name, "ctr", "-n=k8s.io", "images", "rm", ref) //nolint:errcheck
+			}
 		}
 		if _, err := ctrExec("exec", n.name,
 			"ctr", "-n=k8s.io", "images", "import", "--all-platforms", ctrTarPath,
 		); err != nil {
 			return fmt.Errorf("import image on %s: %w", n.name, err)
 		}
-		dockerRef := "docker.io/" + image
-		ctrExec("exec", n.name,
-			"ctr", "-n=k8s.io", "images", "tag", "localhost/"+image, dockerRef) //nolint:errcheck
+		// Docker Desktop OCI index may import with a mangled tag (spaces
+		// instead of hyphens). Re-tag to ensure the correct ref exists.
+		importedImages, _ := ctrExec("exec", n.name,
+			"ctr", "-n=k8s.io", "images", "ls", "-q")
+		for _, ref := range strings.Split(importedImages, "\n") {
+			ref = strings.TrimSpace(ref)
+			if strings.Contains(ref, "inerplat/wirekube") && ref != dockerRef {
+				ctrExec("exec", n.name, "ctr", "-n=k8s.io", "images", "tag", ref, dockerRef) //nolint:errcheck
+			}
+		}
 		ctrExec("exec", n.name, "rm", ctrTarPath) //nolint:errcheck
 		fmt.Printf("e2e: loaded %s into %s\n", image, n.name)
 	}
@@ -1158,9 +1251,7 @@ func applyWireKubeMeshCR(ctx context.Context, stunServers []string, relayEndpoin
 		HealthProbeTimeoutSeconds:    5,
 		DirectConnectedWindowSeconds: 45,
 	}
-	mesh.Spec.AutoAllowedIPs = &wirekubev1alpha1.AutoAllowedIPsSpec{
-		Strategy: "node-internal-ip",
-	}
+	mesh.Spec.MeshCIDR = "100.64.0.0/10"
 
 	existing := &wirekubev1alpha1.WireKubeMesh{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: meshName}, existing); err != nil {
@@ -1300,6 +1391,31 @@ func execInPod(ctx context.Context, t *testing.T, pod corev1.Pod, container stri
 	return buf.String(), err
 }
 
+func execInPodViaCRI(t *testing.T, pod corev1.Pod, container string, cmd []string) (string, error) {
+	t.Helper()
+
+	var containerID string
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != container {
+			continue
+		}
+		containerID = status.ContainerID
+		break
+	}
+	if containerID == "" {
+		return "", fmt.Errorf("container %q not found in pod %s/%s", container, pod.Namespace, pod.Name)
+	}
+
+	containerID = strings.TrimPrefix(containerID, "containerd://")
+	if containerID == "" {
+		return "", fmt.Errorf("empty container id for %s/%s container %q", pod.Namespace, pod.Name, container)
+	}
+
+	execArgs := []string{"exec", pod.Spec.NodeName, "crictl", "exec", containerID}
+	execArgs = append(execArgs, cmd...)
+	return ctrExec(execArgs...)
+}
+
 // ── Fault injection ──────────────────────────────────────────────────────────
 
 func blockWireGuardUDP(t *testing.T, nodeName string) func() {
@@ -1322,6 +1438,48 @@ func blockWireGuardUDP(t *testing.T, nodeName string) func() {
 			t.Logf("warning: unblock WG UDP on %s: %v", nodeName, err)
 		}
 	}
+}
+
+func clearWireGuardUDPBlocks(t *testing.T) {
+	t.Helper()
+	for _, n := range nodeConfigs {
+		for {
+			if _, err := ctrExec("exec", n.name,
+				"iptables", "-D", "INPUT",
+				"-p", "udp", "--dport", fmt.Sprintf("%d", wgPort),
+				"-j", "DROP",
+			); err != nil {
+				break
+			}
+			t.Logf("cleared stale WG UDP block on %s", n.name)
+		}
+	}
+}
+
+func setMeshRelayMode(ctx context.Context, t *testing.T, newMode string) {
+	t.Helper()
+
+	var mesh wirekubev1alpha1.WireKubeMesh
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: meshName}, &mesh); err != nil {
+		t.Fatalf("get WireKubeMesh: %v", err)
+	}
+	current := ""
+	if mesh.Spec.Relay != nil {
+		current = mesh.Spec.Relay.Mode
+	}
+	if current == newMode {
+		return
+	}
+
+	patch := client.MergeFrom(mesh.DeepCopy())
+	if mesh.Spec.Relay == nil {
+		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{}
+	}
+	mesh.Spec.Relay.Mode = newMode
+	if err := k8sClient.Patch(ctx, &mesh, patch); err != nil {
+		t.Fatalf("set relay.mode=%s: %v", newMode, err)
+	}
+	t.Logf("set relay.mode=%s (was %q)", newMode, current)
 }
 
 func patchMeshRelayMode(ctx context.Context, t *testing.T, newMode string) func() {

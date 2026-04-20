@@ -34,10 +34,11 @@ flowchart LR
     N2 <-->|"WireGuard P2P"| N3
 ```
 
-1. An **Agent DaemonSet** runs on each node, creates a WireGuard interface, and discovers its public endpoint via STUN.
-2. Each agent registers itself as a **WireKubePeer** CRD. All agents watch all peers and configure WireGuard accordingly.
-3. Direct P2P is attempted first. If the handshake times out (default 30s), traffic routes through a **TCP relay** — with WireGuard encryption preserved end-to-end.
-4. The agent periodically re-probes relayed peers and upgrades back to direct when possible.
+1. An **Agent DaemonSet** runs on each node, creates a WireGuard TUN (wireguard-go userspace), and discovers its public endpoint via STUN.
+2. Each agent registers itself as a **WireKubePeer** CRD. All agents watch all peers and configure WireGuard through a custom `Bind` layer.
+3. The custom Bind runs a **bimodal warm-relay datapath**: when direct is unproven or flapping, every packet is duplicated on both the direct UDP leg and the relay TCP leg. WireGuard's replay counter dedupes on the receiver, so blackouts are bounded by the 3-second trust window instead of by control-plane sync intervals.
+4. When direct receive stalls, the bind fires a **BimodalHint** through the relay to pull the remote peer into dual-send too — this is the fix for asymmetric (one-way) UDP drops that would otherwise take ~30s to recover.
+5. The per-peer `PathMonitor` FSM promotes `Relay → Warm → Direct` on fresh direct receive evidence and demotes back on stall. Relay is always warm; direct is an opportunistic overlay.
 
 No coordination server, no external etcd, no control plane beyond the Kubernetes API itself.
 
@@ -55,11 +56,24 @@ kubectl apply -f config/agent/
 kubectl get wirekubepeers -o wide
 ```
 
-Each agent auto-discovers its endpoint and registers as a WireKubePeer. Set AllowedIPs per peer to define which traffic flows through the mesh:
+Each agent auto-discovers its endpoint and registers as a WireKubePeer. Set `meshCIDR` on the `WireKubeMesh` CR and every peer is automatically assigned a deterministic `/32` overlay IP from that range (derived from the node name):
+
+```yaml
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  meshCIDR: "100.64.0.0/10"   # recommended CGNAT range
+  autoAllowedIPs:
+    includeNodeInternalIP: true  # optionally also publish each node's private IP
+```
+
+You can still set AllowedIPs manually for fine-grained control:
 
 ```bash
 kubectl patch wirekubepeer <node-name> --type=merge \
-  -p '{"spec":{"allowedIPs":["<node-ip>/32"]}}'
+  -p '{"spec":{"allowedIPs":["<ip>/32"]}}'
 ```
 
 See the [Quick Start guide](https://inerplat.github.io/wirekube/getting-started/quickstart/) for detailed setup instructions.
@@ -69,8 +83,11 @@ See the [Quick Start guide](https://inerplat.github.io/wirekube/getting-started/
 | Feature | Description |
 |---------|-------------|
 | **No coordination server** | Kubernetes CRDs are the only control plane — no external dependencies |
+| **Deterministic mesh overlay** | `meshCIDR` assigns each node a stable `/32` from a hash of its node name — no central IP allocator |
+| **Bimodal warm-relay datapath** | Direct + relay legs duplicated when the direct path is unproven; WireGuard replay window dedupes. Blackouts are bounded by a 3s trust window, not control-plane sync |
+| **Disco-style failover hints** | On stale receive, a `BimodalHint` is relayed to the peer so asymmetric UDP blackholes recover within one trust window instead of ~30s |
+| **NAT type detection** | `open` / `cone` / `port-restricted-cone` / `symmetric` — public-IP-on-NIC hosts skip traversal entirely |
 | **Automatic NAT traversal** | STUN discovery → direct P2P → TCP relay fallback, fully automatic |
-| **Direct path recovery** | Periodically re-probes relayed peers and upgrades to direct when possible |
 | **Virtual Gateway** | Cross-VPC routing with HA failover via `WireKubeGateway` CRD |
 | **CNI compatible** | Routes only node IPs (`/32`); never touches pod CIDRs |
 | **Relay pool scaling** | DNS-based multi-instance relay discovery with automatic failover |

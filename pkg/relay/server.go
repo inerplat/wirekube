@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -41,7 +42,10 @@ func NewServer() *Server {
 }
 
 func (s *Server) ListenAndServe(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	lc := net.ListenConfig{
+		Control: listenControl,
+	}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
@@ -86,8 +90,14 @@ func (s *Server) ListenAndServe(addr string) error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+	// Set fwmark on the accepted connection so reply packets bypass the
+	// WireKube routing table. Linux does not inherit SO_MARK from the
+	// listener socket to accepted connections.
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true) //nolint:errcheck
+		if sc, err := tc.SyscallConn(); err == nil {
+			_ = listenControl("", "", sc)
+		}
 	}
 	reader := bufio.NewReader(conn)
 
@@ -170,6 +180,36 @@ func (s *Server) handleConn(conn net.Conn) {
 
 			if err != nil {
 				log.Printf("relay: forward error to %x: %v", destKey[:8], err)
+			}
+			// Successful forwards intentionally not logged: a busy relay
+			// (RelayModeAlways / warm-bimodal) can push tens of frames per
+			// second per peer, which would dominate the log without adding
+			// operational signal. Prometheus counters on the agent side
+			// cover byte/packet accounting.
+
+		case MsgBimodalHint:
+			destKey, err := ParseBimodalHintFrame(frame.Body)
+			if err != nil {
+				log.Printf("relay: bad bimodal hint frame from %x: %v", pubKey[:8], err)
+				continue
+			}
+			s.mu.RLock()
+			dest, ok := s.peers[destKey]
+			s.mu.RUnlock()
+			if !ok {
+				continue
+			}
+			// Forward with sender pubkey so the destination can key the hint
+			// by peer; body carries the sender (not the dest) on the wire.
+			outFrame := Frame{Type: MsgBimodalHint, Body: pubKey[:]}
+			dest.mu.Lock()
+			err = WriteFrame(dest.writer, outFrame)
+			if err == nil {
+				err = dest.writer.Flush()
+			}
+			dest.mu.Unlock()
+			if err != nil {
+				log.Printf("relay: forward bimodal hint to %x: %v", destKey[:8], err)
 			}
 
 		case MsgNATProbe:

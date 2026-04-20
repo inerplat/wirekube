@@ -4,6 +4,7 @@ package kind_e2e
 
 import (
 	"context"
+	"net"
 	"sort"
 	"strings"
 	"testing"
@@ -112,8 +113,23 @@ func logConnections(ctx context.Context, t *testing.T, peerName string) {
 	t.Logf("connections(%s): {%s}", peerName, strings.Join(parts, ", "))
 }
 
+// nodeIPForPeer returns the mesh overlay IP for a peer (AllowedIPs[0] without /32).
+// When meshCIDR is configured, peers receive a deterministic overlay IP instead of
+// their physical node IP. Tests must ping this address to route through the tunnel.
 func nodeIPForPeer(t *testing.T, peerName string) string {
 	t.Helper()
+	ctx := context.Background()
+	var peer wirekubev1alpha1.WireKubePeer
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: peerName}, &peer); err == nil {
+		if len(peer.Spec.AllowedIPs) > 0 {
+			cidr := peer.Spec.AllowedIPs[0]
+			ip, _, _ := net.ParseCIDR(cidr)
+			if ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	// Fallback to physical node IP when meshCIDR is not configured.
 	for _, n := range nodeConfigs {
 		if n.name == peerName {
 			return n.ip

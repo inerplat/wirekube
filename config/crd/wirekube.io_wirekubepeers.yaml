@@ -96,6 +96,10 @@ spec:
           status:
             description: WireKubePeerStatus defines the observed state of WireKubePeer
             properties:
+              bindMode:
+                description: BindMode indicates which WireGuard engine this peer uses
+                  ("kernel" or "userspace").
+                type: string
               bytesReceived:
                 description: BytesReceived is the number of bytes received from this
                   peer.
@@ -163,8 +167,10 @@ spec:
                   type: object
                 type: array
               connected:
-                description: Connected indicates whether this peer has an active WireGuard
-                  handshake.
+                description: |-
+                  Connected indicates whether this peer currently has a usable transport
+                  path to all configured remote peers. The preferred path may be direct
+                  or relay; relay-backed connectivity still counts as connected.
                 type: boolean
               connections:
                 additionalProperties:
@@ -217,7 +223,11 @@ spec:
               natType:
                 description: |-
                   NATType indicates the NAT mapping behavior detected on this node via STUN.
+                  "open": no NAT — the STUN-mapped address is this node's own interface IP
+                          (typical for cloud instances with a public IP on the NIC directly).
                   "cone": Endpoint-Independent Mapping — stable mapped port, direct P2P capable.
+                  "port-restricted-cone": cone with port-restricted filtering, detected via
+                                          a dual-probe from the relay's bound UDP port.
                   "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
                   Empty string means NAT type was not determined (e.g., only one STUN server responded).
                 type: string
