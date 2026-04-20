@@ -1,18 +1,28 @@
 # NAT Traversal
 
 WireKube implements a multi-stage NAT traversal strategy inspired by
-[Tailscale's approach](https://tailscale.com/blog/how-nat-traversal-works).
-The core idea: establish relay connectivity immediately, probe for direct paths
-in parallel, and transparently upgrade when a better path is found.
+[Tailscale's approach](https://tailscale.com/blog/how-nat-traversal-works)
+and its magicsock / disco protocol. The core idea: relay is **always warm**,
+direct is an **opportunistic overlay** that duplicates packets on both legs
+while the path is being proven, and a small cross-peer signalling channel
+on the relay closes the gap when the failure is asymmetric.
 
 ## NAT Types
 
 | NAT Type | Mapping Behavior | WireGuard P2P | WireKube Strategy |
 |----------|-----------------|---------------|-------------------|
+| **Open (no NAT)** | **STUN reflects a local interface IP** | **Direct** | **No traversal, no port-restriction probe** |
 | Full Cone | Endpoint-Independent | Direct | STUN discovery |
 | Restricted Cone | Endpoint-Independent | Direct (with keepalive) | STUN discovery |
 | Port Restricted Cone | Endpoint-Independent | Usually works | STUN discovery |
 | **Symmetric (EDM)** | **Endpoint-Dependent** | **Fails** | **Relay fallback** |
+
+!!! tip "Open vs Cone"
+    Public-IP-on-NIC cloud instances (Oracle Cloud shapes, NCloud direct
+    attach, bare-metal servers with a routable address) are classified as
+    `open` rather than `cone`. They skip port-restriction detection and
+    relay warm-up entirely. The agent infers this by checking whether the
+    STUN-reflected IP is present on any local interface.
 
 ### Why Symmetric NAT Breaks WireGuard
 
@@ -142,6 +152,7 @@ The agent evaluates the NAT type of both sides to select the optimal strategy:
 
 | Local NAT | Peer NAT | Strategy |
 |-----------|----------|----------|
+| Open | Any | Direct immediately — no probe, no warm-up |
 | Cone | Cone | Direct probe via STUN endpoints (high success rate) |
 | Cone | Symmetric | Probe with cone's stable endpoint; symmetric peer's keepalive opens pinhole |
 | Symmetric | Cone | Probe peer's stable endpoint; our NAT creates mapping for response |
@@ -183,6 +194,77 @@ nodes also learn the correct endpoint. To prevent flapping with Symmetric NAT
 ports, endpoint updates for same-IP-different-port cases are only applied when
 ICE confirms the connection is stable.
 
+### Bimodal Warm-Relay Datapath
+
+The custom `WireKubeBind` (sitting between wireguard-go and the network)
+runs every peer in one of three modes:
+
+| Mode | Direct UDP | Relay TCP | When it applies |
+|------|-----------|-----------|-----------------|
+| `PathModeDirect` | ✓ | auto (stale >3s) | Fresh receive evidence within the trust window |
+| `PathModeWarm` | ✓ | ✓ (every packet) | Probing, demoting, or hinted by peer |
+| `PathModeRelay` | — | ✓ | Explicit give-up on direct (symmetric↔PRC etc.) |
+
+Key properties:
+
+- **Warm duplicates every packet** on both legs. WireGuard's replay window
+  dedupes on the receiver, so bimodal send is correctness-free.
+- **Direct auto-upgrades to dual-send on stale receive**. Inside `Send()`,
+  if the peer is in `PathModeDirect` but `DirectHealth.LastSeen` is older
+  than `directTrustWindow` (3s), this packet is also sent on the relay
+  leg. The failover blackout is thus bounded by the trust window — not by
+  the agent's sync interval.
+- **Error-based fallback is intentionally absent**. UDP `WriteToUDP` only
+  errors on local socket failures; using it as a reachability signal
+  would actively mask the inbound-only blackhole case that hints fix.
+
+### Disco-Style Bimodal Hints
+
+Local staleness alone cannot recover from **asymmetric UDP drops** (e.g.
+iptables INPUT DROP on one side only). The blocked side sees stale
+receive and fires bimodal, but the unblocked side keeps sending
+direct-only because its outbound traffic is still succeeding. Without a
+signal, the receiving peer only learns about the outage when the FSM
+finally demotes the path ~30s later.
+
+WireKube borrows Tailscale's disco idea but reuses the existing relay
+TCP connection as the signalling channel instead of inventing a new
+protocol:
+
+```
+peer A                  relay                  peer B
+  |                       |                      |
+  | (DirectHealth stale)  |                      |
+  | MsgBimodalHint(B) --->|                      |
+  |                       | MsgBimodalHint(A) -->|
+  |                       |                      | armed: 10s dual-send window
+  |                       |                      |
+  | <-- relay reply (A reachable via relay) ---- |
+```
+
+Rate-limited to one hint per peer per 250 ms; the receiving side arms a
+10-second dual-send window on that peer. The FSM continues to run as
+before — hints are a datapath accelerator, not a replacement for the
+mode transitions.
+
+### Per-Peer FSM (`PathMonitor`)
+
+Each peer carries a finite state machine whose only input is the
+direct-receive watermark:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Relay : first sight (safe default)
+    Relay --> Warm : backoff elapsed / force probe
+    Warm --> Direct : fresh direct RX (<1.5s)
+    Warm --> Relay : no direct RX for 30s
+    Direct --> Warm : RX stall >3s (aggressive)
+```
+
+`Warm → Direct` is conservative, `Direct → Warm` is aggressive. `Warm →
+Relay` (30s) is the only slow transition, and bimodal send keeps the
+datapath working the entire time.
+
 ### Stage 3: Relay Fallback
 
 When relay is activated for a peer:
@@ -216,9 +298,10 @@ peers to check if direct connectivity has become available:
 
 Each agent publishes two transport-related fields in its WireKubePeer status:
 
-**`natType`** — The node's detected NAT mapping behavior (`cone`, `symmetric`,
-or empty if detection was inconclusive). Other agents use this to decide whether
-direct P2P is possible.
+**`natType`** — The node's detected NAT mapping behavior. One of `open`,
+`cone`, `port-restricted-cone`, `symmetric`, or empty if detection was
+inconclusive. Other agents use this to decide whether direct P2P is
+possible and what strategy to apply.
 
 **`peerTransports`** — A per-peer map recording the transport mode to each
 remote peer (e.g., `{"node-worker1": "direct", "node-worker7": "relay"}`).

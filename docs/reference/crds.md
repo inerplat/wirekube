@@ -20,6 +20,9 @@ spec:
   listenPort: 51820
   interfaceName: wire_kube
   mtu: 1420
+  meshCIDR: "100.64.0.0/10"        # CGNAT range — each node gets a deterministic /32
+  autoAllowedIPs:
+    includeNodeInternalIP: true     # also publish each node's private IP (never public)
   stunServers:
     - stun.cloudflare.com:3478
     - stun.l.google.com:19302
@@ -46,6 +49,8 @@ spec:
 | `listenPort` | int | No | `51820` | WireGuard UDP listen port on each node |
 | `interfaceName` | string | No | `wire_kube` | Name of the WireGuard network interface |
 | `mtu` | int | No | `1420` | Interface MTU. 1420 accounts for WireGuard overhead (40B IPv6 or 20B IPv4 + 8B UDP + 32B WG) |
+| `meshCIDR` | string | No | - | Private CIDR used for mesh overlay addresses. Each node gets a deterministic `/32` inside this range, derived from an FNV-1a hash of the node name. The overlay IP becomes the primary AllowedIPs entry and is assigned to the `wire_kube` TUN. Recommended: `100.64.0.0/10` (CGNAT, RFC 6598). When empty, peers use only manually managed AllowedIPs. |
+| `autoAllowedIPs.includeNodeInternalIP` | bool | No | `false` | When `true`, the agent also appends the node's **private** address to `spec.allowedIPs` (resolved from `Node.status.addresses` first, then from local interfaces as a fallback). Public IPs are never auto-advertised — doing so would hijack SSH / apiserver routes on the next tunnel flap. Operators can override the picked address with the `wirekube.io/internal-ip` annotation on the Node. |
 | `stunServers` | []string | No | - | STUN servers for public endpoint discovery. **Minimum 2 required** — the agent compares mapped ports across servers to detect Symmetric NAT (RFC 5780). |
 
 #### `spec.relay`
@@ -124,7 +129,7 @@ spec:
 | Field | Type | Description |
 |-------|------|-------------|
 | `connected` | bool | Whether a recent WireGuard handshake has been observed |
-| `natType` | string | Detected NAT mapping behavior: `cone`, `symmetric`, or empty (undetermined). Published by the agent so other peers can decide transport path. |
+| `natType` | string | Detected NAT mapping behavior: `open` (no NAT — public IP on NIC), `cone`, `port-restricted-cone`, `symmetric`, or empty (undetermined). Published by the agent so other peers can decide transport path. |
 | `transportMode` | string | Aggregate transport state derived from `peerTransports`: `direct`, `relay`, or `mixed`. |
 | `peerTransports` | map[string]string | Per-peer transport mode. Key is peer CRD name (e.g., `node-worker7`), value is `direct` or `relay`. |
 | `endpointDiscoveryMethod` | string | How the endpoint was discovered: `stun`, `annotation`, `ipv6`, `aws-imds`, `upnp`, `internal` |

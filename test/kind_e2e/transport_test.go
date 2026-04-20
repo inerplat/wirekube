@@ -15,6 +15,91 @@ import (
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 )
 
+func resetTransportState(ctx context.Context, t *testing.T) []string {
+	t.Helper()
+
+	peers := waitForPeers(ctx, t, 3)
+	subject := peers[0]
+
+	clearWireGuardUDPBlocks(t)
+	setMeshRelayMode(ctx, t, "auto")
+	if err := waitForAgents(ctx, len(nodeConfigs)); err != nil {
+		t.Fatalf("wait for agents after transport reset: %v", err)
+	}
+	restartAgentOnNode(ctx, t, subject)
+
+	return peers
+}
+
+func restartAgentOnNode(ctx context.Context, t *testing.T, nodeName string) {
+	t.Helper()
+
+	pod := agentPodForNode(ctx, t, nodeName)
+	oldPodName := pod.Name
+	t.Logf("restarting agent pod %s on %s", oldPodName, nodeName)
+	if _, err := kubectlInCP("delete", "pod", "-n", agentNamespace, oldPodName, "--grace-period=0", "--force"); err != nil {
+		t.Fatalf("delete pod %s: %v", oldPodName, err)
+	}
+
+	time.Sleep(5 * time.Second)
+	eventually(t, func() bool {
+		newPod := agentPodForNode(ctx, t, nodeName)
+		if newPod.Name == "" || newPod.Name == oldPodName {
+			t.Logf("waiting for new agent pod (current: %s, old: %s)", newPod.Name, oldPodName)
+			return false
+		}
+		t.Logf("new agent pod: %s", newPod.Name)
+		return true
+	}, 2*time.Minute, pollInterval, "new agent pod on "+nodeName)
+
+	if err := waitForAgents(ctx, len(nodeConfigs)); err != nil {
+		t.Fatalf("wait for agents after restarting %s: %v", nodeName, err)
+	}
+}
+
+func waitForDirectWithTraffic(ctx context.Context, t *testing.T, subject, remote string) {
+	t.Helper()
+
+	remoteIP := nodeIPForPeer(t, remote)
+	subjectIP := nodeIPForPeer(t, subject)
+	subjectPod := agentPodForNode(ctx, t, subject)
+	remotePod := agentPodForNode(ctx, t, remote)
+	attempts := 0
+	restartedPair := false
+
+	eventually(t, func() bool {
+		attempts++
+		mode := connectionMode(ctx, t, subject, remote)
+		t.Logf("warm direct: %s → %s = %q", subject, remote, mode)
+		if mode == "direct" {
+			return true
+		}
+
+		if !restartedPair && attempts >= 3 {
+			t.Logf("warm direct still relay after %d attempts; restarting %s and %s agents once", attempts, subject, remote)
+			restartAgentOnNode(ctx, t, subject)
+			subjectPod = agentPodForNode(ctx, t, subject)
+			restartAgentOnNode(ctx, t, remote)
+			remotePod = agentPodForNode(ctx, t, remote)
+			restartedPair = true
+		}
+
+		// Keep traffic flowing across at least one full agent sync interval.
+		// Short 1s bursts can miss the byte-delta window that userspace direct
+		// promotion relies on in slower CI runners.
+		out, err := execInPodViaCRI(t, subjectPod, "agent", []string{"ping", "-c", "25", "-i", "0.2", "-W", "1", remoteIP})
+		if err != nil {
+			t.Logf("warm direct ping %s→%s: %v (%s)", subject, remote, err, out)
+		}
+		out, err = execInPodViaCRI(t, remotePod, "agent", []string{"ping", "-c", "25", "-i", "0.2", "-W", "1", subjectIP})
+		if err != nil {
+			t.Logf("warm direct ping %s→%s: %v (%s)", remote, subject, err, out)
+		}
+
+		return connectionMode(ctx, t, subject, remote) == "direct"
+	}, 3*time.Minute, pollInterval, subject+" → "+remote+" should be direct before test")
+}
+
 // TestNATTypeDetected verifies STUN reachability and NAT type reporting for
 // ALL nodes including control-plane.
 func TestNATTypeDetected(t *testing.T) {
@@ -150,7 +235,7 @@ func TestAllNodesReachable(t *testing.T) {
 func TestRelayFallback(t *testing.T) {
 	ctx := context.Background()
 
-	peers := waitForPeers(ctx, t, 3)
+	peers := resetTransportState(ctx, t)
 	subject := peers[0]
 	remote := peers[1]
 
@@ -188,7 +273,7 @@ func TestRelayFallback(t *testing.T) {
 func TestRelayModeAlways(t *testing.T) {
 	ctx := context.Background()
 
-	peers := waitForPeers(ctx, t, 3)
+	peers := resetTransportState(ctx, t)
 	subject := peers[0]
 
 	// Wait for any connection before mode change.
@@ -338,7 +423,7 @@ func TestBidirectionalPing(t *testing.T) {
 func TestDataPlaneUnderRelay(t *testing.T) {
 	ctx := context.Background()
 
-	peers := waitForPeers(ctx, t, 3)
+	peers := resetTransportState(ctx, t)
 	subject := peers[0]
 	remote := peers[1]
 
@@ -381,7 +466,7 @@ func TestDataPlaneUnderRelay(t *testing.T) {
 func TestAgentRestart(t *testing.T) {
 	ctx := context.Background()
 
-	peers := waitForPeers(ctx, t, 3)
+	peers := resetTransportState(ctx, t)
 	subject := peers[0]
 	remote := peers[1]
 
@@ -391,24 +476,7 @@ func TestAgentRestart(t *testing.T) {
 	}, 3*time.Minute, pollInterval, subject+" → "+remote+" should be connected")
 
 	// Delete the agent pod on subject node.
-	pod := agentPodForNode(ctx, t, subject)
-	oldPodName := pod.Name
-	t.Logf("deleting agent pod %s on %s", oldPodName, subject)
-	if _, err := kubectlInCP("delete", "pod", "-n", agentNamespace, oldPodName, "--grace-period=0", "--force"); err != nil {
-		t.Fatalf("delete pod %s: %v", oldPodName, err)
-	}
-
-	// Wait for new pod to come up.
-	time.Sleep(5 * time.Second)
-	eventually(t, func() bool {
-		newPod := agentPodForNode(ctx, t, subject)
-		if newPod.Name == "" || newPod.Name == oldPodName {
-			t.Logf("waiting for new agent pod (current: %s, old: %s)", newPod.Name, oldPodName)
-			return false
-		}
-		t.Logf("new agent pod: %s", newPod.Name)
-		return true
-	}, 2*time.Minute, pollInterval, "new agent pod on "+subject)
+	restartAgentOnNode(ctx, t, subject)
 
 	// Wait for connection recovery.
 	eventually(t, func() bool {
@@ -476,11 +544,86 @@ func TestMetricsEndpoint(t *testing.T) {
 	t.Logf("metrics endpoint OK (%d bytes, all expected metrics present)", len(metricsOut))
 }
 
+// TestFailoverPacketLoss verifies that direct→relay failover causes a
+// minimal blackout window. A continuous ping (2 pps, 150 s) runs while
+// WireGuard UDP is blocked on the subject to force relay failover. Instead
+// of total loss, the test measures the longest consecutive sequence gap —
+// the actual blackout window.
+//
+// With the bimodal warm-send Bind (Tailscale DERP-style), the datapath
+// auto-upgrades PathModeDirect to dual-leg send as soon as the direct
+// receive watermark is stale by directTrustWindow (3 s). The relay leg
+// is always warm (the relay pool holds a persistent TCP session), so the
+// first packet to duplicate actually lands. The expected blackout window
+// is therefore bounded by directTrustWindow rather than by the agent's
+// sync interval: ~6 ping intervals at 2 pps = 3 s + jitter.
+func TestFailoverPacketLoss(t *testing.T) {
+	ctx := context.Background()
+
+	peers := resetTransportState(ctx, t)
+	subject := peers[0]
+	remote := peers[1]
+
+	// Failover blackout is only meaningful if the dataplane has actually
+	// reconverged to direct after any prior restart/relay test.
+	waitForDirectWithTraffic(ctx, t, subject, remote)
+
+	remoteIP := nodeIPForPeer(t, remote)
+	pod := agentPodForNode(ctx, t, subject)
+
+	// Bimodal warm-send: at 2 pps with a ~3 s trust window, worst case
+	// failover loses up to ~6 packets before the datapath starts duplicating
+	// to the relay leg. Use 8 as a slightly slack upper bound for CI jitter.
+	const maxSeqGap = 8
+	t.Logf("bimodal warm-send threshold: maxSeqGap=%d", maxSeqGap)
+
+	// Launch ping at 2 pps for 150 s. The -O flag (report unanswered) ensures
+	// BusyBox ping still prints each icmp_seq so we can detect gaps.
+	type pingResult struct {
+		out string
+		err error
+	}
+	pingDone := make(chan pingResult, 1)
+	go func() {
+		out, err := execInPod(ctx, t, pod, "agent",
+			[]string{"ping", "-i", "0.5", "-c", "300", "-W", "2", remoteIP})
+		pingDone <- pingResult{out, err}
+	}()
+
+	// Give ping a few seconds to establish baseline traffic before blocking.
+	time.Sleep(4 * time.Second)
+
+	// Block WireGuard UDP — forces relay failover.
+	unblock := blockWireGuardUDP(t, subject)
+	defer unblock()
+	t.Logf("WG UDP blocked on %s — failover to relay expected", subject)
+
+	// Wait until connection shows as relay (failover complete).
+	eventually(t, func() bool {
+		mode := connectionMode(ctx, t, subject, remote)
+		t.Logf("%s → %s = %q", subject, remote, mode)
+		return mode == "relay"
+	}, relayTimeout, pollInterval, subject+" → "+remote+" should failover to relay")
+
+	// Wait for the background ping to finish.
+	result := <-pingDone
+
+	t.Logf("ping output:\n%s", result.out)
+
+	gap := longestPingSeqGap(result.out)
+	t.Logf("longest consecutive seq gap: %d (max allowed: %d)", gap, maxSeqGap)
+
+	if gap > maxSeqGap {
+		t.Errorf("blackout window too large during direct→relay failover: gap=%d (max=%d)",
+			gap, maxSeqGap)
+	}
+}
+
 // TestRelayReconnect breaks and restores the relay endpoint.
 func TestRelayReconnect(t *testing.T) {
 	ctx := context.Background()
 
-	peers := waitForPeers(ctx, t, 3)
+	peers := resetTransportState(ctx, t)
 	subject := peers[0]
 	remote := peers[1]
 

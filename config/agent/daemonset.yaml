@@ -53,6 +53,17 @@ spec:
             # - name: KUBERNETES_SERVICE_PORT
             #   value: "443"
           securityContext:
+            # privileged is required to open /dev/net/tun on Ubuntu 24.04+
+            # hosts where containerd's default device cgroup denies TUN
+            # write even with CAP_NET_ADMIN. Older distros with permissive
+            # device cgroups could get by with capabilities alone, but the
+            # userspace engine needs the TUN device on every node so we
+            # enable privileged here.
+            privileged: true
+            # Unconfined AppArmor: the default containerd profile denies
+            # TUN-related operations on Ubuntu 24.04.
+            appArmorProfile:
+              type: Unconfined
             capabilities:
               add: ["NET_ADMIN", "SYS_MODULE"]
           volumeMounts:
@@ -60,13 +71,15 @@ spec:
               mountPath: /var/lib/wirekube
             - name: host-proc-sys-net
               mountPath: /host/proc/sys/net
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
           resources:
             limits:
               cpu: 200m
-              memory: 64Mi
+              memory: 256Mi
             requests:
               cpu: 10m
-              memory: 32Mi
+              memory: 64Mi
       volumes:
         - name: wireguard-keys
           hostPath:
@@ -76,3 +89,7 @@ spec:
           hostPath:
             path: /proc/sys/net
             type: Directory
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

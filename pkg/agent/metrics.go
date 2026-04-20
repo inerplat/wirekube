@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	"github.com/wirekube/wirekube/pkg/wireguard"
 )
 
 var (
@@ -36,7 +37,7 @@ var (
 	peerConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_connected",
-		Help:      "Whether a peer has a recent WireGuard handshake (1=yes, 0=no).",
+		Help:      "Whether a peer currently has a usable transport path (1=yes, 0=no).",
 	}, []string{"source", "peer", "nat_type"})
 
 	peerTransport = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -95,7 +96,9 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 		handshake  time.Time
 		endpoint   string
 	})
+	wgStatsByKey := make(map[string]wireguard.PeerStats, len(stats))
 	for _, s := range stats {
+		wgStatsByKey[s.PublicKeyB64] = s
 		statsByKey[s.PublicKeyB64] = struct {
 			sent, recv int64
 			handshake  time.Time
@@ -128,18 +131,18 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			peerBytesSent.WithLabelValues(me, p.Name).Set(float64(s.sent))
 			peerBytesReceived.WithLabelValues(me, p.Name).Set(float64(s.recv))
 
-			connected := float64(0)
-			if !s.handshake.IsZero() && time.Since(s.handshake) < 3*time.Minute {
-				connected = 1
-			}
-			peerConnected.WithLabelValues(me, p.Name, p.Status.NATType).Set(connected)
-
 			if !s.handshake.IsZero() {
 				peerLastHandshake.WithLabelValues(me, p.Name).Set(time.Since(s.handshake).Seconds())
 			}
 		}
 
-		isRelayed := a.relayedPeers[p.Name]
+		isRelayed := a.preferredTransportForPeer(p.Name) == "relay"
+		connected := float64(0)
+		if a.peerTransportUsable(p, wgStatsByKey) {
+			connected = 1
+		}
+		peerConnected.WithLabelValues(me, p.Name, p.Status.NATType).Set(connected)
+
 		transport := float64(1)
 		if isRelayed {
 			transport = 2

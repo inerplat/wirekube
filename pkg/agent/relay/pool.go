@@ -27,6 +27,14 @@ type Pool struct {
 	clients map[string]*Client // keyed by resolved IP:port
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
+	// bindDelivery, when set, routes incoming relay data packets directly
+	// to the WireKubeBind instead of through UDPProxy. Used in userspace
+	// WireGuard mode where the Bind handles relay receive internally.
+	bindDelivery func(srcKey [32]byte, payload []byte)
+
+	// hintHandler, when set, receives bimodal hints relayed from remote peers.
+	hintHandler func(srcKey [32]byte)
+
 	cancel context.CancelFunc
 }
 
@@ -221,6 +229,25 @@ func (p *Pool) SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte
 	return lastErr
 }
 
+// SendBimodalHint forwards a bimodal-hint to destPubKey via the first
+// reachable relay. The hint tells the destination peer to dual-send on both
+// direct and relay legs for the next few seconds.
+func (p *Pool) SendBimodalHint(destPubKey [relayproto.PubKeySize]byte) error {
+	clients := p.connectedClients()
+	if len(clients) == 0 {
+		return fmt.Errorf("no relay connected")
+	}
+	var lastErr error
+	for _, c := range clients {
+		if err := c.SendBimodalHint(destPubKey); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
 // Close shuts down all relay clients and proxies.
 func (p *Pool) Close() {
 	if p.cancel != nil {
@@ -239,12 +266,54 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 }
 
+// SetBindDelivery registers a callback that receives relay data packets
+// directly, bypassing UDPProxy. Used in userspace WireGuard mode where
+// the WireKubeBind handles relay receive internally.
+func (p *Pool) SetBindDelivery(fn func(srcKey [32]byte, payload []byte)) {
+	p.mu.Lock()
+	p.bindDelivery = fn
+	p.mu.Unlock()
+}
+
+// SetBimodalHintHandler registers a callback invoked when a remote peer
+// relays a bimodal-hint identifying itself as the sender. The bind marks
+// that peer for a short dual-send window so the local datapath immediately
+// cooperates with the remote's failover.
+func (p *Pool) SetBimodalHintHandler(fn func(srcKey [32]byte)) {
+	p.mu.Lock()
+	p.hintHandler = fn
+	p.mu.Unlock()
+}
+
+// HasBindDelivery reports whether a bind delivery callback is registered.
+// When true, relay packets are routed to the Bind and UDPProxy is not needed.
+func (p *Pool) HasBindDelivery() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.bindDelivery != nil
+}
+
 func (p *Pool) handleData(srcKey [relayproto.PubKeySize]byte, payload []byte) {
 	p.mu.RLock()
+	bd := p.bindDelivery
 	proxy, ok := p.proxies[srcKey]
 	p.mu.RUnlock()
+
+	if bd != nil {
+		bd(srcKey, payload)
+		return
+	}
 	if ok {
 		proxy.DeliverToWireGuard(payload)
+	}
+}
+
+func (p *Pool) handleHint(srcKey [relayproto.PubKeySize]byte) {
+	p.mu.RLock()
+	h := p.hintHandler
+	p.mu.RUnlock()
+	if h != nil {
+		h(srcKey)
 	}
 }
 
@@ -270,6 +339,7 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 
 	c := NewClient(addr, p.myPubKey, p.wgPort)
 	c.onData = p.handleData
+	c.onHint = p.handleHint
 	err := c.Connect(ctx)
 
 	p.mu.Lock()
