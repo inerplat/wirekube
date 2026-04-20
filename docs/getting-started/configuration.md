@@ -13,6 +13,9 @@ spec:
   listenPort: 51820
   interfaceName: wire_kube
   mtu: 1420
+  meshCIDR: "100.64.0.0/10"            # recommended — deterministic overlay IPs
+  autoAllowedIPs:
+    includeNodeInternalIP: true         # optionally also publish each node's private IP
   stunServers:
     - stun.cloudflare.com:3478
     - stun.l.google.com:19302
@@ -37,6 +40,8 @@ spec:
 | `spec.listenPort` | int | `51820` | WireGuard UDP listen port |
 | `spec.interfaceName` | string | `wire_kube` | WireGuard network interface name |
 | `spec.mtu` | int | `1420` | Interface MTU (1420 accounts for WireGuard overhead) |
+| `spec.meshCIDR` | string | - | Private CIDR for the overlay. Each node is automatically assigned a stable `/32` within this range derived from `fnv32a(nodeName)`, and that IP becomes the peer's primary AllowedIPs entry. Use `100.64.0.0/10` (CGNAT, RFC 6598) unless it conflicts with your network. Leave empty to manage AllowedIPs entirely by hand. |
+| `spec.autoAllowedIPs.includeNodeInternalIP` | bool | `false` | When `true`, also append the node's **private** address to its peer entry so legacy references by node IP still tunnel. The agent never publishes a public IP even if kubelet reports one as `Node.InternalIP` (common on Oracle Cloud / NCloud); set the `wirekube.io/internal-ip` annotation on the Node to force a specific private address. |
 | `spec.stunServers` | []string | - | STUN servers for endpoint discovery. **Minimum 2 required** for Symmetric NAT detection (RFC 5780). |
 | `spec.relay.mode` | string | `auto` | `auto`, `always`, or `never` |
 | `spec.relay.provider` | string | - | `external` or `managed` |

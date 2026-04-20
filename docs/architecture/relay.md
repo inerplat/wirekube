@@ -44,7 +44,19 @@ All messages are framed with a length prefix:
 | `MsgRegister` | `0x01` | 32-byte WireGuard public key | Agent registers itself with the relay |
 | `MsgData` | `0x02` | 32-byte dest pubkey + UDP payload | Forward WireGuard packet to peer |
 | `MsgKeepalive` | `0x03` | (empty) | Keep TCP connection alive (30s interval) |
+| `MsgNATProbe` | `0x04` | 4-byte IPv4 + 2-byte port | Ask relay to send a UDP probe back to the agent — used for port-restriction detection |
+| `MsgBimodalHint` | `0x05` | 32-byte dest pubkey (server rewrites to sender pubkey on forward) | Disco-style asymmetric-failure signal; instructs the destination peer to dual-send on both direct and relay legs |
 | `MsgError` | `0xFF` | Error message string | Relay reports an error |
+
+!!! note "Why a separate hint frame"
+    Agents cannot detect asymmetric one-way UDP drops from their own
+    observations: on the sender side `WriteToUDP` still succeeds, and on
+    the unblocked receiver the direct-receive watermark stays fresh. The
+    hint frame lets the blocked side push a short "please dual-send to
+    me" request to the peer through the already-warm relay, so failover
+    converges within the trust window instead of waiting for the FSM to
+    time out the path (~30s). The relay rewrites the body to the sender
+    pubkey so the receiver can authenticate who sent it.
 
 ### Connection Lifecycle
 

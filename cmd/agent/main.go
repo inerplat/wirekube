@@ -54,7 +54,10 @@ func main() {
 	flag.StringVar(&apiServer, "kube-apiserver", os.Getenv("WIREKUBE_KUBE_APISERVER"), "Kubernetes API server URL (overrides in-cluster discovery)")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "Prometheus metrics listen address")
 
-	opts := zap.Options{Development: true}
+	// Development=false → production encoder (json) + InfoLevel gate for V(1).
+	// This is the right default for steady-state agents; operators can still
+	// turn on verbose traces with --zap-log-level=debug or --zap-devel=true.
+	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -87,11 +90,12 @@ func main() {
 	// Read WireKubeMesh CR for settings (apiServerURL, interfaceName, listenPort, mtu).
 	// On failure (e.g. CNI not ready, API unreachable) we proceed with defaults;
 	// the agent's setup retry loop will re-read mesh config once available.
+	var mesh *wirekubev1alpha1.WireKubeMesh
 	meshList := &wirekubev1alpha1.WireKubeMeshList{}
 	if listErr := k8sClient.List(context.Background(), meshList); listErr != nil {
 		log.Info("WireKubeMesh read failed (will retry in agent loop)", "error", listErr)
 	} else if len(meshList.Items) > 0 {
-		mesh := &meshList.Items[0]
+		mesh = &meshList.Items[0]
 
 		if apiServer == "" && mesh.Spec.APIServerURL != "" {
 			log.Info("API server overridden by WireKubeMesh CR", "server", mesh.Spec.APIServerURL)
@@ -127,11 +131,11 @@ func main() {
 	log.Info("WireGuard key ready", "publicKey", kp.PublicKeyBase64())
 	log.Info("interface config", "name", ifaceName, "listenPort", listenPort, "mtu", mtu)
 
-	wgMgr, err := wireguard.NewManager(ifaceName, listenPort, mtu, kp)
-	if err != nil {
-		log.Error(err, "creating WireGuard manager")
-		os.Exit(1)
-	}
+	// WireKube runs a single userspace (wireguard-go) engine. The custom Bind
+	// drives the direct↔relay transport decision; the kernel engine was
+	// removed because wgctrl's single-endpoint-per-peer model is incompatible
+	// with warm-relay bimodal send (see PR #8 design notes).
+	engine := wireguard.NewUserspaceEngine(ifaceName, listenPort, mtu, kp)
 
 	// Start Prometheus metrics HTTP server.
 	go func() {
@@ -146,13 +150,13 @@ func main() {
 		}
 	}()
 
-	a := agentpkg.NewAgent(log, k8sClient, wgMgr, nodeName, podName, podNamespace)
+	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace)
 	ctx := ctrl.SetupSignalHandler()
 	log.Info("starting agent", "node", nodeName)
 	if err := a.Run(ctx); err != nil && err != context.Canceled {
 		log.Error(err, "agent error")
-		wgMgr.Close()
+		engine.Close()
 		os.Exit(1)
 	}
-	wgMgr.Close()
+	engine.Close()
 }

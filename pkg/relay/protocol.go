@@ -18,14 +18,24 @@ import (
 //   0x01 = Register: body = [32 bytes WG public key]
 //   0x02 = Data:     body = [32 bytes dest public key] + [UDP payload]
 //   0x03 = Keepalive: body = empty
+//   0x04 = NATProbe: body = [4 bytes IPv4][2 bytes port]
+//   0x05 = BimodalHint: body = [32 bytes dest public key]
 //   0xFF = Error:    body = UTF-8 error string
+//
+// BimodalHint is sent by a peer that suspects its inbound direct path is
+// blocked (direct-receive watermark stale). The relay forwards the hint to
+// the destination peer, which then dual-sends every subsequent packet on
+// both direct and relay legs for a short window. Without this signal,
+// asymmetric (one-way) UDP drops would stall for ~30s until the local FSM
+// demotes the path; hints collapse the blackout to a single trust window.
 
 const (
-	MsgRegister  byte = 0x01
-	MsgData      byte = 0x02
-	MsgKeepalive byte = 0x03
-	MsgNATProbe  byte = 0x04
-	MsgError     byte = 0xFF
+	MsgRegister    byte = 0x01
+	MsgData        byte = 0x02
+	MsgKeepalive   byte = 0x03
+	MsgNATProbe    byte = 0x04
+	MsgBimodalHint byte = 0x05
+	MsgError       byte = 0xFF
 
 	MaxFrameSize = 65536
 	PubKeySize   = 32
@@ -123,4 +133,20 @@ func ParseNATProbeFrame(body []byte) (net.IP, int, error) {
 	ip := net.IPv4(body[0], body[1], body[2], body[3])
 	port := int(binary.BigEndian.Uint16(body[4:]))
 	return ip, port, nil
+}
+
+// MakeBimodalHintFrame creates a hint requesting the destination peer to
+// dual-send on both legs. Body is just the destination public key; the
+// sender is identified by the relay connection it arrives on.
+func MakeBimodalHintFrame(destPubKey [PubKeySize]byte) Frame {
+	return Frame{Type: MsgBimodalHint, Body: destPubKey[:]}
+}
+
+// ParseBimodalHintFrame extracts the destination public key from a hint body.
+func ParseBimodalHintFrame(body []byte) (destPubKey [PubKeySize]byte, err error) {
+	if len(body) < PubKeySize {
+		return destPubKey, fmt.Errorf("bimodal hint frame too short: %d", len(body))
+	}
+	copy(destPubKey[:], body[:PubKeySize])
+	return
 }

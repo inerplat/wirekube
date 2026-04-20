@@ -101,7 +101,16 @@ func init() {
 	case cniModeNoKubeProxyVxlan:
 		subnetOffset, prefix = 6, "cn"
 	case cniModeCalico:
-		subnetOffset, prefix = 9, "ca"
+		// Calico uses 10.200.x to avoid two problems:
+		//  1. Docker Desktop VM uses 172.29.0.0/24 internally (crashes engine)
+		//  2. 172.32+ is outside RFC 1918 private range (agent's IsPrivate check fails)
+		prefix = "ca"
+		nodeConfigs = []nodeConfig{
+			{name: "ca-cp", network: "ca-vpc-1", subnet: "10.200.1.0/24", ip: "10.200.1.2", role: "control-plane"},
+			{name: "ca-w1", network: "ca-vpc-2", subnet: "10.200.2.0/24", ip: "10.200.2.2", role: "worker"},
+			{name: "ca-w2", network: "ca-vpc-3", subnet: "10.200.3.0/24", ip: "10.200.3.2", role: "worker"},
+		}
+		return
 	default:
 		subnetOffset, prefix = 0, "wk"
 	}

@@ -279,6 +279,85 @@ backoff, so it will connect once the external address becomes available.
 
 ---
 
+## Scenario: Agent crashes with `creating TUN wire_kube: operation not permitted`
+
+**Symptoms:** On Ubuntu 24.04 + kernel ≥ 6.14 hosts the agent loops with
+
+```
+ERROR   agent   setup failed, retrying
+    {"error":"creating WireGuard interface: creating TUN wire_kube: operation not permitted"}
+```
+
+even though `CAP_NET_ADMIN` is granted and `/dev/net/tun` exists with `crw-rw-rw-`.
+
+**Root cause:** containerd's default device cgroup denies write on
+`/dev/net/tun` regardless of the granted Linux capabilities, and the
+stock AppArmor profile (`cri-containerd.apparmor.d`) also blocks the
+TUNSETIFF ioctl wireguard-go issues after opening the device. Older
+distros (Ubuntu 22.04 / kernel 6.8) happen to have a more permissive
+default and work with just `CAP_NET_ADMIN`, which is why the shipped
+DaemonSet originally didn't set `privileged: true`.
+
+**Fix:** The shipped `config/agent/daemonset.yaml` now enables
+`privileged: true` and `appArmorProfile: Unconfined`. Re-apply or patch
+an existing cluster:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          securityContext:
+            privileged: true
+            appArmorProfile:
+              type: Unconfined
+            capabilities:
+              add: ["NET_ADMIN", "SYS_MODULE"]
+```
+
+The agent already runs with `hostNetwork: true`, so the added surface
+from `privileged` is narrow — this is simply the only K8s-visible switch
+that loosens the device cgroup enough for TUN creation.
+
+---
+
+## Scenario: Public IP appears in AllowedIPs and SSH breaks
+
+**Symptoms:** After enabling `autoAllowedIPs.includeNodeInternalIP` on a
+cloud provider whose kubelet exposes the public IP as `Node.InternalIP`
+(Oracle Cloud, NCloud, etc.), SSH and kubelet traffic to other nodes
+start timing out. `kubectl get wirekubepeer -o yaml` shows entries like
+`[<meshIP>/32, <public-IP>/32]`.
+
+**Root cause:** Older agent builds (≤ `v0.0.10-dev.5`) fell back to the
+`Node.InternalIP` value even when it was a public address, which caused
+the agent to add a `/32` route for that public IP onto `wire_kube`. The
+next tunnel flap — or even just agent restart — then hijacked SSH,
+kubelet, and apiserver traffic.
+
+**Fix:** Upgrade to `v0.0.10-dev.6` or later. The agent now:
+
+- Walks `Node.status.addresses` and uses only **private** (RFC1918 /
+  CGNAT / loopback / link-local) entries.
+- If none are present, scans local interfaces directly — cloud
+  instances that hide a private secondary behind a kubelet-reported
+  public InternalIP still get picked up this way.
+- Never, under any code path, auto-publishes a public IP. Operators
+  who want a specific non-standard private address can set the
+  `wirekube.io/internal-ip` **node** annotation to override selection.
+
+**Cleanup after upgrade:**
+
+```bash
+# Delete stale peer CRs so the next agent restart recreates them
+# without the lingering public-IP entry.
+kubectl delete wirekubepeer --all
+kubectl -n wirekube-system rollout restart ds/wirekube-agent
+```
+
+---
+
 ## Diagnostic Commands Reference
 
 | Command | Purpose |

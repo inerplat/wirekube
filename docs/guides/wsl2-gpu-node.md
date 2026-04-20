@@ -54,6 +54,7 @@ Create `C:\Users\<USERNAME>\.wslconfig` in Notepad **before** installing WSL2:
 memory=16GB
 swap=0
 networkingMode=mirrored
+dnsTunneling=false
 kernelCommandLine=systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all
 
 [experimental]
@@ -64,6 +65,13 @@ autoMemoryReclaim=gradual
     `cgroup_no_v1=all` forces pure cgroup v2. Without this, Cilium's
     Socket LB (kube-proxy replacement) cannot intercept pod traffic,
     causing `dial tcp 10.96.0.1:443: i/o timeout` on all ClusterIP services.
+
+!!! critical "dnsTunneling must be disabled"
+    `networkingMode=mirrored` enables `dnsTunneling` by default, which binds
+    `10.255.255.254/32` to the `lo` interface. Cilium detects this as a
+    NodePort-capable primary address and uses it for BPF LB SNAT — causing
+    all Pod-to-ClusterIP traffic to be SNATed to an unreachable loopback IP
+    instead of the node's real IP. Result: `i/o timeout` on every service call.
 
 !!! note "Why mirrored networking?"
     `networkingMode=mirrored` gives WSL2 the same IP as the Windows host,
@@ -465,6 +473,88 @@ kubectl delete pod gpu-test
 You should see `nvidia-smi` output showing your GPU from inside the
 Kubernetes pod running on the WSL2 node.
 
+### GPU Benchmark (Optional)
+
+Measure actual TFLOPS with PyTorch matmul across FP32, FP16, and BF16
+precisions. This validates that the GPU is performing at expected levels
+and that WSL2 passthrough introduces no overhead.
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: matmul-bench
+spec:
+  runtimeClassName: nvidia
+  restartPolicy: Never
+  containers:
+  - name: bench
+    image: pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
+    command: ["python3", "-c"]
+    args:
+    - |
+      import torch, time
+
+      device = torch.device("cuda")
+      props = torch.cuda.get_device_properties(0)
+      print(f"GPU: {props.name}")
+      print(f"VRAM: {props.total_memory / 1024**3:.1f} GB")
+      print(f"SM count: {props.multi_processor_count}")
+      print(f"Compute: {props.major}.{props.minor}")
+      print()
+
+      sizes = [1024, 2048, 4096, 8192]
+      dtypes = [
+          ("FP32",  torch.float32),
+          ("FP16",  torch.float16),
+          ("BF16",  torch.bfloat16),
+      ]
+
+      a = torch.randn(1024, 1024, device=device)
+      for _ in range(20):
+          torch.mm(a, a)
+      torch.cuda.synchronize()
+
+      print(f"{'Size':>6} | {'FP32 TFLOPS':>12} | {'FP16 TFLOPS':>12} | {'BF16 TFLOPS':>12}")
+      print("-" * 56)
+
+      for n in sizes:
+          row = f"{n:>6}"
+          for name, dt in dtypes:
+              a = torch.randn(n, n, device=device, dtype=dt)
+              b = torch.randn(n, n, device=device, dtype=dt)
+              for _ in range(5):
+                  torch.mm(a, b)
+              torch.cuda.synchronize()
+
+              iters = 50
+              start = time.perf_counter()
+              for _ in range(iters):
+                  torch.mm(a, b)
+              torch.cuda.synchronize()
+              elapsed = time.perf_counter() - start
+
+              flops = 2 * n**3 * iters / elapsed
+              tflops = flops / 1e12
+              row += f" | {tflops:>10.2f}  "
+          print(row)
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+EOF
+
+kubectl wait --for=condition=Ready pod/matmul-bench --timeout=300s 2>/dev/null
+kubectl logs -f matmul-bench
+kubectl delete pod matmul-bench
+```
+
+!!! note "Reading the results"
+    Ada Lovelace GPUs (RTX 40xx) report FP32 specs including FP32+INT32
+    dual-issue. Pure FP32 matmul achieves ~50% of the advertised TFLOPS —
+    this is expected. FP16/BF16 should reach ~100% of spec. For example,
+    RTX 4060 (15.1 TFLOPS advertised): expect ~7.5 FP32, ~30 FP16/BF16.
+
 ### LLM Serving Test (Optional)
 
 Deploy an LLM using vLLM to verify end-to-end GPU inference. For 8GB VRAM
@@ -566,6 +656,35 @@ kernelCommandLine=systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all
 ```
 
 Then `wsl --shutdown` and verify `stat /sys/fs/cgroup/cgroup.controllers`.
+
+### Pods cannot reach ClusterIP services — dnsTunneling SNAT
+
+**Symptom:** Same `i/o timeout` as above, but cgroup v2 is confirmed. `conntrack -L` shows Pod-to-API-server connections SNATed to `10.255.255.254` (loopback) instead of the node's real IP.
+
+**Cause:** `networkingMode=mirrored` enables `dnsTunneling` by default, binding `10.255.255.254/32` to `lo`. Cilium's BPF LB picks this as the SNAT source for service traffic. The API server cannot route replies back to a loopback address.
+
+**Diagnosis:**
+
+```bash
+# Check if the address exists on lo
+ip addr show lo | grep 10.255.255.254
+
+# Check Cilium node-addresses — 10.255.255.254 should NOT be NodePort=true
+kubectl exec <cilium-pod> -- cilium-dbg shell -- db/show node-addresses
+
+# Check conntrack — reply dst should be the node IP, not 10.255.255.254
+conntrack -L -d <API_SERVER_IP> 2>/dev/null
+```
+
+**Fix:** Add `dnsTunneling=false` to `.wslconfig`:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=false
+```
+
+Then `wsl --shutdown` from PowerShell and restart.
 
 ### CNI pods fail: "not a shared or slave mount"
 

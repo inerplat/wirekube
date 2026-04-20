@@ -111,7 +111,6 @@ jobs:
             need-helm: false
           - cni-mode: calico
             need-helm: false
-            experimental: true
     name: e2e (${{ matrix.cni-mode }})
     steps:
       - name: Checkout
@@ -144,7 +143,6 @@ jobs:
         run: docker load -i /tmp/wirekube-ci.tar
 
       - name: Run e2e tests
-        continue-on-error: ${{ matrix.experimental || false }}
         run: |
           WIREKUBE_IMAGE=inerplat/wirekube:ci-${{ github.sha }} \
           WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \

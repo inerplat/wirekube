@@ -36,18 +36,20 @@ WireKube consists of four binaries:
 
 ### Agent (DaemonSet)
 
-The agent runs on every node labeled with `wirekube.io/vpn-enabled=true`.
-It is responsible for:
+The agent runs on every node labeled with `wirekube.io/vpn-enabled=true`
+(`hostNetwork: true`, `privileged: true`, `appArmorProfile: Unconfined` —
+required for TUN open on Ubuntu 24.04 + containerd ≥ 1.7). It is
+responsible for:
 
-1. **Interface management** — Creates and configures the WireGuard interface
-2. **Key management** — Generates and persists WireGuard key pairs
-3. **Peer registration** — Creates/updates its own WireKubePeer CRD
-4. **Peer synchronization** — Watches all WireKubePeer CRDs and configures WireGuard
-5. **Endpoint discovery** — Determines the best reachable address via STUN, annotations, etc.
-6. **NAT detection** — RFC 5780 multi-server STUN to identify Symmetric NAT
-7. **Relay client** — Connects to relay pool when direct P2P is impossible
-8. **Relay auto-reconnect** — Exponential backoff (1s–30s) on TCP connection drops
-9. **Direct path recovery** — Periodically probes relayed peers for direct upgrade
+1. **Userspace WireGuard** — Runs wireguard-go and owns a TUN named `wire_kube`. The kernel WireGuard backend has been removed; on upgrade from older versions the agent deletes any existing kernel `wire_kube` link and recreates it as a TUN.
+2. **Custom `WireKubeBind`** — Sits between wireguard-go and the network and runs the bimodal warm-relay datapath (see [NAT Traversal](nat-traversal.md)). Also sends and receives `MsgBimodalHint` disco frames via the relay for asymmetric-failover recovery.
+3. **Key management** — Generates and persists WireGuard key pairs
+4. **Peer registration** — Creates/updates its own WireKubePeer CRD (including mesh overlay IP from `meshCIDR` and, optionally, the node's private address via `autoAllowedIPs`)
+5. **Peer synchronization** — Watches all WireKubePeer CRDs and configures wireguard-go peers; the per-peer `PathMonitor` FSM commits `Direct/Warm/Relay` decisions into the Bind
+6. **Endpoint discovery** — Determines the best reachable address via STUN, annotations, etc.
+7. **NAT detection** — RFC 5780 multi-server STUN to classify `open` / `cone` / `port-restricted-cone` / `symmetric`
+8. **Relay client** — Connects to the relay pool and stays connected (relay is always warm, not just a fallback)
+9. **Relay auto-reconnect** — Exponential backoff (1s–30s) on TCP connection drops
 10. **Route management** — Adds `/32` routes for peer node IPs with metric 200
 11. **IPSec bypass** — Sets `disable_xfrm` and `disable_policy` on the WireGuard interface
 12. **Crash recovery** — initContainer cleans stale interfaces, routes, and ip rules
@@ -69,6 +71,12 @@ It is a stateless packet forwarder that:
 **WireKubeMesh** — Singleton resource defining mesh-wide configuration:
 
 - WireGuard listen port and interface name
+- `meshCIDR` — private CIDR for the overlay. Each node gets a
+  deterministic `/32` derived from its node name; that IP becomes the
+  peer's primary AllowedIPs entry.
+- `autoAllowedIPs.includeNodeInternalIP` — optional flag that also
+  publishes each node's **private** address (never public) alongside
+  the overlay IP for legacy references.
 - STUN server list (minimum 2 for NAT detection)
 - Relay configuration (mode, provider, endpoints, timeouts)
 
@@ -76,8 +84,11 @@ It is a stateless packet forwarder that:
 
 - WireGuard public key
 - Discovered endpoint (ip:port)
-- AllowedIPs (typically node IP `/32`)
-- Status: connected, transport mode (`direct`/`relay`/`mixed`), discovery method
+- AllowedIPs (typically the deterministic mesh IP `/32`, optionally
+  augmented with the node's private IP)
+- Status: connected, NAT type (`open`/`cone`/`port-restricted-cone`/
+  `symmetric`), transport mode (`direct`/`relay`/`mixed`), per-peer
+  `connections` map, discovery method
 
 **WireKubeGateway** — Virtual gateway for cross-VPC routing:
 

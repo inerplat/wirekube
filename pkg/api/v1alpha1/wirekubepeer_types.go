@@ -66,7 +66,9 @@ type PortPrediction struct {
 
 // WireKubePeerStatus defines the observed state of WireKubePeer
 type WireKubePeerStatus struct {
-	// Connected indicates whether this peer has an active WireGuard handshake.
+	// Connected indicates whether this peer currently has a usable transport
+	// path to all configured remote peers. The preferred path may be direct
+	// or relay; relay-backed connectivity still counts as connected.
 	Connected bool `json:"connected,omitempty"`
 
 	// LastHandshake is the timestamp of the most recent WireGuard handshake.
@@ -85,7 +87,11 @@ type WireKubePeerStatus struct {
 	EndpointDiscoveryMethod string `json:"endpointDiscoveryMethod,omitempty"`
 
 	// NATType indicates the NAT mapping behavior detected on this node via STUN.
+	// "open": no NAT — the STUN-mapped address is this node's own interface IP
+	//         (typical for cloud instances with a public IP on the NIC directly).
 	// "cone": Endpoint-Independent Mapping — stable mapped port, direct P2P capable.
+	// "port-restricted-cone": cone with port-restricted filtering, detected via
+	//                         a dual-probe from the relay's bound UDP port.
 	// "symmetric": Endpoint-Dependent Mapping — mapped port changes per destination.
 	// Empty string means NAT type was not determined (e.g., only one STUN server responded).
 	// +optional
@@ -115,6 +121,10 @@ type WireKubePeerStatus struct {
 	// Only set when TransportMode is "relay".
 	// +optional
 	RelayLatencyMs int32 `json:"relayLatencyMs,omitempty"`
+
+	// BindMode indicates which WireGuard engine this peer uses ("kernel" or "userspace").
+	// +optional
+	BindMode string `json:"bindMode,omitempty"`
 
 	// Conditions reflect the current state of the peer.
 	// +optional

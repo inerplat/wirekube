@@ -21,7 +21,14 @@ var defaultSTUNServers = []string{
 type NATType string
 
 const (
-	NATUnknown            NATType = ""
+	NATUnknown NATType = ""
+	// NATOpen marks a host that is not behind NAT at all — the STUN-mapped
+	// address matches one of the host's own interfaces, so the public
+	// endpoint IS the listen socket. This distinction matters because
+	// "open" peers can be reached directly without any traversal
+	// (no port-restriction check, no symmetric port prediction, and
+	// no relay fallback needs to be primed).
+	NATOpen               NATType = "open"
 	NATCone               NATType = "cone"
 	NATPortRestrictedCone NATType = "port-restricted-cone"
 	NATSymmetric          NATType = "symmetric"
@@ -74,6 +81,34 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+// isLocalInterfaceIP reports whether the given IP string is assigned to any
+// of the host's network interfaces. Used to distinguish an open host
+// (STUN reflects our own address) from a real cone NAT (STUN reflects a
+// different NAT-public address).
+func isLocalInterfaceIP(ip string) bool {
+	target := net.ParseIP(ip)
+	if target == nil {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var localIP net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			localIP = v.IP
+		case *net.IPAddr:
+			localIP = v.IP
+		}
+		if localIP != nil && localIP.Equal(target) {
+			return true
+		}
+	}
+	return false
 }
 
 // STUNResult holds the outcome of a STUN-based endpoint discovery,
@@ -166,9 +201,19 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 	}
 
 	if allSame {
+		// If the STUN-reflected IP matches one of our own interface IPs,
+		// the host has no NAT between it and the STUN server — the public
+		// endpoint is literally our own socket. Cloud instances with a
+		// public IP attached directly to the NIC (Oracle Cloud / NCloud
+		// etc.) land here, and mislabelling them as "cone" would trigger
+		// unnecessary port-restriction detection and relay warm-up.
+		nat := NATCone
+		if isLocalInterfaceIP(results[0].ip) {
+			nat = NATOpen
+		}
 		return &STUNResult{
 			Endpoint: results[0].endpoint,
-			NATType:  NATCone,
+			NATType:  nat,
 		}, nil
 	}
 

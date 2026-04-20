@@ -43,40 +43,33 @@ type WireKubeMeshSpec struct {
 	// +optional
 	NATTraversal *NATTraversalSpec `json:"natTraversal,omitempty"`
 
-	// AutoAllowedIPs configures automatic AllowedIPs detection for each node's own WireKubePeer.
-	// When enabled, the agent sets its own AllowedIPs from Node.Status.InternalIP if the field
-	// is currently empty. This simplifies initial node onboarding without manual kubectl patch.
+	// MeshCIDR is the private IP range used for mesh overlay addresses.
+	// Each node is automatically assigned a deterministic /32 address within this CIDR
+	// (derived from a hash of the node name), which becomes the sole AllowedIPs entry
+	// for that peer. This address is assigned to the WireGuard interface and is used
+	// for all intra-mesh traffic — completely independent of the node's physical IP.
+	// Recommended: "100.64.0.0/10" (CGNAT range, RFC 6598, ~4M addresses).
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$`
+	MeshCIDR string `json:"meshCIDR,omitempty"`
+
+	// AutoAllowedIPs adds node-derived entries to each peer's AllowedIPs in
+	// addition to the mesh overlay IP. This is useful when other services on
+	// the cluster still address peers by their physical node IP — without
+	// this, a peer only exposes its meshIP/32 and legacy references to the
+	// node-internal IP stop tunnelling.
 	// +optional
 	AutoAllowedIPs *AutoAllowedIPsSpec `json:"autoAllowedIPs,omitempty"`
-
-	// PodCIDRRouting enables automatic pod CIDR advertisement via AllowedIPs.
-	// When enabled, the agent appends Node.Spec.PodCIDR to its own AllowedIPs each sync cycle.
-	// Designed for hybrid environments where on-premises nodes use Cilium/Calico (which set
-	// Node.Spec.PodCIDR), enabling direct pod-to-pod routing across the mesh tunnel.
-	// +optional
-	PodCIDRRouting *PodCIDRRoutingSpec `json:"podCIDRRouting,omitempty"`
 }
 
-// AutoAllowedIPsSpec configures automatic AllowedIPs detection for the agent's own WireKubePeer.
+// AutoAllowedIPsSpec controls automatic AllowedIPs augmentation.
 type AutoAllowedIPsSpec struct {
-	// Strategy controls how the agent automatically sets AllowedIPs for its own WireKubePeer
-	// when the field is currently empty.
-	// "disabled" (default): AllowedIPs must be set manually by the user.
-	// "node-internal-ip": use Node.Status.InternalIP/32 (the node's primary cluster IP).
-	// +kubebuilder:default=disabled
-	// +kubebuilder:validation:Enum=disabled;node-internal-ip
-	// +optional
-	Strategy string `json:"strategy,omitempty"`
-}
-
-// PodCIDRRoutingSpec enables automatic pod CIDR advertisement via AllowedIPs.
-type PodCIDRRoutingSpec struct {
-	// Enabled controls whether the agent appends Node.Spec.PodCIDR to its own AllowedIPs.
-	// When true, pods on each node become directly reachable by other mesh nodes.
-	// Only effective when the node's CNI sets Node.Spec.PodCIDR (e.g. Cilium, Calico, Flannel).
-	// VPC CNI (EKS cloud nodes) typically does not set Node.Spec.PodCIDR and will be skipped.
+	// IncludeNodeInternalIP, when true, appends the node's InternalIP/32 to
+	// its WireKubePeer spec.allowedIPs (after any mesh IP). The InternalIP is
+	// read from corev1.Node.status.addresses. Leave other AllowedIPs entries
+	// (e.g. gateway-injected CIDRs) untouched.
 	// +kubebuilder:default=false
-	Enabled bool `json:"enabled"`
+	IncludeNodeInternalIP bool `json:"includeNodeInternalIP,omitempty"`
 }
 
 // NATTraversalSpec configures advanced NAT traversal strategies.

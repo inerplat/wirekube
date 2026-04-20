@@ -28,6 +28,11 @@ import (
 // proxy map instead.
 type DataHandler func(srcKey [relayproto.PubKeySize]byte, payload []byte)
 
+// HintHandler is called when a BimodalHint frame arrives from a sender key.
+// The handler should mark the sender peer to receive dual-leg sends for a
+// short trust window so asymmetric UDP blackholes recover immediately.
+type HintHandler func(srcKey [relayproto.PubKeySize]byte)
+
 type Client struct {
 	relayAddr string
 	myPubKey  [relayproto.PubKeySize]byte
@@ -39,6 +44,7 @@ type Client struct {
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
 	onData      DataHandler
+	onHint      HintHandler
 	connected   atomic.Bool
 	reconnectCh chan struct{} // signalled by readLoop on disconnect
 	cancel      context.CancelFunc
@@ -77,9 +83,19 @@ func (c *Client) Connect(ctx context.Context) error {
 	return err
 }
 
+const dialTimeout = 10 * time.Second
+
 // dial performs a single TCP connect + register handshake.
+// The TCP socket is marked with the WireKube fwmark (SO_MARK) so that
+// it bypasses the WireKube routing table and uses the main table.
+// Without this, relay TCP would be routed through the WG tunnel itself,
+// creating a circular dependency that kills relay connectivity.
 func (c *Client) dial(ctx context.Context) error {
-	conn, err := net.DialTimeout("tcp", c.relayAddr, 10*time.Second)
+	dialer := net.Dialer{
+		Timeout: dialTimeout,
+		Control: dialControl,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", c.relayAddr)
 	if err != nil {
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
@@ -149,7 +165,6 @@ func (c *Client) readLoop(ctx context.Context) {
 				log.Printf("relay-client: bad data frame: %v", err)
 				continue
 			}
-
 			if c.onData != nil {
 				c.onData(srcKey, payload)
 				continue
@@ -164,6 +179,16 @@ func (c *Client) readLoop(ctx context.Context) {
 			}
 
 			proxy.DeliverToWireGuard(payload)
+
+		case relayproto.MsgBimodalHint:
+			srcKey, err := relayproto.ParseBimodalHintFrame(frame.Body)
+			if err != nil {
+				log.Printf("relay-client: bad bimodal hint frame: %v", err)
+				continue
+			}
+			if c.onHint != nil {
+				c.onHint(srcKey)
+			}
 
 		case relayproto.MsgError:
 			log.Printf("relay-client: server error: %s", string(frame.Body))
@@ -275,6 +300,23 @@ func (c *Client) SendNATProbe(ip net.IP, port int) error {
 // SendToPeer sends a UDP payload to a remote peer through the relay.
 func (c *Client) SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte) error {
 	frame := relayproto.MakeDataFrame(destPubKey, payload)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writer == nil {
+		return fmt.Errorf("not connected")
+	}
+	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
+		return err
+	}
+	return c.writer.Flush()
+}
+
+// SendBimodalHint asks the relay to deliver a hint to destPubKey telling it
+// to dual-send subsequent packets on both direct and relay legs. Used when
+// the local receive watermark has stalled but send keeps succeeding, which
+// indicates an asymmetric UDP blackhole.
+func (c *Client) SendBimodalHint(destPubKey [relayproto.PubKeySize]byte) error {
+	frame := relayproto.MakeBimodalHintFrame(destPubKey)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.writer == nil {
