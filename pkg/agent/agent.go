@@ -197,69 +197,25 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	ticker := time.NewTicker(a.syncEvery)
 	defer ticker.Stop()
-	fastFailTicker := time.NewTicker(250 * time.Millisecond)
-	defer fastFailTicker.Stop()
+
+	// A legacy 250ms fastFailoverTick used to race with the sync loop and
+	// force Relay transitions whenever its own direct-traffic heuristic
+	// (handshake age + bytes delta) disagreed with PathMonitor's
+	// LastDirectReceive-based decision. Tailscale's magicsock keeps a
+	// single decision loop (heartbeat + trustBestAddrUntil) — WireKube now
+	// does the same: PathMonitor is the sole control-plane authority, the
+	// datapath trust window (bind.go) handles sub-second failover.
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-fastFailTicker.C:
-			if err := a.fastFailoverTick(ctx); err != nil {
-				a.log.Error(err, "fast failover tick error")
-			}
 		case <-ticker.C:
 			if err := a.sync(ctx); err != nil {
 				a.log.Error(err, "sync error")
 			}
 		}
 	}
-}
-
-func (a *Agent) fastFailoverTick(ctx context.Context) error {
-	if a.relayPool == nil || !a.relayPool.IsConnected() {
-		return nil
-	}
-
-	stats, err := a.wgMgr.GetStats()
-	if err != nil {
-		return nil
-	}
-	statsByKey := make(map[string]wireguard.PeerStats, len(stats))
-	for _, s := range stats {
-		statsByKey[s.PublicKeyB64] = s
-	}
-
-	peerList := &wirekubev1alpha1.WireKubePeerList{}
-	if err := a.client.List(ctx, peerList); err != nil {
-		return err
-	}
-
-	remotePeerNames := make([]string, 0, len(peerList.Items))
-	remotePeers := make(map[string]*wirekubev1alpha1.WireKubePeer, len(peerList.Items))
-	didFailover := false
-	for i := range peerList.Items {
-		p := &peerList.Items[i]
-		if p.Name == a.nodeName || p.Spec.PublicKey == "" {
-			continue
-		}
-		remotePeerNames = append(remotePeerNames, p.Name)
-		remotePeers[p.Name] = p
-		if !a.shouldFastFailToRelay(p, statsByKey) {
-			continue
-		}
-		a.log.Info("fast failover tick: direct traffic inactive, activating relay", "peer", p.Name)
-		a.revertToRelay(p)
-		a.deferDirectReprobe(p.Name, directFailoverProbeCooldown)
-		didFailover = true
-	}
-
-	if didFailover {
-		if err := a.updateOwnStatus(ctx, a.nodeName, remotePeerNames, remotePeers, statsByKey); err != nil {
-			a.log.Error(err, "fast failover status update failed")
-		}
-	}
-	return nil
 }
 
 // cleanup tears down all WireGuard kernel state and releases user-space
@@ -719,42 +675,22 @@ func (a *Agent) sync(ctx context.Context) error {
 			allRoutes = append(allRoutes, cidr)
 		}
 
-		// ForceEndpoint overrides WG's NAT-preservation logic (which would reuse
-		// the kernel's existing.Endpoint). We force in two cases:
-		//   1. Active ICE probe: ensure WG sends to the candidate endpoint.
-		//   2. ICE-connected but not relayed: after relay proxy closure the kernel
-		//      still holds the old proxy address (127.0.0.1:PORT) as existing.Endpoint.
-		//      Without forcing, SyncPeers reuses that dead address and WG keepalives
-		//      go to a closed socket, causing isDirectConnected to fail within 30s.
-		//
-		// Symmetric NAT exception: for symmetric peers, we only ForceEndpoint ONCE
-		// during the probe (to set the initial endpoint and open our NAT filter).
-		// After that first sync, ForceEndpoint is disabled so WG can learn the
-		// peer's actual NAT-mapped port from incoming packets. The CRD endpoint
-		// uses the STUN port (e.g. 51822), but symmetric NAT maps each destination
-		// to a DIFFERENT port. ForceEndpoint on every sync would overwrite the
-		// WG-learned port, breaking bidirectional connectivity.
+		// Symmetric peers must never be force-endpointed post-probe: the
+		// NAT-mapped source port drifts and writing a stale value clobbers
+		// wireguard-go's roamed endpoint.
 		iceStateNow := a.getICEState(p.Name)
 		peerIsSymmetric := p.Status.NATType == "symmetric"
 		forceForProbe := a.directProbing[p.Name] && (!peerIsSymmetric || !a.probeForced[p.Name])
 		if forceForProbe && peerIsSymmetric {
 			a.probeForced[p.Name] = true
 		}
-		// Force the endpoint when:
-		//   1. Active probe: ensure WG sends to the candidate endpoint.
-		//   2. Connected non-symmetric peer: prevent WG from keeping stale relay address.
-		//   3. Connected symmetric peer WITH a discovered endpoint: use the actual
-		//      NAT-mapped port instead of the wrong CRD port.
-		hasDiscoveredEp := peerIsSymmetric && a.directEndpoints[p.Name] != "" &&
-			!isLocalhostEndpoint(a.directEndpoints[p.Name])
 		forceEp := forceForProbe ||
-			(iceStateNow.State == iceStateConnected && !a.relayedPeers[p.Name] &&
-				(!peerIsSymmetric || hasDiscoveredEp))
+			(iceStateNow.State == iceStateConnected && !a.relayedPeers[p.Name] && !peerIsSymmetric)
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
 			Endpoint:         endpoint,
 			AllowedIPs:       filteredAllowedIPs,
-			KeepaliveSeconds: int(p.Spec.PersistentKeepalive),
+			KeepaliveSeconds: a.keepaliveForPeer(p),
 			ForceEndpoint:    forceEp,
 		})
 	}
@@ -1179,6 +1115,17 @@ func (a *Agent) driveTransportMode(
 		}
 		if err := a.wgMgr.SetPeerPath(peer.Spec.PublicKey, mode.toWireguardPathMode(), directAddr); err != nil {
 			a.log.Error(err, "SetPeerPath failed", "peer", name, "mode", mode)
+		}
+		// Mirror PathMonitor into the legacy relayedPeers map so any path
+		// still reading that map (preferredTransportForPeer, forceEndpoint
+		// decisions, restart-recovery checks) observes the same decision
+		// PathMonitor made. ICE paths still write relayedPeers directly,
+		// but this assignment happens at the end of every sync tick and
+		// therefore wins, collapsing the old racing-writers problem.
+		if mode == PathModeRelay {
+			a.relayedPeers[name] = true
+		} else {
+			delete(a.relayedPeers, name)
 		}
 	}
 	// Forget state for peers that disappeared.
@@ -1779,6 +1726,24 @@ func (a *Agent) findPeerNameByKey(pubKeyB64 string) string {
 		}
 	}
 	return ""
+}
+
+// keepaliveForPeer honours the peer CR's PersistentKeepalive, but shortens
+// to 10s when THIS node sits behind a symmetric or port-restricted-cone
+// NAT. Measured NCloud shared-NAT TTL sits below the default 25s: a ping
+// started while the pinhole is closed loses ~10 packets before the next
+// keepalive re-opens it. Tailscale can keep a fixed interval because it
+// targets typical home/office NATs with longer TTL — this override is
+// WireKube's concession to shared-CGNAT-grade deployments.
+func (a *Agent) keepaliveForPeer(p *wirekubev1alpha1.WireKubePeer) int {
+	ka := int(p.Spec.PersistentKeepalive)
+	switch a.detectedNATType {
+	case string(nat.NATSymmetric), string(nat.NATPortRestrictedCone):
+		if ka == 0 || ka > 10 {
+			ka = 10
+		}
+	}
+	return ka
 }
 
 // nodeInternalIP returns the first InternalIP from the node's status addresses.
