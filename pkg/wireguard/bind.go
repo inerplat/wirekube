@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -52,6 +53,15 @@ const bimodalHintWindowNs = int64(10 * time.Second)
 // reconnect jitter without flooding the control channel.
 const bimodalHintSendIntervalNs = int64(250 * time.Millisecond)
 
+const sendDiagLogIntervalNs = int64(1 * time.Second)
+
+var bindDebug = os.Getenv("WIREKUBE_BIND_DEBUG") == "1"
+
+var (
+	lastLogNoPeerNs             atomic.Int64
+	lastLogDirectStaleNoRelayNs atomic.Int64
+)
+
 // PathHealth tracks observed health metrics for a single path (direct or relay).
 // All fields are lock-free atomics to allow concurrent reads from Send/Receive.
 //
@@ -88,16 +98,16 @@ type PeerPath struct {
 	RelayHealth  PathHealth   // observed health of the relay TCP path
 	Mode         atomic.Int32 // one of PathModeDirect | PathModeWarm | PathModeRelay
 
-	// hintedUntilNs, when set to a future unix-nano, forces Send to dual-path
-	// this peer's packets regardless of Mode. Set on inbound BimodalHint
-	// reception; cleared by time. Lets the remote side pull us into bimodal
-	// mode when it observes an asymmetric blackhole that we cannot detect
-	// locally (our direct receive watermark is still fresh).
-	hintedUntilNs atomic.Int64
+	// learnedAddrMu serializes updates to learnedAddr and the corresponding
+	// addrToPeer entry so the reverse map cannot leak stale keys.
+	learnedAddrMu sync.Mutex
+	// learnedAddr is the NAT-mapped source we have observed for this peer
+	// (updated on direct UDP receive and from UAPI stats). DirectAddr stays
+	// the SetPeerPath-supplied bootstrap value; for symmetric peers the two
+	// diverge as the NAT port drifts.
+	learnedAddr netip.AddrPort
 
-	// lastHintSentNs rate-limits outbound hints this node sends about this
-	// peer. Send updates it when firing a hint so a sustained stall does not
-	// flood the relay control channel.
+	hintedUntilNs  atomic.Int64
 	lastHintSentNs atomic.Int64
 }
 
@@ -206,8 +216,9 @@ func (b *WireKubeBind) makeReceiveFunc(udpConn *net.UDPConn) conn.ReceiveFunc {
 		// this is the loudest line in the agent log and has no operational
 		// value (LastSeen watermark is observable via Prometheus). Only
 		// flag unmatched control frames, which is genuinely abnormal.
-		if _, path, ok := b.lookupPeerByDirectAddr(addr); ok {
+		if pubKey, path, ok := b.lookupPeerByDirectAddr(addr); ok {
 			path.DirectHealth.LastSeen.Store(time.Now().UnixNano())
+			b.updateLearnedAddr(path, pubKey, addr)
 		} else if isWireGuardControlPacket(packets[0][:n]) {
 			log.Printf("[bind] direct receive unmatched control src=%s len=%d", addr.String(), n)
 		}
@@ -375,6 +386,15 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 	}
 
+	if bindDebug && pp == nil {
+		nowNsLog := time.Now().UnixNano()
+		last := lastLogNoPeerNs.Load()
+		if nowNsLog-last > sendDiagLogIntervalNs &&
+			lastLogNoPeerNs.CompareAndSwap(last, nowNsLog) {
+			log.Printf("[bind] debug send no-peer dst=%s", wkep.dst.String())
+		}
+	}
+
 	// Decide which legs to send on.
 	sendDirect := mode == PathModeDirect || mode == PathModeWarm
 	sendRelay := mode == PathModeRelay || mode == PathModeWarm
@@ -403,6 +423,15 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			if mode == PathModeDirect {
 				sendRelay = true
 			}
+		}
+	}
+
+	if bindDebug && directStale && !(relay != nil && hasPeerKey) {
+		last := lastLogDirectStaleNoRelayNs.Load()
+		if nowNs-last > sendDiagLogIntervalNs &&
+			lastLogDirectStaleNoRelayNs.CompareAndSwap(last, nowNs) {
+			log.Printf("[bind] debug direct-stale no-relay dst=%s hasPeerKey=%v relayNil=%v",
+				wkep.dst.String(), hasPeerKey, relay == nil)
 		}
 	}
 
@@ -508,6 +537,33 @@ func (b *WireKubeBind) BatchSize() int {
 	return 1
 }
 
+// LearnedAddr returns the most recently observed source address for this peer,
+// or the zero value if nothing has been learned yet.
+func (pp *PeerPath) LearnedAddr() netip.AddrPort {
+	pp.learnedAddrMu.Lock()
+	defer pp.learnedAddrMu.Unlock()
+	return pp.learnedAddr
+}
+
+// updateLearnedAddr records a NAT-mapped source address and atomically rewires
+// the bind's addrToPeer reverse map so stale entries cannot accumulate as the
+// peer's source port drifts.
+func (b *WireKubeBind) updateLearnedAddr(pp *PeerPath, pubKeyB64 string, newAddr netip.AddrPort) {
+	if !newAddr.IsValid() {
+		return
+	}
+	pp.learnedAddrMu.Lock()
+	defer pp.learnedAddrMu.Unlock()
+	if pp.learnedAddr == newAddr {
+		return
+	}
+	if pp.learnedAddr.IsValid() {
+		b.addrToPeer.Delete(pp.learnedAddr.String())
+	}
+	pp.learnedAddr = newAddr
+	b.addrToPeer.Store(newAddr.String(), pubKeyB64)
+}
+
 // SetPeerPath updates the path table entry for a peer identified by its base64
 // public key. Also maintains the addrToPeer reverse map used by Send().
 func (b *WireKubeBind) SetPeerPath(pubKeyB64 string, mode int32, directAddr netip.AddrPort) {
@@ -582,8 +638,13 @@ func (b *WireKubeBind) DeliverRelayPacket(pkt RelayPacket) {
 }
 
 // makeRelayReceiveFunc creates a ReceiveFunc that reads packets from the relay
-// channel. wireguard-go identifies peers by public key in the WireGuard crypto
-// header, not by source endpoint, so we use a synthetic loopback endpoint.
+// channel. wireguard-go roams peer endpoints to whatever address we surface on
+// receive, so we must hand it the best-known direct address: the peer's
+// NAT-mapped source learned from direct UDP traffic (LearnedAddr) takes
+// priority over the CR-supplied DirectAddr, which for symmetric-NAT peers is
+// only a placeholder and would clobber the roamed port. Fall back to a
+// loopback synthetic when nothing has been learned yet; Send detects the zero
+// port and routes via relay.
 func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		select {
@@ -591,11 +652,20 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 			n := copy(packets[0], pkt.Payload)
 			sizes[0] = n
 			pubKeyB64 := base64.StdEncoding.EncodeToString(pkt.SrcKey[:])
+			var dst netip.AddrPort
 			if pp := b.GetPeerPath(pubKeyB64); pp != nil {
 				pp.RelayHealth.LastSeen.Store(time.Now().UnixNano())
+				if learned := pp.LearnedAddr(); learned.IsValid() {
+					dst = learned
+				} else if pp.DirectAddr.IsValid() {
+					dst = pp.DirectAddr
+				}
+			}
+			if !dst.IsValid() {
+				dst = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
 			}
 			eps[0] = &WireKubeEndpoint{
-				dst:     netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0),
+				dst:     dst,
 				peerKey: pkt.SrcKey,
 			}
 			return 1, nil

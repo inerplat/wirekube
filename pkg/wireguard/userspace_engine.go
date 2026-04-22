@@ -232,6 +232,10 @@ func (u *UserspaceEngine) SyncPeers(peers []PeerConfig) error {
 	if err != nil {
 		return err
 	}
+	currentHex := make(map[string]bool, len(currentKeys))
+	for _, k := range currentKeys {
+		currentHex[k] = true
+	}
 
 	desiredKeys := make(map[string]struct{}, len(peers))
 	var conf strings.Builder
@@ -239,17 +243,14 @@ func (u *UserspaceEngine) SyncPeers(peers []PeerConfig) error {
 	for _, p := range peers {
 		pubHex := keyToHex(p.PublicKeyB64)
 		desiredKeys[pubHex] = struct{}{}
+		isNew := !currentHex[pubHex]
 
 		fmt.Fprintf(&conf, "public_key=%s\n", pubHex)
-		if p.Endpoint != "" {
+		// Preserve wireguard-go's roamed endpoint on established peers; only
+		// write endpoint= on initial registration or explicit force.
+		if p.Endpoint != "" && (isNew || p.ForceEndpoint) {
 			fmt.Fprintf(&conf, "endpoint=%s\n", p.Endpoint)
 
-			// Register peer endpoint in the Bind's addrToPeer map so that
-			// Send() can look up the peer key and route via the correct path.
-			// New peers start in Relay mode when relay is connected — safer
-			// default since direct may not work (VPC isolation, NAT). ICE will
-			// upgrade to Direct after successful probing.
-			// Existing peers keep their ICE-managed mode.
 			if u.bind != nil {
 				if addr, err := netip.ParseAddrPort(p.Endpoint); err == nil {
 					existing := u.bind.GetPeerPath(p.PublicKeyB64)
@@ -321,7 +322,30 @@ func (u *UserspaceEngine) GetStats() ([]PeerStats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("UAPI get: %w", err)
 	}
-	return parseUAPIStats(output)
+	stats, err := parseUAPIStats(output)
+	if err != nil {
+		return nil, err
+	}
+	// Feed wireguard-go's roamed endpoints into the bind so addrToPeer
+	// disambiguates same-NAT peers and stale source-port entries are purged
+	// as the NAT mapping drifts.
+	if u.bind != nil {
+		for _, s := range stats {
+			if s.ActualEndpoint == "" || s.PublicKeyB64 == "" {
+				continue
+			}
+			addr, err := netip.ParseAddrPort(s.ActualEndpoint)
+			if err != nil {
+				continue
+			}
+			pp := u.bind.GetPeerPath(s.PublicKeyB64)
+			if pp == nil {
+				continue
+			}
+			u.bind.updateLearnedAddr(pp, s.PublicKeyB64, addr)
+		}
+	}
+	return stats, nil
 }
 
 // SetAddress assigns the mesh IP to the TUN device.

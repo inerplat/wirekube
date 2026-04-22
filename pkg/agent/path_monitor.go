@@ -127,13 +127,21 @@ type pathEntry struct {
 // zero-valued field, so the caller can set just what it wants to override.
 type PathMonitorConfig struct {
 	// WarmStall is how long the direct receive watermark is allowed to go
-	// without updating before Direct is demoted to Warm. Default: 3s.
+	// without updating before Direct is demoted to Warm. Default: 30s.
+	// Must exceed WireGuard's persistentKeepalive (25s) so an idle peer
+	// whose only traffic is the periodic keepalive doesn't oscillate
+	// between Direct and Warm every 25-second cycle. The datapath's
+	// directTrustWindow (3s, in bind.go) governs actual failover
+	// latency independently of this value.
 	WarmStall time.Duration
 	// RelayStall is the additional time the entry can stay in Warm without
 	// any direct receive before being demoted to Relay. Default: 30s.
 	RelayStall time.Duration
 	// PromoteAge is the maximum age of a direct receive watermark for it
-	// to count as "fresh evidence" when considering Warm → Direct. Default: 1.5s.
+	// to count as "fresh evidence" when considering Warm → Direct.
+	// Default: 30s. Lined up with WireGuard keepalive so a single
+	// keepalive arrival during the Warm probe window is enough to
+	// promote, instead of requiring a burst within 1.5s.
 	PromoteAge time.Duration
 	// RelayRetry is the minimum wallclock gap between successive
 	// Relay → Warm opportunistic probes. Default: 30s.
@@ -145,13 +153,13 @@ type PathMonitorConfig struct {
 // unit tests can drive the FSM deterministically; pass time.Now in prod.
 func NewPathMonitor(log logr.Logger, rx directReceiver, cfg PathMonitorConfig, now func() time.Time) *PathMonitor {
 	if cfg.WarmStall == 0 {
-		cfg.WarmStall = 3 * time.Second
+		cfg.WarmStall = 30 * time.Second
 	}
 	if cfg.RelayStall == 0 {
-		cfg.RelayStall = 30 * time.Second
+		cfg.RelayStall = 60 * time.Second
 	}
 	if cfg.PromoteAge == 0 {
-		cfg.PromoteAge = 1500 * time.Millisecond
+		cfg.PromoteAge = 30 * time.Second
 	}
 	if cfg.RelayRetry == 0 {
 		cfg.RelayRetry = 30 * time.Second
