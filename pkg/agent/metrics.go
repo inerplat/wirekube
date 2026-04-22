@@ -136,7 +136,13 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			}
 		}
 
-		isRelayed := a.preferredTransportForPeer(p.Name) == "relay"
+		// Align the metric with WireKubePeer.status.connections: PathMonitor
+		// is the single source of truth for transport mode. The legacy
+		// relayedPeers map stays populated by ICE for its own bookkeeping
+		// but can lag behind the datapath by many seconds, which made the
+		// Grafana dashboard show Relay while the bind was actually sending
+		// direct (or bimodal Warm, which also counts as "direct").
+		isRelayed := a.publishedTransportForPeer(p, nil) == "relay"
 		connected := float64(0)
 		if a.peerTransportUsable(p, wgStatsByKey) {
 			connected = 1
