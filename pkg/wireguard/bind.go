@@ -48,10 +48,10 @@ const directTrustWindowNs = int64(3 * time.Second)
 const bimodalHintWindowNs = int64(10 * time.Second)
 
 // bimodalHintSendIntervalNs rate-limits outbound hints to at most one per
-// interval per peer. Short enough that a lost hint is retried several times
-// within the trust window (3s / 250ms = 12 attempts), tolerant of TCP relay
-// reconnect jitter without flooding the control channel.
-const bimodalHintSendIntervalNs = int64(250 * time.Millisecond)
+// interval per peer. The relay is TCP and the receiver arms a 10s window, so
+// second-scale retries are enough to survive transient reconnect jitter without
+// turning a persistent direct-path stall into control-plane log noise.
+const bimodalHintSendIntervalNs = int64(2 * time.Second)
 
 const sendDiagLogIntervalNs = int64(1 * time.Second)
 
@@ -614,9 +614,13 @@ func (b *WireKubeBind) MarkBimodalHint(srcPubKey [32]byte) {
 		actual, _ := b.pathTable.LoadOrStore(pubKeyB64, pp)
 		pp = actual.(*PeerPath)
 	}
-	pp.hintedUntilNs.Store(time.Now().UnixNano() + bimodalHintWindowNs)
-	log.Printf("[bind] bimodal hint received peer=%s window=%s",
-		shortKey(pubKeyB64), time.Duration(bimodalHintWindowNs))
+	nowNs := time.Now().UnixNano()
+	prevUntil := pp.hintedUntilNs.Load()
+	pp.hintedUntilNs.Store(nowNs + bimodalHintWindowNs)
+	if prevUntil <= nowNs {
+		log.Printf("[bind] bimodal hint received peer=%s window=%s",
+			shortKey(pubKeyB64), time.Duration(bimodalHintWindowNs))
+	}
 }
 
 // DeliverRelayPacket pushes a packet received from the relay network into the
