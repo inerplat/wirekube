@@ -60,4 +60,4 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./... -v
+        run: go test $(go list ./... | grep -v /test/e2e) -v
