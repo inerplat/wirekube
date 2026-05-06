@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
@@ -88,13 +89,36 @@ func main() {
 	}
 
 	// Read WireKubeMesh CR for settings (apiServerURL, interfaceName, listenPort, mtu).
-	// On failure (e.g. CNI not ready, API unreachable) we proceed with defaults;
-	// the agent's setup retry loop will re-read mesh config once available.
+	// CNI may not be ready yet at startup (e.g. Cilium initializing); the API
+	// server is unreachable until then. We MUST block here until mesh is read,
+	// because listenPort committed below is used for the lifetime of the
+	// wireguard-go interface — falling back to the default after a CRD-read
+	// timeout produces a port mismatch with the rest of the cluster (other
+	// agents discover the port from the CRD too) and the resulting agent has
+	// no way to receive direct UDP. Better to crashloop until CNI is ready.
 	var mesh *wirekubev1alpha1.WireKubeMesh
 	meshList := &wirekubev1alpha1.WireKubeMeshList{}
-	if listErr := k8sClient.List(context.Background(), meshList); listErr != nil {
-		log.Info("WireKubeMesh read failed (will retry in agent loop)", "error", listErr)
-	} else if len(meshList.Items) > 0 {
+	{
+		const maxAttempts = 60 // ~10 minutes at 10s backoff
+		backoff := 2 * time.Second
+		var listErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			listErr = k8sClient.List(context.Background(), meshList)
+			if listErr == nil {
+				break
+			}
+			log.Info("WireKubeMesh read failed, retrying", "attempt", attempt, "backoff", backoff, "error", listErr)
+			time.Sleep(backoff)
+			if backoff < 10*time.Second {
+				backoff += 2 * time.Second
+			}
+		}
+		if listErr != nil {
+			log.Error(listErr, "WireKubeMesh unreadable after retries; cannot determine listen port — exiting")
+			os.Exit(1)
+		}
+	}
+	if len(meshList.Items) > 0 {
 		mesh = &meshList.Items[0]
 
 		if apiServer == "" && mesh.Spec.APIServerURL != "" {
