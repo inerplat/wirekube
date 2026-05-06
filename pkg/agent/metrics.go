@@ -55,7 +55,7 @@ var (
 	nodeNATType = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "node_nat_type",
-		Help:      "NAT type detected for this node (1=cone, 2=symmetric, 3=port-restricted-cone, 0=unknown).",
+		Help:      "NAT type detected for this node (1=cone, 2=symmetric, 3=port-restricted-cone, 4=open, 0=unknown).",
 	}, []string{"node"})
 
 	peerCount = promauto.NewGauge(prometheus.GaugeOpts{
@@ -121,6 +121,8 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 				natVal = 2
 			case "port-restricted-cone":
 				natVal = 3
+			case "open":
+				natVal = 4
 			}
 			nodeNATType.WithLabelValues(me).Set(natVal)
 			continue
