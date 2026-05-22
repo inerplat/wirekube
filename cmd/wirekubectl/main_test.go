@@ -9,10 +9,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	"github.com/wirekube/wirekube/pkg/externalpeer"
 )
 
 func TestRenderConfIncludesExternalPeerMTU(t *testing.T) {
-	conf := renderConf("private", &wirekubev1alpha1.WireKubeExternalPeer{
+	conf := externalpeer.RenderConfig("private", &wirekubev1alpha1.WireKubeExternalPeer{
 		Status: wirekubev1alpha1.WireKubeExternalPeerStatus{
 			AssignedMeshIP:      "100.102.23.169/32",
 			IngressPublicKey:    "ingress",
@@ -26,7 +27,7 @@ func TestRenderConfIncludesExternalPeerMTU(t *testing.T) {
 }
 
 func TestRenderConfUsesStatusMTU(t *testing.T) {
-	conf := renderConf("private", &wirekubev1alpha1.WireKubeExternalPeer{
+	conf := externalpeer.RenderConfig("private", &wirekubev1alpha1.WireKubeExternalPeer{
 		Spec: wirekubev1alpha1.WireKubeExternalPeerSpec{
 			MTU: 1200,
 		},
@@ -86,8 +87,8 @@ func TestWriteExternalPeerTable(t *testing.T) {
 }
 
 func TestExternalPeerMTUFallsBackToDefault(t *testing.T) {
-	got := externalPeerMTU(&wirekubev1alpha1.WireKubeExternalPeer{})
+	got := externalpeer.EffectiveMTU(&wirekubev1alpha1.WireKubeExternalPeer{})
 	if got != wirekubev1alpha1.DefaultExternalPeerMTU {
-		t.Fatalf("externalPeerMTU = %d, want %d", got, wirekubev1alpha1.DefaultExternalPeerMTU)
+		t.Fatalf("EffectiveMTU = %d, want %d", got, wirekubev1alpha1.DefaultExternalPeerMTU)
 	}
 }

@@ -1,10 +1,9 @@
 ---
 # wirekube-relay ServiceAccount + RBAC
 #
-# The relay process itself needs no Kubernetes permissions. This ServiceAccount
-# exists only so optional `kubectl exec deploy/wirekube-relay -- wirekubectl ...`
-# read-only commands can inspect mesh and peer state. Mutating external-peer
-# commands should run from an admin context or the agent ServiceAccount.
+# The relay process itself needs no Kubernetes permissions. The admin-web
+# sidecar uses this ServiceAccount to list, issue, and delete
+# WireKubeExternalPeer resources from a localhost-only web UI.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -26,6 +25,8 @@ rules:
   - get
   - list
   - watch
+  - create
+  - delete
 - apiGroups:
   - wirekube.io
   resources:
@@ -102,6 +103,22 @@ spec:
             limits:
               cpu: 500m
               memory: 128Mi
+        - name: admin-web
+          image: inerplat/wirekube:v0.0.0-dev.14
+          command: ["wirekube-admin-web"]
+          args:
+            - --addr=127.0.0.1:8080
+          ports:
+            - name: admin-web
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 96Mi
 ---
 apiVersion: v1
 kind: Service
