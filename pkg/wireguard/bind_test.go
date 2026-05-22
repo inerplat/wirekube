@@ -18,6 +18,7 @@ import (
 type mockRelayTransport struct {
 	mu        sync.Mutex
 	sent      []mockRelayCall
+	external  []mockExternalRelayCall
 	hints     [][32]byte
 	connected bool
 }
@@ -27,10 +28,23 @@ type mockRelayCall struct {
 	payload []byte
 }
 
+type mockExternalRelayCall struct {
+	relayAddr string
+	token     uint64
+	payload   []byte
+}
+
 func (m *mockRelayTransport) SendToPeer(dest [32]byte, payload []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sent = append(m.sent, mockRelayCall{dest, append([]byte(nil), payload...)})
+	return nil
+}
+
+func (m *mockRelayTransport) SendToExternal(relayAddr string, token uint64, payload []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.external = append(m.external, mockExternalRelayCall{relayAddr, token, append([]byte(nil), payload...)})
 	return nil
 }
 
@@ -75,6 +89,60 @@ func TestBindOpenWithRelay(t *testing.T) {
 	}
 
 	b.Close()
+}
+
+func TestBindExternalSourceRelayRoundTrip(t *testing.T) {
+	b := NewWireKubeBind()
+	relay := &mockRelayTransport{connected: true}
+	b.SetRelayTransport(relay)
+
+	fns, _, err := b.Open(0)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer b.Close()
+	if len(fns) != 2 {
+		t.Fatalf("Open() returned %d ReceiveFuncs, want 2", len(fns))
+	}
+
+	b.DeliverRelayPacket(RelayPacket{
+		ExternalSource: ExternalSource{
+			Valid:     true,
+			RelayAddr: "10.0.0.10:3478",
+			Token:     42,
+			Addr:      "203.0.113.20:51820",
+		},
+		Payload: []byte("external-handshake"),
+	})
+
+	packets := [][]byte{make([]byte, 1500)}
+	sizes := []int{0}
+	eps := []conn.Endpoint{nil}
+	n, err := fns[1](packets, sizes, eps)
+	if err != nil {
+		t.Fatalf("relay ReceiveFunc: %v", err)
+	}
+	if n != 1 || string(packets[0][:sizes[0]]) != "external-handshake" {
+		t.Fatalf("received n=%d payload=%q", n, string(packets[0][:sizes[0]]))
+	}
+	if eps[0].DstToString() != "203.0.113.20:51820" {
+		t.Fatalf("endpoint DstToString = %q", eps[0].DstToString())
+	}
+
+	if err := b.Send([][]byte{[]byte("handshake-response")}, eps[0]); err != nil {
+		t.Fatalf("Send external response: %v", err)
+	}
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	if len(relay.external) != 1 {
+		t.Fatalf("external sends = %d, want 1", len(relay.external))
+	}
+	if relay.external[0].relayAddr != "10.0.0.10:3478" || relay.external[0].token != 42 {
+		t.Fatalf("external send target = %+v", relay.external[0])
+	}
+	if string(relay.external[0].payload) != "handshake-response" {
+		t.Fatalf("external send payload = %q", string(relay.external[0].payload))
+	}
 }
 
 func TestBindParseEndpoint(t *testing.T) {

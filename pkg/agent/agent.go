@@ -19,6 +19,7 @@ import (
 	"github.com/wirekube/wirekube/pkg/agent/nat"
 	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	"github.com/wirekube/wirekube/pkg/meship"
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 )
@@ -108,6 +109,13 @@ type Agent struct {
 	// feeds Status.Connections. The legacy relayedPeers/directProbing maps
 	// are compatibility shims during the transition and will be removed.
 	pathMonitor *PathMonitor
+	// peerMetricLabels remembers which peer names this agent has emitted
+	// Prometheus samples for. Every sync pass diffs the current peer list
+	// against this set and calls DeletePartialMatch on the per-peer
+	// GaugeVecs for every name that has since disappeared, so /metrics
+	// stops advertising vanished peers within one sync interval instead
+	// of leaking labels for the lifetime of the process.
+	peerMetricLabels map[string]struct{}
 }
 
 type peerTrafficSnapshot struct {
@@ -148,6 +156,7 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		relayPrewarmed:       make(map[string]bool),
 		probeForced:          make(map[string]bool),
 		peerTrafficSnapshots: make(map[string]peerTrafficSnapshot),
+		peerMetricLabels:     make(map[string]struct{}),
 	}
 	a.pathMonitor = NewPathMonitor(log.WithName("path"), wgMgr, PathMonitorConfig{}, time.Now)
 	return a
@@ -421,8 +430,9 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
-					"wirekube.io/node": a.nodeName,
+					agentManagedPeerLabel: a.nodeName,
 				},
+				OwnerReferences: nodeOwnerReferences(node),
 			},
 			Spec: wirekubev1alpha1.WireKubePeerSpec{
 				PublicKey:           pubKey,
@@ -451,6 +461,11 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if endpoint != "" {
 		existing.Spec.Endpoint = endpoint
 	}
+	// Backfill ownerReference for CRs created before this fix existed, so K8s
+	// GC cascade-deletes them the moment the underlying Node is removed.
+	if !hasNodeOwnerReference(existing.OwnerReferences, node) {
+		existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
+	}
 	applyMeshIP(a.log, mesh, name, &existing.Spec)
 	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
@@ -464,6 +479,40 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	return nil
 }
 
+// nodeOwnerReferences builds the OwnerReference slice that ties a
+// WireKubePeer to its underlying K8s Node. K8s garbage collection
+// cascade-deletes the peer the moment the owning Node is removed, so
+// stale CRs never accumulate. Controller=false because the agent itself
+// is the active reconciler — Node is only the lifecycle parent.
+// BlockOwnerDeletion=false so the user can always remove a node without
+// being held up by a peer CR.
+func nodeOwnerReferences(node *corev1.Node) []metav1.OwnerReference {
+	if node == nil || node.UID == "" {
+		return nil
+	}
+	return []metav1.OwnerReference{{
+		APIVersion: "v1",
+		Kind:       "Node",
+		Name:       node.Name,
+		UID:        node.UID,
+	}}
+}
+
+// hasNodeOwnerReference reports whether the OwnerReference slice already
+// contains a Node owner that matches the given node. Used by upsertOwnPeer
+// to avoid duplicating the ownerRef when backfilling pre-existing CRs.
+func hasNodeOwnerReference(refs []metav1.OwnerReference, node *corev1.Node) bool {
+	if node == nil {
+		return false
+	}
+	for _, r := range refs {
+		if r.Kind == "Node" && r.UID == node.UID {
+			return true
+		}
+	}
+	return false
+}
+
 // applyMeshIP ensures the deterministic mesh IP is the first entry in AllowedIPs.
 // If meshCIDR is not configured, AllowedIPs is left unchanged so that manually
 // configured peers continue to work. Gateway-injected CIDRs beyond the mesh IP
@@ -472,7 +521,7 @@ func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName 
 	if mesh == nil || mesh.Spec.MeshCIDR == "" {
 		return
 	}
-	meshIP, err := meshIPForNode(peerName, mesh.Spec.MeshCIDR)
+	meshIP, err := meship.IPForName(peerName, mesh.Spec.MeshCIDR)
 	if err != nil {
 		log.Error(err, "computing mesh IP", "peer", peerName, "meshCIDR", mesh.Spec.MeshCIDR)
 		return
@@ -517,49 +566,13 @@ func applyNodeInternalIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, n
 	log.V(1).Info("autoAllowedIPs: appended node internal IP", "peer", node.Name, "entry", entry)
 }
 
-// meshIPForNode deterministically derives a /32 overlay IP within meshCIDR for the
-// given node name using a 32-bit FNV hash. The result is stable across restarts and
-// requires no central allocator. Collision probability is negligible for clusters
-// smaller than sqrt(CIDR size) ≈ 2048 nodes for a /10 CIDR.
-func meshIPForNode(nodeName, meshCIDR string) (string, error) {
-	_, ipnet, err := net.ParseCIDR(meshCIDR)
-	if err != nil {
-		return "", fmt.Errorf("invalid meshCIDR %q: %w", meshCIDR, err)
+func containsString(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
 	}
-	base := ipnet.IP.To4()
-	if base == nil {
-		return "", fmt.Errorf("meshCIDR must be an IPv4 CIDR")
-	}
-	ones, bits := ipnet.Mask.Size()
-	size := uint32(1) << uint(bits-ones)
-	if size < 4 {
-		return "", fmt.Errorf("meshCIDR too small (need at least /30)")
-	}
-
-	// FNV-1a hash of node name for uniform distribution.
-	h := fnv32a(nodeName)
-	// Usable range: skip network (.0) and broadcast (.size-1).
-	// offset ∈ [1, size-2].
-	offset := (h%(size-2) + 1)
-
-	baseInt := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
-	ipInt := baseInt + offset
-	ip := net.IP{byte(ipInt >> 24), byte(ipInt >> 16), byte(ipInt >> 8), byte(ipInt)}
-	return ip.String() + "/32", nil
-}
-
-// fnv32a is an inline FNV-1a 32-bit hash to avoid importing hash/fnv.
-func fnv32a(s string) uint32 {
-	const (
-		offset32 = 2166136261
-		prime32  = 16777619
-	)
-	h := uint32(offset32)
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= prime32
-	}
-	return h
+	return false
 }
 
 func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) error {
@@ -640,6 +653,23 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	remotePeerNames := []string{}
 	remotePeers := make(map[string]*wirekubev1alpha1.WireKubePeer, len(peerList.Items))
+	externalList := &wirekubev1alpha1.WireKubeExternalPeerList{}
+	externalByIngress := map[string][]string{}
+	if err := a.client.List(ctx, externalList); err != nil {
+		a.log.Error(err, "list WireKubeExternalPeer; skipping external peer sync")
+		externalList = nil
+	} else {
+		for i := range externalList.Items {
+			ep := &externalList.Items[i]
+			if ep.Status.Phase != wirekubev1alpha1.ExternalPeerPhaseActive {
+				continue
+			}
+			if ep.Status.IngressPeerName == "" || ep.Status.PublicKey == "" || ep.Status.AssignedMeshIP == "" {
+				continue
+			}
+			externalByIngress[ep.Status.IngressPeerName] = append(externalByIngress[ep.Status.IngressPeerName], ep.Status.AssignedMeshIP)
+		}
+	}
 
 	var ownIP net.IP
 	for i := range peerList.Items {
@@ -674,6 +704,16 @@ func (a *Agent) sync(ctx context.Context) error {
 			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
 			allRoutes = append(allRoutes, cidr)
 		}
+		for _, cidr := range externalByIngress[p.Name] {
+			if a.shouldSkipGatewayRoute(ctx, cidr, myPeerName, ownIP) {
+				continue
+			}
+			if containsString(filteredAllowedIPs, cidr) {
+				continue
+			}
+			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
+			allRoutes = append(allRoutes, cidr)
+		}
 
 		// Symmetric peers must never be force-endpointed post-probe: the
 		// NAT-mapped source port drifts and writing a stale value clobbers
@@ -693,6 +733,47 @@ func (a *Agent) sync(ctx context.Context) error {
 			KeepaliveSeconds: a.keepaliveForPeer(p),
 			ForceEndpoint:    forceEp,
 		})
+	}
+
+	// Ingress-side external peer acceptance.
+	//
+	// WireKubeExternalPeer CRs describe off-cluster hosts that join the mesh
+	// through the relay's shared raw-WireGuard UDP listener. The reconciler
+	// picks one cluster ingress peer for each external peer and writes the
+	// choice to status.ingressPeerName. Only that ingress agent adds the
+	// official client's WG peer. Other agents route the external peer's /32
+	// through the selected ingress by augmenting that WireKubePeer's
+	// AllowedIPs above, which keeps VM-to-VM and cluster-to-external traffic
+	// routable without installing the external peer key everywhere.
+	//
+	// We do NOT set Endpoint here: the ingress peer accepts inbound and the bind
+	// transport mode auto-defaults to relay when the relay pool is connected
+	// (see SetPeerPath in userspace_engine.go), so outbound responses flow
+	// through the relay leg back to the shared relay listener and on to the
+	// external peer.
+	// KeepaliveSeconds is 0 because the external peer initiates keepalives;
+	// the ingress peer only responds.
+	if externalList != nil {
+		for i := range externalList.Items {
+			ep := &externalList.Items[i]
+			if ep.Status.IngressPeerName != myPeerName {
+				continue
+			}
+			if ep.Status.Phase != wirekubev1alpha1.ExternalPeerPhaseActive {
+				continue
+			}
+			if ep.Status.PublicKey == "" || ep.Status.AssignedMeshIP == "" {
+				continue
+			}
+			wgPeers = append(wgPeers, wireguard.PeerConfig{
+				PublicKeyB64:     ep.Status.PublicKey,
+				Endpoint:         "",
+				AllowedIPs:       []string{ep.Status.AssignedMeshIP},
+				KeepaliveSeconds: 0,
+				ForceEndpoint:    false,
+			})
+			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
+		}
 	}
 
 	// When own allowedIPs is empty, this node has no identity in the mesh.
@@ -806,6 +887,11 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.log.Error(err, "gateway setup error")
 	}
 
+	// Delete legacy WireKubePeer CRs whose underlying Node has been removed.
+	// New CRs are protected by Node ownerReferences (set in upsertOwnPeer),
+	// so this loop is the safety net for entries created before that fix.
+	a.cleanupOrphanedPeers(ctx, peerList)
+
 	// Update Prometheus metrics.
 	a.updateMetrics(ctx, peerList)
 
@@ -816,6 +902,73 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// orphanGracePeriod is how long a WireKubePeer must have existed before
+// cleanupOrphanedPeers will consider it for deletion when its owning Node
+// is absent. The grace window prevents a transient Node list staleness
+// (control-plane hiccup, agent restart, propagation lag during cluster
+// scale-up) from racing with a brand-new peer whose Node has not yet
+// surfaced in this agent's cache. Tuned well above any realistic
+// propagation delay and well below the WG handshake window so the worst
+// case is a 10-minute lag in cleanup, not silent peer deletion.
+const orphanGracePeriod = 10 * time.Minute
+
+// agentManagedPeerLabel marks a WireKubePeer as belonging to a K8s Node
+// (set by upsertOwnPeer). Manually-created external peers (home PCs,
+// remote VMs — see WireKubePeer type doc) do not carry this label and
+// are exempt from cleanup so user-managed CRs are never silently
+// deleted.
+const agentManagedPeerLabel = "wirekube.io/node"
+
+// cleanupOrphanedPeers deletes agent-managed WireKubePeer CRs whose
+// corresponding K8s Node no longer exists. The recommended cleanup
+// path is the Node ownerReference set by upsertOwnPeer — K8s garbage
+// collection cascade-deletes the peer the moment the Node disappears.
+// This loop is the safety net for two cases:
+//   - CRs created before ownerReference support existed.
+//   - CRs whose ownerReference has been stripped externally (manual edit)
+//     and which would otherwise leak forever.
+//
+// Scope: only peers with the agentManagedPeerLabel are eligible. The
+// agent's own peer is also exempt — that record is owned by the local
+// cleanup() path on graceful shutdown. Concurrent Delete races across
+// agents are tolerated via IsNotFound.
+func (a *Agent) cleanupOrphanedPeers(ctx context.Context, peerList *wirekubev1alpha1.WireKubePeerList) {
+	nodeList := &corev1.NodeList{}
+	if err := a.client.List(ctx, nodeList); err != nil {
+		a.log.V(1).Info("cleanupOrphanedPeers: listing nodes failed", "error", err)
+		return
+	}
+	nodeNames := make(map[string]struct{}, len(nodeList.Items))
+	for _, n := range nodeList.Items {
+		nodeNames[n.Name] = struct{}{}
+	}
+
+	for i := range peerList.Items {
+		p := &peerList.Items[i]
+		if p.Name == a.nodeName {
+			continue
+		}
+		if _, agentManaged := p.Labels[agentManagedPeerLabel]; !agentManaged {
+			continue
+		}
+		if _, alive := nodeNames[p.Name]; alive {
+			continue
+		}
+		if time.Since(p.CreationTimestamp.Time) < orphanGracePeriod {
+			continue
+		}
+		err := a.client.Delete(ctx, p)
+		switch {
+		case err == nil:
+			a.log.Info("deleted orphaned WireKubePeer", "peer", p.Name, "reason", "no corresponding K8s Node")
+		case apierrors.IsNotFound(err):
+			a.log.V(1).Info("orphan already deleted by another agent", "peer", p.Name)
+		default:
+			a.log.Error(err, "deleting orphaned WireKubePeer", "peer", p.Name)
+		}
+	}
 }
 
 func (a *Agent) peerHadTrafficSinceLastSync(pubKey string, current wireguard.PeerStats) bool {
@@ -1218,10 +1371,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		if relay.Managed != nil && relay.Managed.Port != 0 {
 			port = relay.Managed.Port
 		}
-		endpoint = a.discoverManagedRelay(ctx, port)
-		if endpoint == "" {
-			return fmt.Errorf("managed relay: no externally reachable address found on wirekube-relay Service (LB/NodePort not ready yet)")
-		}
+		endpoint = managedRelayControlEndpoint(a.podNamespace, port)
 	default:
 		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
 	}
@@ -1248,10 +1398,16 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		DeliverRelayPacket(wireguard.RelayPacket)
 	}
 	if rd, ok := a.wgMgr.(relayDeliverer); ok {
-		a.relayPool.SetBindDelivery(func(srcKey [32]byte, payload []byte) {
+		a.relayPool.SetBindDelivery(func(pkt agentrelay.DeliveredPacket) {
 			rd.DeliverRelayPacket(wireguard.RelayPacket{
-				SrcKey:  srcKey,
-				Payload: payload,
+				SrcKey: pkt.SrcKey,
+				ExternalSource: wireguard.ExternalSource{
+					Valid:     pkt.ExternalSource.Valid,
+					RelayAddr: pkt.ExternalSource.RelayAddr,
+					Token:     pkt.ExternalSource.Token,
+					Addr:      pkt.ExternalSource.Addr,
+				},
+				Payload: pkt.Payload,
 			})
 		})
 		a.log.Info("relay bind-delivery enabled (userspace mode)")
@@ -1272,6 +1428,13 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
 	return nil
+}
+
+func managedRelayControlEndpoint(namespace string, port int32) string {
+	if namespace == "" {
+		namespace = "wirekube-system"
+	}
+	return fmt.Sprintf("wirekube-relay-control.%s.svc.cluster.local:%d", namespace, port)
 }
 
 func (a *Agent) preferredTransportForPeer(peerName string) string {
@@ -1476,99 +1639,6 @@ func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	}
 
 	return proxy.ListenAddr()
-}
-
-// discoverManagedRelay queries the wirekube-relay Service to find an externally
-// reachable address. CoreDNS service domains (ClusterIP) are NOT used because
-// they require a functioning CNI, which may not be available on hybrid/NAT'd
-// nodes at startup.
-//
-// Priority: ExternalIPs → LB ingress IP/hostname → NodePort via public node IP.
-func (a *Agent) discoverManagedRelay(ctx context.Context, port int32) string {
-	svc := &corev1.Service{}
-	if err := a.client.Get(ctx, client.ObjectKey{
-		Name:      "wirekube-relay",
-		Namespace: "wirekube-system",
-	}, svc); err != nil {
-		return ""
-	}
-
-	// 1. ExternalIPs (manually configured public IPs)
-	for _, ip := range svc.Spec.ExternalIPs {
-		parsed := net.ParseIP(ip)
-		if parsed != nil && !parsed.IsPrivate() {
-			ep := fmt.Sprintf("%s:%d", ip, port)
-			a.log.Info("relay using externalIP", "endpoint", ep)
-			return ep
-		}
-	}
-
-	// 2. LoadBalancer Ingress (cloud-assigned external IP/hostname)
-	for _, ing := range svc.Status.LoadBalancer.Ingress {
-		if ing.IP != "" {
-			ep := fmt.Sprintf("%s:%d", ing.IP, port)
-			a.log.Info("relay using LB ingress IP", "endpoint", ep)
-			return ep
-		}
-		if ing.Hostname != "" {
-			ep := fmt.Sprintf("%s:%d", ing.Hostname, port)
-			a.log.Info("relay using LB ingress hostname", "endpoint", ep)
-			return ep
-		}
-	}
-
-	// 3. NodePort — find a cluster node with a public IP and use NodePort.
-	// Checks ExternalIP first, then InternalIP (some cloud providers like
-	// OCI register the public IP as InternalIP).
-	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer || svc.Spec.Type == corev1.ServiceTypeNodePort {
-		var nodePort int32
-		for _, p := range svc.Spec.Ports {
-			if p.Port == port && p.NodePort != 0 {
-				nodePort = p.NodePort
-				break
-			}
-		}
-		if nodePort != 0 {
-			if ep := a.findNodePortEndpoint(ctx, nodePort); ep != "" {
-				return ep
-			}
-		}
-	}
-
-	return ""
-}
-
-// findNodePortEndpoint scans cluster nodes for a publicly reachable IP to use
-// with the given NodePort.
-func (a *Agent) findNodePortEndpoint(ctx context.Context, nodePort int32) string {
-	nodeList := &corev1.NodeList{}
-	if err := a.client.List(ctx, nodeList); err != nil {
-		return ""
-	}
-	for _, n := range nodeList.Items {
-		for _, addr := range n.Status.Addresses {
-			if addr.Type == corev1.NodeExternalIP {
-				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
-				a.log.Info("relay using NodePort via ExternalIP", "endpoint", ep)
-				return ep
-			}
-		}
-	}
-	// Fallback: use non-private InternalIP (OCI registers public IP as InternalIP)
-	for _, n := range nodeList.Items {
-		for _, addr := range n.Status.Addresses {
-			if addr.Type != corev1.NodeInternalIP {
-				continue
-			}
-			ip := net.ParseIP(addr.Address)
-			if ip != nil && !ip.IsPrivate() {
-				ep := fmt.Sprintf("%s:%d", addr.Address, nodePort)
-				a.log.Info("relay using NodePort via public InternalIP", "endpoint", ep)
-				return ep
-			}
-		}
-	}
-	return ""
 }
 
 // prewarmAllPeerRelays ensures a relay proxy exists for every remote peer,

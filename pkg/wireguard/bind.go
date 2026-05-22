@@ -359,6 +359,18 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return conn.ErrWrongEndpointType
 	}
 
+	if wkep.externalSource.Valid {
+		if relay == nil {
+			return syscall.ENOTCONN
+		}
+		for _, buf := range bufs {
+			if err := relay.SendToExternal(wkep.externalSource.RelayAddr, wkep.externalSource.Token, buf); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Resolve peer by either the endpoint's peerKey (set on packets we
 	// delivered from relay) or by the reverse map on the destination addr.
 	// Grab the PeerPath too so we can consult DirectHealth.LastSeen below.
@@ -655,6 +667,17 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 		case pkt := <-b.relayCh:
 			n := copy(packets[0], pkt.Payload)
 			sizes[0] = n
+			if pkt.ExternalSource.Valid {
+				dst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
+				if addr, err := netip.ParseAddrPort(pkt.ExternalSource.Addr); err == nil {
+					dst = addr
+				}
+				eps[0] = &WireKubeEndpoint{
+					dst:            dst,
+					externalSource: pkt.ExternalSource,
+				}
+				return 1, nil
+			}
 			pubKeyB64 := base64.StdEncoding.EncodeToString(pkt.SrcKey[:])
 			var dst netip.AddrPort
 			if pp := b.GetPeerPath(pubKeyB64); pp != nil {
