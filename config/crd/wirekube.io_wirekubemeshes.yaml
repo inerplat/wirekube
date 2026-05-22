@@ -191,6 +191,11 @@ spec:
                         required:
                         - name
                         type: object
+                      controlEndpoint:
+                        description: |-
+                          ControlEndpoint is reserved for legacy relay control operations. Shared
+                          external peers use Endpoint directly and do not require this field.
+                        type: string
                       endpoint:
                         description: |-
                           Endpoint is the relay server address (host:port).
