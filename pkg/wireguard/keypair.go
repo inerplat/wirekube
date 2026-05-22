@@ -78,6 +78,15 @@ func loadOrGenerateFromDir(dir string) (*KeyPair, error) {
 }
 
 func generateKeyPair() (*KeyPair, error) {
+	return GenerateKeyPair()
+}
+
+// GenerateKeyPair returns a fresh WireGuard X25519 keypair without touching
+// disk. The private key is clamped per RFC 7748 so it is suitable for
+// inclusion in an [Interface] PrivateKey block. Used by wirekubectl invite
+// to mint client-side keypairs without ever sending the private half through
+// the cluster.
+func GenerateKeyPair() (*KeyPair, error) {
 	kp := &KeyPair{}
 	if _, err := rand.Read(kp.Private[:]); err != nil {
 		return nil, fmt.Errorf("generating private key: %w", err)

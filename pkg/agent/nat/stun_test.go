@@ -96,6 +96,92 @@ func TestGenerateCandidates_EdgeCases(t *testing.T) {
 	}
 }
 
+// TestGenerateCandidates_HighIncrement covers NATs whose observed port
+// increment is so large (NCloud's symmetric NAT regularly reports values
+// in the 26 000-58 000 range) that a strict sequential fan-out walks
+// outside the valid 1-65535 port range in a single step. Before the
+// wide-scan fallback was added, this case returned 0-1 candidates and
+// birthday attack failed with "no candidate ports". The fix is verified
+// here by asserting a full N candidates and that none come from the
+// out-of-range sequential extrapolation.
+func TestGenerateCandidates_HighIncrement(t *testing.T) {
+	// Mirrors the actual portPrediction observed for s4-g3a-0 / gpu-bm
+	// behind NCloud NAT.
+	pp := PortPrediction{
+		BasePort:    59611,
+		Increment:   47657,
+		Jitter:      0,
+		SamplePorts: []int{11954, 59611},
+	}
+
+	candidates := pp.GenerateCandidates(256)
+	if len(candidates) != 256 {
+		t.Fatalf("high-increment NAT got %d candidates, want 256", len(candidates))
+	}
+	seen := make(map[int]struct{}, len(candidates))
+	for _, p := range candidates {
+		if p <= 0 || p >= 65536 {
+			t.Errorf("invalid port: %d", p)
+		}
+		if _, dup := seen[p]; dup {
+			t.Errorf("duplicate port: %d", p)
+		}
+		seen[p] = struct{}{}
+	}
+}
+
+// TestGenerateCandidates_NegativeIncrement covers NATs where the second
+// observed port is lower than the first (NCloud worker7 reported
+// BasePort=33792, Increment=-26134). The sequential fan-out only yields
+// one valid candidate (BasePort+Increment) before going negative; the
+// wide-scan top-up must supply the remainder.
+func TestGenerateCandidates_NegativeIncrement(t *testing.T) {
+	pp := PortPrediction{
+		BasePort:    33792,
+		Increment:   -26134,
+		Jitter:      0,
+		SamplePorts: []int{59926, 33792},
+	}
+
+	candidates := pp.GenerateCandidates(128)
+	if len(candidates) != 128 {
+		t.Fatalf("negative-increment NAT got %d candidates, want 128", len(candidates))
+	}
+	for _, p := range candidates {
+		if p <= 0 || p >= 65536 {
+			t.Errorf("invalid port: %d", p)
+		}
+	}
+}
+
+// TestGenerateCandidates_SequentialOverflowFallsBack covers the edge case
+// where Increment is small enough to be sequential but BasePort is so
+// close to 65535 that fan-out exits the valid range mid-loop. The
+// wide-scan fallback should fill the remainder so the caller still gets
+// up to n unique candidates.
+func TestGenerateCandidates_SequentialOverflowFallsBack(t *testing.T) {
+	pp := PortPrediction{
+		BasePort:    64000,
+		Increment:   1000,
+		Jitter:      10,
+		SamplePorts: []int{63000, 64000},
+	}
+
+	candidates := pp.GenerateCandidates(64)
+	if len(candidates) != 64 {
+		t.Fatalf("sequential-overflow NAT got %d candidates, want 64", len(candidates))
+	}
+	// No duplicates expected even though sequential and wide-scan ranges
+	// can naturally overlap.
+	seen := make(map[int]struct{}, len(candidates))
+	for _, p := range candidates {
+		if _, dup := seen[p]; dup {
+			t.Errorf("duplicate port: %d", p)
+		}
+		seen[p] = struct{}{}
+	}
+}
+
 func TestAbs(t *testing.T) {
 	tests := []struct {
 		input, expected int

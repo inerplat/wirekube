@@ -42,35 +42,66 @@ type PortPrediction struct {
 	SamplePorts []int
 }
 
-// GenerateCandidates produces a list of predicted ports spread around the base.
-// For sequential NATs the list fans out from the predicted next port.
-// For unpredictable NATs it covers a wide range.
+// sequentialMaxIncrement bounds the increment values that we still treat as
+// genuine sequential allocation. Real sequential NATs increment by 1-100;
+// some jittered designs bump that to a few thousand. Anything beyond means
+// the NAT effectively allocates ports randomly (e.g. NCloud's symmetric
+// NAT regularly produces 26 000-58 000 increments), and a sequential
+// fan-out would walk past the valid 1-65535 port range in one step.
+const sequentialMaxIncrement = 8192
+
+// GenerateCandidates produces up to n predicted ports spread around the base.
+// Strategy:
+//  1. If the observed Increment looks plausibly sequential (non-zero, with
+//     bounded jitter, magnitude ≤ sequentialMaxIncrement), fan out from
+//     BasePort + Increment.
+//  2. If the sequential pass produced fewer than n valid candidates (either
+//     because we skipped it or the fan-out walked off the valid port range
+//     mid-loop), top up with a wide scan window around BasePort.
+//
+// The combined result lets birthday attack make progress even on NATs that
+// look random in their port allocation: sequential's high-precision shot
+// is still tried when the data supports it, but the wide scan ensures we
+// never hand the caller an empty list.
 func (pp PortPrediction) GenerateCandidates(n int) []int {
 	if n <= 0 {
 		return nil
 	}
 	ports := make([]int, 0, n)
-
-	if pp.Increment != 0 && pp.Jitter <= abs(pp.Increment)*2 {
-		// Sequential allocation: fan out from predicted next port
-		nextPort := pp.BasePort + pp.Increment
-		for i := 0; i < n; i++ {
-			p := nextPort + pp.Increment*i
-			if p > 0 && p < 65536 {
-				ports = append(ports, p)
-			}
+	seen := make(map[int]struct{}, n)
+	add := func(p int) {
+		if p <= 0 || p >= 65536 {
+			return
 		}
-	} else {
-		// Random/unpredictable allocation: scan a wide range around the base
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+
+	sequential := pp.Increment != 0 &&
+		pp.Jitter <= abs(pp.Increment)*2 &&
+		abs(pp.Increment) <= sequentialMaxIncrement
+
+	if sequential {
+		nextPort := pp.BasePort + pp.Increment
+		for i := 0; len(ports) < n; i++ {
+			p := nextPort + pp.Increment*i
+			if p <= 0 || p >= 65536 {
+				break // walked off the valid range
+			}
+			add(p)
+		}
+	}
+
+	if len(ports) < n {
 		start := pp.BasePort - n/2
 		if start < 1024 {
 			start = 1024
 		}
-		for i := 0; i < n; i++ {
-			p := start + i
-			if p > 0 && p < 65536 {
-				ports = append(ports, p)
-			}
+		for i := 0; len(ports) < n && start+i < 65536; i++ {
+			add(start + i)
 		}
 	}
 	return ports

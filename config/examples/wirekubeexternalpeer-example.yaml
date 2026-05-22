@@ -1,0 +1,32 @@
+# WireKubeExternalPeer — minimal example.
+#
+# Authorizes an off-cluster host (laptop, home machine) to join the mesh
+# through a selected ingress WireKubePeer via the relay's shared raw-WireGuard
+# UDP endpoint. The host runs only the official WireGuard client; the data
+# plane always enters through the relay.
+#
+# Lifecycle:
+#   1. Create this CR or use `wirekubectl invite`.
+#   2. The controller allocates a /32 mesh IP and publishes the shared relay
+#      endpoint.
+#   3. The rendered conf is delivered once to the user via CLI or QR.
+#   4. To revoke, delete this CR — the ingress peer evicts the peer key on next
+#      reconcile and the user loses connectivity within ~60s.
+#
+# Optional fields not shown:
+#   - spec.allowedDestinations: defaults to [meshCIDR, podCIDR] from
+#     WireKubeMesh; override only if the peer should reach a narrower scope.
+#   - spec.ingressPeer:         pin to a specific WireKubePeer; default is
+#     auto-select at allocation time.
+#   - spec.mtu:                 override the rendered client MTU. Defaults to
+#     1248 for the shared relay + mesh path.
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeExternalPeer
+metadata:
+  name: alice
+spec:
+  displayName: alice
+  # Replace with the external client's 44-character base64 WireGuard public key.
+  publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  # Time-boxed access: CR is auto-deleted 24h after creation.
+  ttl: 24h

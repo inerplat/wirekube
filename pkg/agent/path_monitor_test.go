@@ -201,3 +201,79 @@ func TestStaleWatermarkIsNotFreshEvidence(t *testing.T) {
 		t.Fatalf("stale watermark promoted to Direct (should not): got %v", got)
 	}
 }
+
+// TestMarkNeverDirectSuppressesProbe asserts that pinning a peer with
+// MarkNeverDirect prevents both the timer-based and forced Relay→Warm
+// transitions, so symmetric ↔ symmetric NAT pairs (with birthday attack
+// disabled or already failed) stop oscillating between modes.
+func TestMarkNeverDirectSuppressesProbe(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false) // Relay
+	pm.MarkNeverDirect("p1", "key1")
+
+	// Backoff timer elapsed: would normally probe Relay→Warm.
+	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+		t.Fatalf("Evaluate after timer with neverDirect = %v, want PathModeRelay", got)
+	}
+
+	// forceProbe must not override neverDirect: this is the contract
+	// that lets the agent durably pin a peer to relay even if other
+	// signals (e.g. ICE detected an inbound direct packet via relay
+	// keepalive proxying) would normally trigger a probe.
+	if got := pm.Evaluate("p1", "key1", true); got != PathModeRelay {
+		t.Fatalf("Evaluate with forceProbe and neverDirect = %v, want PathModeRelay", got)
+	}
+}
+
+// TestMarkNeverDirectFromWarmDemotes asserts that calling MarkNeverDirect
+// while the peer is already in Warm (e.g. an in-flight probe just before
+// the agent decides this pair is impossible) demotes immediately back to
+// Relay rather than waiting out relayStall.
+func TestMarkNeverDirectFromWarmDemotes(t *testing.T) {
+	pm, _, _ := newMonitor(t)
+	pm.Evaluate("p1", "key1", true) // Warm
+	pm.MarkNeverDirect("p1", "key1")
+	if got := pm.ModeFor("p1"); got != PathModeRelay {
+		t.Fatalf("ModeFor after MarkNeverDirect from Warm = %v, want PathModeRelay", got)
+	}
+}
+
+// TestMarkNeverDirectCreatesEntry asserts that MarkNeverDirect is safe to
+// call before the peer has ever been Evaluate-d. The agent's ICE loop and
+// the data-plane sync loop are independent goroutines, so the marking can
+// land first.
+func TestMarkNeverDirectCreatesEntry(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.MarkNeverDirect("p1", "key1")
+	if got := pm.ModeFor("p1"); got != PathModeRelay {
+		t.Fatalf("ModeFor after MarkNeverDirect on missing entry = %v, want PathModeRelay", got)
+	}
+	clk.advance(time.Hour) // way past any timer
+	if got := pm.Evaluate("p1", "key1", true); got != PathModeRelay {
+		t.Fatalf("Evaluate after MarkNeverDirect on missing entry = %v, want PathModeRelay", got)
+	}
+}
+
+// TestClearNeverDirectRestoresProbing asserts the symmetric undo path:
+// once the agent decides direct may now work (e.g. NAT type re-discovered
+// as cone, or birthday attack flipped on), ClearNeverDirect lets the
+// timer fire again on the next backoff window.
+func TestClearNeverDirectRestoresProbing(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false) // Relay, lastProbeAt = now
+	pm.MarkNeverDirect("p1", "key1")
+
+	clk.advance(300 * time.Millisecond)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+		t.Fatalf("setup: still pinned, got %v", got)
+	}
+
+	pm.ClearNeverDirect("p1")
+	// neverDirect is cleared but lastProbeAt was anchored when the entry
+	// was created, and the clock has already moved past relayRetry. The
+	// next Evaluate should now fire the deferred probe.
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("Evaluate after ClearNeverDirect = %v, want PathModeWarm", got)
+	}
+}
