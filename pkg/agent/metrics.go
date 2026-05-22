@@ -83,6 +83,38 @@ var (
 	}, []string{"source", "peer"})
 )
 
+// dropStaleMetricLabels removes Prometheus label combinations for peer
+// names that the agent emitted samples for last cycle but did not see in
+// the current peer list. Without this, deleting a WireKubePeer (or a
+// whole node) leaves its labels in /metrics until the agent process
+// restarts — Grafana would keep charting a long-vanished peer.
+//
+// DeletePartialMatch hits every label combination whose "peer" label
+// matches, so transport / nat_type variants of the same peer are pulled
+// in a single call.
+func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
+	for name := range a.peerMetricLabels {
+		if _, alive := currentPeers[name]; alive {
+			continue
+		}
+		// Never drop labels for the local agent. Per-peer metrics are not
+		// supposed to be emitted for self, but defending the invariant
+		// here keeps the cleanup loop safe if a future change adds one.
+		if name == a.nodeName {
+			continue
+		}
+		labels := prometheus.Labels{"peer": name}
+		peerLatency.DeletePartialMatch(labels)
+		peerBytesSent.DeletePartialMatch(labels)
+		peerBytesReceived.DeletePartialMatch(labels)
+		peerConnected.DeletePartialMatch(labels)
+		peerTransport.DeletePartialMatch(labels)
+		peerLastHandshake.DeletePartialMatch(labels)
+		peerICEStateMetric.DeletePartialMatch(labels)
+	}
+	a.peerMetricLabels = currentPeers
+}
+
 // updateMetrics publishes Prometheus metrics from WireGuard stats and peer CRDs.
 // All per-peer metrics include a "source" label set to this node's name, allowing
 // Grafana to distinguish which agent is reporting and build proper mesh views.
@@ -109,6 +141,7 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 	me := a.nodeName
 	relayed := 0
 	direct := 0
+	currentPeers := make(map[string]struct{}, len(peerList.Items))
 
 	for i := range peerList.Items {
 		p := &peerList.Items[i]
@@ -127,6 +160,8 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			nodeNATType.WithLabelValues(me).Set(natVal)
 			continue
 		}
+
+		currentPeers[p.Name] = struct{}{}
 
 		s, ok := statsByKey[p.Spec.PublicKey]
 		if ok {
@@ -181,6 +216,8 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 	peerCount.Set(float64(len(peerList.Items)))
 	relayedPeersCount.Set(float64(relayed))
 	directPeersCount.Set(float64(direct))
+
+	a.dropStaleMetricLabels(currentPeers)
 }
 
 // measurePeerLatency runs a single ICMP ping to each connected peer and

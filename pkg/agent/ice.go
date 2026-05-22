@@ -441,8 +441,20 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 			}
 
 		case iceStateFailed:
-			if isPortRestrictedSymmetricPair(a.detectedNATType, p.Status.NATType) {
-				continue // permanently stay on relay
+			if a.shouldPermanentRelay(p, state) {
+				// Permanent relay: pin PathMonitor so the data-plane FSM
+				// stops probing too. ICE state stays in iceStateFailed
+				// and BirthdayTried is preserved across cycles.
+				if a.pathMonitor != nil {
+					a.pathMonitor.MarkNeverDirect(p.Name, p.Spec.PublicKey)
+				}
+				continue
+			}
+			// Conditions changed (NAT re-discovery, birthday attack toggled
+			// on, etc.) — clear any prior permanent-relay pin so the
+			// timer-based probe can fire again on the next sync.
+			if a.pathMonitor != nil {
+				a.pathMonitor.ClearNeverDirect(p.Name)
 			}
 			if !state.NextProbeAfter.IsZero() && time.Now().Before(state.NextProbeAfter) {
 				continue
@@ -599,6 +611,41 @@ func isPortRestrictedSymmetricPair(myNAT, peerNAT string) bool {
 	prc := string(nat.NATPortRestrictedCone)
 	sym := string(nat.NATSymmetric)
 	return (myNAT == prc && peerNAT == sym) || (myNAT == sym && peerNAT == prc)
+}
+
+// isSymmetricSymmetricPair returns true when both ends are symmetric NAT.
+// Direct P2P is only possible via birthday attack hole-punching for this
+// combination; without it, the pair must use the relay permanently.
+func isSymmetricSymmetricPair(myNAT, peerNAT string) bool {
+	sym := string(nat.NATSymmetric)
+	return myNAT == sym && peerNAT == sym
+}
+
+// shouldPermanentRelay reports whether this peer pair has been determined
+// to be unable to establish a direct path. The agent uses this to pin the
+// peer to relay-only transport and suppress further probing.
+//
+// Permanent-relay conditions:
+//   - port-restricted cone ↔ symmetric: structurally impossible (no birthday
+//     workaround helps because port-restricted cone won't pass the reply).
+//   - symmetric ↔ symmetric WITH birthday attack disabled: opt-out by config.
+//   - symmetric ↔ symmetric WITH birthday attack enabled AND already attempted
+//     and failed: best effort exhausted.
+func (a *Agent) shouldPermanentRelay(peer *wirekubev1alpha1.WireKubePeer, state *peerICEState) bool {
+	myNAT := a.detectedNATType
+	peerNAT := peer.Status.NATType
+	if isPortRestrictedSymmetricPair(myNAT, peerNAT) {
+		return true
+	}
+	if isSymmetricSymmetricPair(myNAT, peerNAT) {
+		if !a.isBirthdayAttackEnabled(peer) {
+			return true
+		}
+		if state != nil && state.BirthdayTried {
+			return true
+		}
+	}
+	return false
 }
 
 // trySameNATDirect checks if the peer shares our public NAT IP.

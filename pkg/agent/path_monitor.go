@@ -121,6 +121,13 @@ type pathEntry struct {
 	// lastProbeAt records the wallclock time of the most recent Relay→Warm
 	// attempt, so the Relay backoff loop does not fire every sync cycle.
 	lastProbeAt time.Time
+	// neverDirect, when true, suppresses the Relay→Warm timer probe and
+	// keeps the entry pinned to PathModeRelay. Used for peer pairs where
+	// direct connectivity has been proven impossible (e.g. symmetric ↔
+	// symmetric NAT after a failed birthday attack, or with birthday
+	// attack disabled). Cleared via ClearNeverDirect when conditions
+	// change (e.g. NAT type re-discovery).
+	neverDirect bool
 }
 
 // PathMonitorConfig bundles the thresholds. Defaults are applied for any
@@ -191,10 +198,51 @@ func (m *PathMonitor) ModeFor(peerName string) PathMode {
 }
 
 // Forget removes all state for a peer. Call when a WireKubePeer is deleted.
+// Any neverDirect pin is dropped along with the entry; if the same peer
+// later re-appears (CRD churn), the agent's ICE layer must re-issue
+// MarkNeverDirect on the next iceStateFailed evaluation.
 func (m *PathMonitor) Forget(peerName string) {
 	m.mu.Lock()
 	delete(m.entries, peerName)
 	m.mu.Unlock()
+}
+
+// MarkNeverDirect pins a peer to PathModeRelay and suppresses subsequent
+// Relay→Warm probes. Call when the agent has determined direct connectivity
+// is impossible for this peer (e.g. symmetric ↔ symmetric NAT pair with
+// birthday attack disabled or already-failed). The peer entry is created
+// in PathModeRelay if it does not yet exist.
+func (m *PathMonitor) MarkNeverDirect(peerName, pubKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	e, ok := m.entries[peerName]
+	if !ok {
+		e = &pathEntry{
+			pubKey:        pubKey,
+			mode:          PathModeRelay,
+			modeEnteredAt: now,
+			lastProbeAt:   now,
+		}
+		m.entries[peerName] = e
+	}
+	e.pubKey = pubKey
+	e.neverDirect = true
+	if e.mode != PathModeRelay {
+		e.setMode(PathModeRelay, now)
+	}
+}
+
+// ClearNeverDirect re-enables the Relay→Warm probe for a peer. Call when
+// the agent has reason to believe direct connectivity may now be possible
+// (e.g. NAT type re-discovered as non-symmetric, birthday attack enabled
+// after being disabled).
+func (m *PathMonitor) ClearNeverDirect(peerName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[peerName]; ok {
+		e.neverDirect = false
+	}
 }
 
 // ForgetMissing removes entries for any peers not present in `alive`. Call
@@ -300,7 +348,12 @@ func (m *PathMonitor) Evaluate(peerName, pubKey string, forceProbe bool) PathMod
 		// now) or whenever the backoff interval has elapsed. Note that we
 		// enter Warm, not Direct — a probe that cannot prove direct
 		// connectivity stays bimodal and will drift back to Relay after
-		// relayStall.
+		// relayStall. neverDirect peers stay pinned to Relay forever
+		// regardless of the timer or forceProbe argument; the agent
+		// must call ClearNeverDirect to re-enable probing.
+		if e.neverDirect {
+			break
+		}
 		if forceProbe || now.Sub(e.lastProbeAt) >= m.relayRetry {
 			e.lastProbeAt = now
 			e.setMode(PathModeWarm, now)

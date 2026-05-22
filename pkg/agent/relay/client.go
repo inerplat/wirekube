@@ -28,6 +28,11 @@ import (
 // proxy map instead.
 type DataHandler func(srcKey [relayproto.PubKeySize]byte, payload []byte)
 
+// ExternalDataHandler is called when a raw WireGuard datagram arrives from a
+// relay shared external listener. relayAddr identifies the TCP relay client
+// that owns the token, so responses can be sent back to the same relay.
+type ExternalDataHandler func(relayAddr string, sourceToken uint64, sourceAddr string, payload []byte)
+
 // HintHandler is called when a BimodalHint frame arrives from a sender key.
 // The handler should mark the sender peer to receive dual-leg sends for a
 // short trust window so asymmetric UDP blackholes recover immediately.
@@ -44,6 +49,7 @@ type Client struct {
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
 	onData      DataHandler
+	onExternal  ExternalDataHandler
 	onHint      HintHandler
 	connected   atomic.Bool
 	reconnectCh chan struct{} // signalled by readLoop on disconnect
@@ -190,6 +196,36 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.onHint(srcKey)
 			}
 
+		case relayproto.MsgRelayProbe:
+			token, err := relayproto.ParseRelayProbeFrame(frame.Body)
+			if err != nil {
+				log.Printf("relay-client: bad relay probe frame: %v", err)
+				continue
+			}
+			c.mu.Lock()
+			if c.writer != nil {
+				err = relayproto.WriteFrame(c.writer, relayproto.MakeRelayProbeFrame(token))
+				if err == nil {
+					err = c.writer.Flush()
+				}
+			}
+			c.mu.Unlock()
+			if err != nil {
+				log.Printf("relay-client: relay probe response failed: %v", err)
+				c.signalReconnect()
+				return
+			}
+
+		case relayproto.MsgExternalData:
+			sourceToken, sourceAddr, payload, err := relayproto.ParseExternalDataFrame(frame.Body)
+			if err != nil {
+				log.Printf("relay-client: bad external data frame: %v", err)
+				continue
+			}
+			if c.onExternal != nil {
+				c.onExternal(c.relayAddr, sourceToken, sourceAddr, payload)
+			}
+
 		case relayproto.MsgError:
 			log.Printf("relay-client: server error: %s", string(frame.Body))
 
@@ -300,6 +336,21 @@ func (c *Client) SendNATProbe(ip net.IP, port int) error {
 // SendToPeer sends a UDP payload to a remote peer through the relay.
 func (c *Client) SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte) error {
 	frame := relayproto.MakeDataFrame(destPubKey, payload)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writer == nil {
+		return fmt.Errorf("not connected")
+	}
+	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
+		return err
+	}
+	return c.writer.Flush()
+}
+
+// SendToExternal sends a raw WireGuard response packet back to a source token
+// owned by this relay connection's shared external listener.
+func (c *Client) SendToExternal(sourceToken uint64, payload []byte) error {
+	frame := relayproto.MakeExternalDataFrame(sourceToken, "", payload)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.writer == nil {

@@ -1,4 +1,53 @@
 ---
+# wirekube-relay ServiceAccount + RBAC
+#
+# The relay process itself needs no Kubernetes permissions. This ServiceAccount
+# exists only so optional `kubectl exec deploy/wirekube-relay -- wirekubectl ...`
+# read-only commands can inspect mesh and peer state. Mutating external-peer
+# commands should run from an admin context or the agent ServiceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wirekube-relay
+  namespace: wirekube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wirekube-relay
+rules:
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubepeers
+  - wirekubemeshes
+  - wirekubegateways
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wirekube-relay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wirekube-relay
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: wirekube-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,6 +68,7 @@ spec:
         app.kubernetes.io/name: wirekube-relay
         app.kubernetes.io/component: relay
     spec:
+      serviceAccountName: wirekube-relay
       nodeSelector:
         eks.amazonaws.com/nodegroup: relay-ng
       containers:
@@ -27,10 +77,14 @@ spec:
           command: ["wirekube-relay"]
           args:
             - --addr=:3478
+            - --external-wg-addr=:3478
           ports:
-            - name: relay
+            - name: relay-tcp
               containerPort: 3478
               protocol: TCP
+            - name: relay-udp
+              containerPort: 3478
+              protocol: UDP
           readinessProbe:
             tcpSocket:
               port: 3478
@@ -52,6 +106,25 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: wirekube-relay-control
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: wirekube
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: wirekube-relay
+  ports:
+    - name: relay-control
+      port: 3478
+      targetPort: 3478
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: wirekube-relay
   namespace: wirekube-system
   labels:
@@ -67,3 +140,7 @@ spec:
       port: 3478
       targetPort: 3478
       protocol: TCP
+    - name: relay-udp
+      port: 3478
+      targetPort: 3478
+      protocol: UDP

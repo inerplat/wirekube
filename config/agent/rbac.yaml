@@ -14,9 +14,18 @@ rules:
   - ""
   resources:
   - nodes
+  - services
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
 - apiGroups:
   - wirekube.io
   resources:
@@ -27,6 +36,8 @@ rules:
   - create
   - patch
   - update
+  - delete
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -43,6 +54,7 @@ rules:
   - get
   - list
   - update
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -57,6 +69,7 @@ rules:
   verbs:
   - get
   - list
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -65,6 +78,53 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers
+  verbs:
+  - get
+  - list
+  - watch
+  # create/delete are required because wirekubectl runs inside the agent
+  # pod ("kubectl exec ... wirekubectl invite alice") and uses the agent
+  # ServiceAccount to mint/revoke external peer CRs. The reconciler is the
+  # only writer of status; the agent itself does not patch status here.
+  - create
+  - delete
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers/status
+  verbs:
+  - get
+  - patch
+  - update
+# Leader election for the embedded WireKubeExternalPeer reconciler. Every
+# agent pod runs the reconciler manager but only the leader actually
+# reconciles, preventing N-fold relay-port allocations across the
+# DaemonSet replicas.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

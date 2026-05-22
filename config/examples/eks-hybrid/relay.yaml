@@ -34,10 +34,14 @@ spec:
           command: ["wirekube-relay"]
           args:
             - --addr=:3478
+            - --external-wg-addr=:3478
           ports:
-            - name: relay
+            - name: relay-tcp
               containerPort: 3478
               protocol: TCP
+            - name: relay-udp
+              containerPort: 3478
+              protocol: UDP
           readinessProbe:
             tcpSocket:
               port: 3478
@@ -59,6 +63,25 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: wirekube-relay-control
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: wirekube
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: wirekube-relay
+  ports:
+    - name: relay-control
+      port: 3478
+      targetPort: 3478
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: wirekube-relay
   namespace: wirekube-system
   labels:
@@ -74,3 +97,7 @@ spec:
       port: 3478
       targetPort: 3478
       protocol: TCP
+    - name: relay-udp
+      port: 3478
+      targetPort: 3478
+      protocol: UDP

@@ -14,8 +14,9 @@ var _ conn.Endpoint = (*WireKubeEndpoint)(nil)
 // When peerKey is set (relay-received packets), Send() uses it directly to look
 // up the pathTable instead of going through the addrToPeer reverse map.
 type WireKubeEndpoint struct {
-	dst     netip.AddrPort
-	peerKey [32]byte // set by relay ReceiveFunc; zero value means unset
+	dst            netip.AddrPort
+	peerKey        [32]byte // set by relay ReceiveFunc; zero value means unset
+	externalSource ExternalSource
 }
 
 // NewWireKubeEndpoint creates an endpoint from an address:port pair.
@@ -33,6 +34,9 @@ func (e *WireKubeEndpoint) SrcToString() string {
 
 // DstToString returns the destination address as "ip:port".
 func (e *WireKubeEndpoint) DstToString() string {
+	if e.externalSource.Valid && e.externalSource.Addr != "" {
+		return e.externalSource.Addr
+	}
 	return e.dst.String()
 }
 

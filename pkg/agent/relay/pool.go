@@ -30,12 +30,29 @@ type Pool struct {
 	// bindDelivery, when set, routes incoming relay data packets directly
 	// to the WireKubeBind instead of through UDPProxy. Used in userspace
 	// WireGuard mode where the Bind handles relay receive internally.
-	bindDelivery func(srcKey [32]byte, payload []byte)
+	bindDelivery func(DeliveredPacket)
 
 	// hintHandler, when set, receives bimodal hints relayed from remote peers.
 	hintHandler func(srcKey [32]byte)
 
 	cancel context.CancelFunc
+}
+
+// DeliveredPacket is a packet delivered from the relay pool to the userspace
+// WireGuard bind.
+type DeliveredPacket struct {
+	SrcKey         [relayproto.PubKeySize]byte
+	ExternalSource ExternalSource
+	Payload        []byte
+}
+
+// ExternalSource identifies a shared external-listener source on a specific
+// relay replica.
+type ExternalSource struct {
+	Valid     bool
+	RelayAddr string
+	Token     uint64
+	Addr      string
 }
 
 // NewPool creates a relay pool that discovers and connects to all instances
@@ -229,6 +246,18 @@ func (p *Pool) SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte
 	return lastErr
 }
 
+// SendToExternal sends a raw WireGuard response back through the relay replica
+// that delivered the corresponding ExternalData frame.
+func (p *Pool) SendToExternal(relayAddr string, sourceToken uint64, payload []byte) error {
+	p.mu.RLock()
+	c := p.clients[relayAddr]
+	p.mu.RUnlock()
+	if c == nil || !c.IsConnected() {
+		return fmt.Errorf("relay %s not connected", relayAddr)
+	}
+	return c.SendToExternal(sourceToken, payload)
+}
+
 // SendBimodalHint forwards a bimodal-hint to destPubKey via the first
 // reachable relay. The hint tells the destination peer to dual-send on both
 // direct and relay legs for the next few seconds.
@@ -269,7 +298,7 @@ func (p *Pool) Close() {
 // SetBindDelivery registers a callback that receives relay data packets
 // directly, bypassing UDPProxy. Used in userspace WireGuard mode where
 // the WireKubeBind handles relay receive internally.
-func (p *Pool) SetBindDelivery(fn func(srcKey [32]byte, payload []byte)) {
+func (p *Pool) SetBindDelivery(fn func(DeliveredPacket)) {
 	p.mu.Lock()
 	p.bindDelivery = fn
 	p.mu.Unlock()
@@ -300,12 +329,30 @@ func (p *Pool) handleData(srcKey [relayproto.PubKeySize]byte, payload []byte) {
 	p.mu.RUnlock()
 
 	if bd != nil {
-		bd(srcKey, payload)
+		bd(DeliveredPacket{SrcKey: srcKey, Payload: payload})
 		return
 	}
 	if ok {
 		proxy.DeliverToWireGuard(payload)
 	}
+}
+
+func (p *Pool) handleExternalData(relayAddr string, sourceToken uint64, sourceAddr string, payload []byte) {
+	p.mu.RLock()
+	bd := p.bindDelivery
+	p.mu.RUnlock()
+	if bd == nil {
+		return
+	}
+	bd(DeliveredPacket{
+		ExternalSource: ExternalSource{
+			Valid:     true,
+			RelayAddr: relayAddr,
+			Token:     sourceToken,
+			Addr:      sourceAddr,
+		},
+		Payload: payload,
+	})
 }
 
 func (p *Pool) handleHint(srcKey [relayproto.PubKeySize]byte) {
@@ -339,6 +386,7 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 
 	c := NewClient(addr, p.myPubKey, p.wgPort)
 	c.onData = p.handleData
+	c.onExternal = p.handleExternalData
 	c.onHint = p.handleHint
 	err := c.Connect(ctx)
 

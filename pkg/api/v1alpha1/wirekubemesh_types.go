@@ -159,6 +159,11 @@ type ExternalRelaySpec struct {
 	// Example: "relay.example.com:3478" or "203.0.113.10:3478"
 	Endpoint string `json:"endpoint"`
 
+	// ControlEndpoint is reserved for legacy relay control operations. Shared
+	// external peers use Endpoint directly and do not require this field.
+	// +optional
+	ControlEndpoint string `json:"controlEndpoint,omitempty"`
+
 	// Transport is the protocol used to connect to the relay.
 	// +kubebuilder:default=tcp
 	// +kubebuilder:validation:Enum=tcp;ws

@@ -6,10 +6,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,9 +22,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	agentpkg "github.com/wirekube/wirekube/pkg/agent"
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	externalctrl "github.com/wirekube/wirekube/pkg/controller/external"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 )
 
@@ -176,6 +181,18 @@ func main() {
 
 	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace)
 	ctx := ctrl.SetupSignalHandler()
+
+	// Start the WireKubeExternalPeer reconciler in a sibling controller-
+	// runtime manager. It allocates relay forwarder mappings through the
+	// relay control endpoint while advertising the public relay endpoint to
+	// official WireGuard clients.
+	relayNS := relayNamespace(podNamespace)
+	if err := startExternalPeerReconciler(ctx, log, restConfig, scheme, relayNS); err != nil {
+		// A reconciler-manager failure is non-fatal for the data plane
+		// (cluster mesh works without external peers). Log and continue.
+		log.Error(err, "external-peer reconciler failed to start; continuing without it")
+	}
+
 	log.Info("starting agent", "node", nodeName)
 	if err := a.Run(ctx); err != nil && err != context.Canceled {
 		log.Error(err, "agent error")
@@ -183,4 +200,117 @@ func main() {
 		os.Exit(1)
 	}
 	engine.Close()
+}
+
+func relayNamespace(podNamespace string) string {
+	if podNamespace != "" {
+		return podNamespace
+	}
+	return "wirekube-system"
+}
+
+// relayEndpointFromMesh derives the shared raw-WireGuard endpoint advertised
+// to official WireGuard external peers from the mesh CR's relay configuration.
+// The returned value is host:port; external peers no longer receive per-peer
+// UDP forwarder ports.
+func relayEndpointFromMesh(ctx context.Context, c client.Reader, mesh *wirekubev1alpha1.WireKubeMesh, namespace string) string {
+	if mesh == nil || mesh.Spec.Relay == nil {
+		return ""
+	}
+	if mesh.Spec.Relay.External != nil {
+		return mesh.Spec.Relay.External.Endpoint
+	}
+	if mesh.Spec.Relay.Managed != nil {
+		host := relayPublicHostFromService(ctx, c, namespace)
+		if host == "" {
+			return ""
+		}
+		port := int32(3478)
+		if mesh.Spec.Relay.Managed.Port != 0 {
+			port = mesh.Spec.Relay.Managed.Port
+		}
+		return net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
+	return ""
+}
+
+// relayControlAddrFromMesh returns an explicitly configured legacy relay
+// control address. Shared external peers use relayEndpointFromMesh directly
+// and do not need a relay control session.
+func relayControlAddrFromMesh(mesh *wirekubev1alpha1.WireKubeMesh, _ string) string {
+	if mesh == nil || mesh.Spec.Relay == nil {
+		return ""
+	}
+	if mesh.Spec.Relay.External != nil {
+		return mesh.Spec.Relay.External.ControlEndpoint
+	}
+	return ""
+}
+
+func relayPublicHostFromService(ctx context.Context, c client.Reader, namespace string) string {
+	svc := &corev1.Service{}
+	if err := c.Get(ctx, client.ObjectKey{Name: "wirekube-relay", Namespace: namespace}, svc); err != nil {
+		return ""
+	}
+	for _, ip := range svc.Spec.ExternalIPs {
+		if ip != "" {
+			return ip
+		}
+	}
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		if ing.IP != "" {
+			return ing.IP
+		}
+		if ing.Hostname != "" {
+			return ing.Hostname
+		}
+	}
+	return ""
+}
+
+// startExternalPeerReconciler spins up a controller-runtime manager
+// running the WireKubeExternalPeer reconciler. The manager runs in a
+// background goroutine; its lifetime is bound to ctx (the agent's
+// signal-aware context).
+func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfig *rest.Config, scheme *runtime.Scheme, relayNamespace string) error {
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                  scheme,
+		Metrics:                 metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress:  "0",
+		LeaderElection:          true,
+		LeaderElectionID:        "wirekube-external-peer.wirekube.io",
+		LeaderElectionNamespace: os.Getenv("POD_NAMESPACE"),
+	})
+	if err != nil {
+		return fmt.Errorf("create external-peer manager: %w", err)
+	}
+
+	r := &externalctrl.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Relay:  externalctrl.NewNoopRelayController(""),
+		RelayResolver: func(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) externalctrl.RelayController {
+			return relayControllerFromMesh(ctx, mgr.GetClient(), mesh, relayNamespace)
+		},
+	}
+	if err := r.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup external-peer reconciler: %w", err)
+	}
+
+	go func() {
+		log.Info("starting external-peer reconciler", "relayNamespace", relayNamespace)
+		if err := mgr.Start(ctx); err != nil {
+			log.Error(err, "external-peer manager exited")
+		}
+	}()
+	return nil
+}
+
+func relayControllerFromMesh(ctx context.Context, c client.Reader, mesh *wirekubev1alpha1.WireKubeMesh, namespace string) externalctrl.RelayController {
+	relayEndpoint := relayEndpointFromMesh(ctx, c, mesh, namespace)
+	relayControlAddr := relayControlAddrFromMesh(mesh, namespace)
+	if relayControlAddr != "" {
+		return externalctrl.NewFanoutRelayController(relayControlAddr, relayEndpoint)
+	}
+	return externalctrl.NewNoopRelayController(relayEndpoint)
 }

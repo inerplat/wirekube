@@ -20,4 +20,5 @@ func init() {
 	SchemeBuilder.Register(&WireKubeMesh{}, &WireKubeMeshList{})
 	SchemeBuilder.Register(&WireKubePeer{}, &WireKubePeerList{})
 	SchemeBuilder.Register(&WireKubeGateway{}, &WireKubeGatewayList{})
+	SchemeBuilder.Register(&WireKubeExternalPeer{}, &WireKubeExternalPeerList{})
 }
