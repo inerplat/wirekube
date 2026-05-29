@@ -3,6 +3,7 @@
 package wireguard
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -62,18 +63,48 @@ func EnsureRoutingRules() error {
 	// destinations not reachable through WireGuard tunnels.
 	wgRule.SuppressPrefixlen = 0
 
-	// Always remove and re-add the WK rule to ensure SuppressPrefixlen is
-	// applied. A stale rule without suppress (from a previous agent run or
-	// a failed setup attempt) would trap non-WG traffic and break API access.
-	staleWG := netlink.NewRule()
-	staleWG.Table = WKRouteTable
-	staleWG.Priority = 200
-	_ = netlink.RuleDel(staleWG) // ignore error if rule doesn't exist
-
-	if err := netlink.RuleAdd(wgRule); err != nil {
-		return fmt.Errorf("adding wg table rule: %w", err)
+	// Reassert the WK rule idempotently. EnsureRoutingRules runs on every sync
+	// tick (not only at startup) so the rule self-heals if a co-resident
+	// component — notably Cilium's ip-rule reconciliation — flushes it. When a
+	// healthy exact catch-all rule is already present we leave it untouched, so
+	// the steady-state tick performs no Del/Add and never opens a window where
+	// traffic falls through to the main table. Only when the rule is missing or
+	// stale/selector-limited (e.g. an old rule without SuppressPrefixlen, which
+	// would trap non-WG traffic and break API access) do we delete and re-add it.
+	if err := ensureWGTableRule(wgRule); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+func ensureWGTableRule(wgRule *netlink.Rule) error {
+	rules, err := netlink.RuleList(syscall.AF_INET)
+	if err != nil {
+		return fmt.Errorf("listing wg table rules: %w", err)
+	}
+
+	healthy, toDelete := wgTableRulePlan(rules)
+	if healthy {
+		return nil
+	}
+
+	for _, r := range toDelete {
+		rule := r
+		if err := netlink.RuleDel(&rule); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("deleting stale wg table rule: %w", err)
+		}
+	}
+
+	if err := netlink.RuleAdd(wgRule); err != nil {
+		if isNetlinkFileExists(err) {
+			rules, listErr := netlink.RuleList(syscall.AF_INET)
+			if listErr == nil && wgRuleHealthyIn(rules) {
+				return nil
+			}
+		}
+		return fmt.Errorf("adding wg table rule: %w", err)
+	}
 	return nil
 }
 
@@ -141,10 +172,11 @@ func SyncRoutesForLink(linkIndex int, preferredSrc net.IP, desired []string) err
 // that the route already exists. netlink returns a sentinel string rather
 // than a typed error, so a string compare is the interface we have.
 func isRouteExists(err error) bool {
-	if err == nil {
-		return false
-	}
-	return err.Error() == "file exists"
+	return isNetlinkFileExists(err)
+}
+
+func isNetlinkFileExists(err error) bool {
+	return err != nil && err.Error() == "file exists"
 }
 
 // AddRouteForLink adds a route for dst through the given link in the WireKube
@@ -204,6 +236,63 @@ func fwmarkRulePriority() int {
 		prio = 199
 	}
 	return prio
+}
+
+// wgRuleHealthyIn is the pure predicate behind ensureWGTableRule. The WK table
+// rule must be an exact catch-all table lookup rule; any rule at the same
+// table/priority that carries selectors or stale attributes is unhealthy and
+// must be recreated.
+func wgRuleHealthyIn(rules []netlink.Rule) bool {
+	found := 0
+	for _, r := range rules {
+		if r.Table != WKRouteTable || r.Priority != 200 {
+			continue
+		}
+		if !wgRuleExactCatchAll(r) {
+			return false
+		}
+		found++
+	}
+	return found == 1
+}
+
+func wgRuleExactCatchAll(r netlink.Rule) bool {
+	return r.Table == WKRouteTable &&
+		r.Priority == 200 &&
+		r.SuppressPrefixlen == 0 &&
+		r.Mark == 0 &&
+		r.Mask == nil &&
+		r.Tos == 0 &&
+		r.TunID == 0 &&
+		r.Goto < 0 &&
+		r.Src == nil &&
+		r.Dst == nil &&
+		r.Flow < 0 &&
+		r.IifName == "" &&
+		r.OifName == "" &&
+		r.SuppressIfgroup < 0 &&
+		!r.Invert &&
+		r.Dport == nil &&
+		r.Sport == nil &&
+		r.IPProto == 0 &&
+		r.UIDRange == nil
+}
+
+func wgTableRulePlan(rules []netlink.Rule) (bool, []netlink.Rule) {
+	if wgRuleHealthyIn(rules) {
+		return true, nil
+	}
+	return false, wgTablePriorityRules(rules)
+}
+
+func wgTablePriorityRules(rules []netlink.Rule) []netlink.Rule {
+	out := make([]netlink.Rule, 0)
+	for _, r := range rules {
+		if r.Table == WKRouteTable && r.Priority == 200 {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // ruleExists checks if a matching ip rule already exists.

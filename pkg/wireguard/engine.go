@@ -47,6 +47,12 @@ type WGEngine interface {
 	AddRoute(dst string) error
 	DelRoute(dst string) error
 
+	// EnsureRoutingRules (re)asserts the fwmark and WireKube-table ip rules
+	// that activate the WireKube routing table. Idempotent and safe to call on
+	// every sync tick so the rules self-heal if another component (e.g. Cilium)
+	// flushes them; the routes in the WK table are inert without these rules.
+	EnsureRoutingRules() error
+
 	// Path control for ICE negotiation.
 	// SetPeerPath updates the Bind's pathTable atomically so the next Send()
 	// for this peer uses the requested transport mode.

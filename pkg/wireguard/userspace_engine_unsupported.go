@@ -75,6 +75,10 @@ func (u *UserspaceEngine) SyncRoutes(_ []string) error {
 	return errUserspaceEngineUnsupported
 }
 
+func (u *UserspaceEngine) EnsureRoutingRules() error {
+	return errUserspaceEngineUnsupported
+}
+
 func (u *UserspaceEngine) AddRoute(_ string) error {
 	return errUserspaceEngineUnsupported
 }
