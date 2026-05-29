@@ -379,6 +379,13 @@ func (u *UserspaceEngine) SyncRoutes(desired []string) error {
 	return SyncRoutesForLink(u.linkIndex, u.preferredSrc, desired)
 }
 
+// EnsureRoutingRules delegates to the package-level idempotent implementation.
+// Called both at startup (via Configure) and on every sync tick so the ip
+// rules self-heal if a co-resident component flushes them.
+func (u *UserspaceEngine) EnsureRoutingRules() error {
+	return EnsureRoutingRules()
+}
+
 // AddRoute delegates to the shared AddRouteForLink.
 func (u *UserspaceEngine) AddRoute(dst string) error {
 	return AddRouteForLink(u.linkIndex, u.preferredSrc, dst)

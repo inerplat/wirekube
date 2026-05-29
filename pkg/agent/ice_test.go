@@ -44,6 +44,7 @@ func (f *fakeWGEngine) GetStats() ([]wireguard.PeerStats, error) { return f.stat
 func (f *fakeWGEngine) SetAddress(string) error                  { return nil }
 func (f *fakeWGEngine) SetPreferredSrc(string)                   {}
 func (f *fakeWGEngine) SyncRoutes([]string) error                { return nil }
+func (f *fakeWGEngine) EnsureRoutingRules() error                { return nil }
 func (f *fakeWGEngine) AddRoute(string) error                    { return nil }
 func (f *fakeWGEngine) DelRoute(string) error                    { return nil }
 func (f *fakeWGEngine) SetPeerPath(_ string, mode wireguard.PathMode, _ string) error {
