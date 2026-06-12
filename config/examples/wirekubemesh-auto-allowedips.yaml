@@ -5,9 +5,10 @@
 # kubectl patch each WireKubePeer after node join.
 #
 # Behavior:
-#   - autoAllowedIPs.strategy=node-internal-ip: if AllowedIPs is currently
-#     empty, the agent auto-sets it to <Node.Status.InternalIP>/32.
-#   - If AllowedIPs is already set (manually or previously), it is NOT overwritten.
+#   - meshCIDR assigns every peer a deterministic overlay /32.
+#   - autoAllowedIPs.includeNodeInternalIP appends <Node.Status.InternalIP>/32
+#     so kube-apiserver -> kubelet/logs/exec traffic can route through WireKube
+#     when the physical node IP is not directly reachable.
 #
 # kubectl apply -f config/examples/wirekubemesh-auto-allowedips.yaml
 apiVersion: wirekube.io/v1alpha1
@@ -18,8 +19,11 @@ spec:
   listenPort: 51822
   interfaceName: wire_kube
   mtu: 1420
+  # Example only. Replace with a private range that does not overlap with node,
+  # pod, service, VPC, proxy, or corporate networks.
+  meshCIDR: 172.31.240.0/20
   stunServers:
     - stun.cloudflare.com:3478
     - stun.l.google.com:19302
   autoAllowedIPs:
-    strategy: node-internal-ip
+    includeNodeInternalIP: true

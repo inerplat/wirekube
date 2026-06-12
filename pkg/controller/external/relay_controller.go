@@ -21,6 +21,12 @@ import (
 // mutating calls when no control path is configured.
 var ErrNotImplemented = errors.New("relay controller: not implemented")
 
+// ErrIngressProbeDisabled means the relay data plane is available but the
+// optional ingress-probe control frame is disabled. Shared-endpoint external
+// peers must still be reconciled in this mode; they fall back to peer status
+// and load-based selection.
+var ErrIngressProbeDisabled = errors.New("relay ingress probe disabled")
+
 // RelayController is the surface the reconciler uses to publish the relay
 // endpoint and, for legacy allocations, register or tear down per-peer UDP
 // forwarder mappings on the relay.

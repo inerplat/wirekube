@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,8 @@ type Client struct {
 	relayAddr string
 	myPubKey  [relayproto.PubKeySize]byte
 	wgPort    int
+	proxyMode ProxyMode
+	proxyURL  *url.URL
 
 	mu      sync.RWMutex
 	conn    net.Conn
@@ -61,9 +64,24 @@ func NewClient(relayAddr string, myPubKey [relayproto.PubKeySize]byte, wgPort in
 		relayAddr:   relayAddr,
 		myPubKey:    myPubKey,
 		wgPort:      wgPort,
+		proxyMode:   ProxyDisabled,
 		proxies:     make(map[[relayproto.PubKeySize]byte]*UDPProxy),
 		reconnectCh: make(chan struct{}, 1),
 	}
+}
+
+func (c *Client) SetProxyMode(mode ProxyMode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.proxyMode = mode.normalized()
+	c.proxyURL = nil
+}
+
+func (c *Client) SetProxyURL(proxyURL *url.URL) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.proxyMode = ProxyExplicit
+	c.proxyURL = proxyURL
 }
 
 // IsConnected returns whether the relay TCP connection is alive.
@@ -101,7 +119,11 @@ func (c *Client) dial(ctx context.Context) error {
 		Timeout: dialTimeout,
 		Control: dialControl,
 	}
-	conn, err := dialer.DialContext(ctx, "tcp", c.relayAddr)
+	c.mu.RLock()
+	proxyMode := c.proxyMode
+	proxyURL := c.proxyURL
+	c.mu.RUnlock()
+	conn, err := dialRelay(ctx, &dialer, c.relayAddr, proxyMode, proxyURL)
 	if err != nil {
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
