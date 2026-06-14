@@ -3,13 +3,10 @@
 #
 # Key configuration choices:
 #
-#   autoAllowedIPs (node-internal-ip):
-#     Automatically sets AllowedIPs to <InternalIP>/32 for new peers.
-#     Cloud nodes use VPC IPs; hybrid nodes use their on-prem private IPs.
-#
-#   podCIDRRouting (enabled):
-#     Appends Node.Spec.PodCIDR to AllowedIPs. Only Cilium hybrid nodes
-#     have this field; VPC CNI cloud nodes do not and are safely skipped.
+#   meshCIDR + autoAllowedIPs.includeNodeInternalIP:
+#     Assigns a deterministic mesh /32 and appends <InternalIP>/32 for each
+#     peer. The InternalIP route lets kube-apiserver -> kubelet/logs/exec
+#     traffic traverse WireKube when hybrid node IPs are not directly reachable.
 #
 #   relay (auto, external):
 #     Tries direct P2P first (STUN endpoint discovery), falls back to
@@ -34,15 +31,15 @@ spec:
   listenPort: 51822
   interfaceName: wire_kube
   mtu: 1420
+  # Example only. Replace with a private range that does not overlap with node,
+  # pod, service, VPC, proxy, or corporate networks.
+  meshCIDR: 172.31.240.0/20
   stunServers:
     - stun.cloudflare.com:3478
     - stun.l.google.com:19302
 
   autoAllowedIPs:
-    strategy: node-internal-ip
-
-  podCIDRRouting:
-    enabled: true
+    includeNodeInternalIP: true
 
   natTraversal:
     birthdayAttack: enabled

@@ -3,13 +3,12 @@
 #
 # Runs on every node (cloud + hybrid) with hostNetwork: true.
 #
-# IMPORTANT: Set KUBERNETES_SERVICE_HOST/PORT to the EKS public API endpoint.
+# IMPORTANT: Set WIREKUBE_KUBE_APISERVER to the EKS public API endpoint.
 # Hybrid nodes cannot reach the ClusterIP (172.16.0.1) before CNI is ready,
 # and the agent needs API access at startup to create its WireKubePeer CR.
 #
-# Replace the KUBERNETES_SERVICE_HOST value with your EKS cluster endpoint:
+# Replace the WIREKUBE_KUBE_APISERVER value with your EKS cluster endpoint:
 #   aws eks describe-cluster --name <CLUSTER> --query cluster.endpoint --output text
-#   → strip "https://" prefix
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -17,6 +16,8 @@ metadata:
   namespace: wirekube-system
   labels:
     app: wirekube-agent
+    app.kubernetes.io/name: wirekube-agent
+    app.kubernetes.io/component: agent
 spec:
   selector:
     matchLabels:
@@ -29,6 +30,8 @@ spec:
     metadata:
       labels:
         app: wirekube-agent
+        app.kubernetes.io/name: wirekube-agent
+        app.kubernetes.io/component: agent
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
@@ -77,10 +80,8 @@ spec:
             - name: WIREKUBE_INTERFACE
               value: "wire_kube"
             # EKS public API endpoint (required for hybrid nodes)
-            - name: KUBERNETES_SERVICE_HOST
-              value: "REPLACE_WITH_EKS_API_ENDPOINT"  # e.g. XXXXX.gr7.ap-northeast-2.eks.amazonaws.com
-            - name: KUBERNETES_SERVICE_PORT
-              value: "443"
+            - name: WIREKUBE_KUBE_APISERVER
+              value: "https://REPLACE_WITH_EKS_API_ENDPOINT"  # e.g. https://XXXXX.gr7.ap-northeast-2.eks.amazonaws.com
           securityContext:
             capabilities:
               add: ["NET_ADMIN", "SYS_MODULE"]

@@ -64,7 +64,7 @@ kind: WireKubeMesh
 metadata:
   name: default
 spec:
-  meshCIDR: "100.64.0.0/10"   # recommended CGNAT range
+  meshCIDR: "172.31.240.0/20" # example only; choose a non-overlapping private range
   autoAllowedIPs:
     includeNodeInternalIP: true  # optionally also publish each node's private IP
 ```
