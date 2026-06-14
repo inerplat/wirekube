@@ -278,6 +278,41 @@ func TestFanoutRelayController_ProbeIngressLatencyRequiresEveryReplica(t *testin
 	}
 }
 
+func TestRemoteRelayController_ProbeIngressLatencyDisabled(t *testing.T) {
+	server := startFakeRelayControl(t, 53042)
+	defer server.Close()
+	server.SetProbeError("relay control disabled")
+
+	var key [32]byte
+	_, err := NewRemoteRelayController(server.Addr(), "relay.example.com").ProbeIngressLatency(context.Background(), [][32]byte{key})
+	if !errors.Is(err, ErrIngressProbeDisabled) {
+		t.Fatalf("ProbeIngressLatency error = %v, want ErrIngressProbeDisabled", err)
+	}
+}
+
+func TestFanoutRelayController_ProbeIngressLatencyDisabledFallsBack(t *testing.T) {
+	first := startFakeRelayControl(t, 53042)
+	second := startFakeRelayControl(t, 61000)
+	defer first.Close()
+	defer second.Close()
+	first.SetProbeError("relay control disabled")
+	second.SetProbeError("relay control disabled")
+
+	var key [32]byte
+	c := &FanoutRelayController{endpoint: "relay.example.com"}
+	c.controllersFn = func() []*RemoteRelayController {
+		return []*RemoteRelayController{
+			NewRemoteRelayController(first.Addr(), c.endpoint),
+			NewRemoteRelayController(second.Addr(), c.endpoint),
+		}
+	}
+
+	_, err := c.ProbeIngressLatency(context.Background(), [][32]byte{key})
+	if !errors.Is(err, ErrIngressProbeDisabled) {
+		t.Fatalf("ProbeIngressLatency error = %v, want ErrIngressProbeDisabled", err)
+	}
+}
+
 type fakeRelayControl struct {
 	ln net.Listener
 
@@ -287,6 +322,7 @@ type fakeRelayControl struct {
 	registers    []fakeRelayRegister
 	unregisters  []uint16
 	probeRTTs    map[[32]byte]time.Duration
+	probeErr     string
 	probeReqs    [][][32]byte
 }
 
@@ -337,6 +373,12 @@ func (f *fakeRelayControl) SetProbeLatencies(latencies map[[32]byte]time.Duratio
 	for key, rtt := range latencies {
 		f.probeRTTs[key] = rtt
 	}
+}
+
+func (f *fakeRelayControl) SetProbeError(message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeErr = message
 }
 
 func (f *fakeRelayControl) ProbeRequests() [][][32]byte {
@@ -402,6 +444,12 @@ func (f *fakeRelayControl) handle(conn net.Conn) {
 			return
 		}
 		f.mu.Lock()
+		if f.probeErr != "" {
+			probeErr := f.probeErr
+			f.mu.Unlock()
+			_ = relay.WriteFrame(conn, relay.MakeErrorFrame(probeErr))
+			return
+		}
 		f.probeReqs = append(f.probeReqs, append([][32]byte(nil), keys...))
 		results := make([]relay.IngressProbeResult, 0, len(keys))
 		for _, key := range keys {

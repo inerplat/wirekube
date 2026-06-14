@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,7 +131,11 @@ func (c *RemoteRelayController) ProbeIngressLatency(ctx context.Context, ingress
 		return nil, err
 	}
 	if resp.Type == relay.MsgError {
-		return nil, fmt.Errorf("relay refused ingress probe: %s", string(resp.Body))
+		body := string(resp.Body)
+		if strings.Contains(body, "relay control disabled") {
+			return nil, fmt.Errorf("%w: %s", ErrIngressProbeDisabled, body)
+		}
+		return nil, fmt.Errorf("relay refused ingress probe: %s", body)
 	}
 	if resp.Type != relay.MsgIngressProbe {
 		return nil, fmt.Errorf("unexpected response type %#x to ingress probe", resp.Type)
@@ -296,9 +301,14 @@ func (c *FanoutRelayController) ProbeIngressLatency(ctx context.Context, ingress
 	seen := make(map[[32]byte]int, len(ingressPubKeys))
 	maxRTT := make(map[[32]byte]time.Duration, len(ingressPubKeys))
 	var errs []error
+	probeDisabled := false
 	for range controllers {
 		resp := <-responses
 		if resp.err != nil {
+			if errors.Is(resp.err, ErrIngressProbeDisabled) {
+				probeDisabled = true
+				continue
+			}
 			errs = append(errs, fmt.Errorf("relay fanout ingress probe %s: %w", resp.addr, resp.err))
 			continue
 		}
@@ -308,6 +318,9 @@ func (c *FanoutRelayController) ProbeIngressLatency(ctx context.Context, ingress
 				maxRTT[key] = rtt
 			}
 		}
+	}
+	if probeDisabled {
+		return nil, ErrIngressProbeDisabled
 	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err

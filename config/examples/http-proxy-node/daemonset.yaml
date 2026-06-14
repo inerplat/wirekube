@@ -1,17 +1,33 @@
 ---
+# WireKube Agent DaemonSet for nodes that can reach the relay/apiserver only
+# through an HTTP CONNECT proxy.
+#
+# Usage:
+#   1. Label proxy-only nodes:
+#        kubectl label node <node> wirekube.io/proxy-node=true
+#   2. If the normal agent is already running on that node, delete that pod so
+#      the default DaemonSet does not keep managing the newly labeled node:
+#        kubectl -n wirekube-system delete pod -l app=wirekube-agent \
+#          --field-selector spec.nodeName=<node>
+#   3. Replace REPLACE_WITH_* values below.
+#   4. Apply this manifest in addition to config/agent/rbac.yaml.
+#
+# The default config/agent/daemonset.yaml excludes wirekube.io/proxy-node=true
+# nodes so proxy settings do not leak onto ordinary nodes.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: wirekube-agent
+  name: wirekube-agent-proxy
   namespace: wirekube-system
   labels:
-    app: wirekube-agent
+    app: wirekube-agent-proxy
     app.kubernetes.io/name: wirekube-agent
     app.kubernetes.io/component: agent
+    app.kubernetes.io/variant: proxy
 spec:
   selector:
     matchLabels:
-      app: wirekube-agent
+      app: wirekube-agent-proxy
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
@@ -19,9 +35,10 @@ spec:
   template:
     metadata:
       labels:
-        app: wirekube-agent
+        app: wirekube-agent-proxy
         app.kubernetes.io/name: wirekube-agent
         app.kubernetes.io/component: agent
+        app.kubernetes.io/variant: proxy
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
@@ -35,19 +52,19 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: wirekube.io/proxy-node
-                    operator: NotIn
+                    operator: In
                     values:
                       - "true"
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
-                  app: wirekube-agent-proxy
+                  app: wirekube-agent
               topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 30
       containers:
         - name: agent
-          image: inerplat/wirekube:v0.0.8-dev.15
+          image: inerplat/wirekube:latest
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
@@ -66,25 +83,24 @@ spec:
                   fieldPath: metadata.namespace
             - name: WIREKUBE_INTERFACE
               value: "wire_kube"
-            # Do not put HTTP_PROXY/HTTPS_PROXY here for clusters where only a
-            # subset of nodes needs egress proxying. Label those nodes with
-            # wirekube.io/proxy-node=true and deploy the dedicated proxy-node
-            # example manifest instead.
-            #
-            # Bootstrap-only Kubernetes API override for nodes that cannot reach
-            # the in-cluster Service IP before WireKube routes exist:
-            # - name: WIREKUBE_KUBE_APISERVER
-            #   value: "https://YOUR_KUBE_APISERVER_ENDPOINT"
+            # Bootstrap Kubernetes API endpoint. This must be reachable through
+            # HTTPS_PROXY before WireKube routes exist.
+            - name: WIREKUBE_KUBE_APISERVER
+              value: "https://REPLACE_WITH_KUBE_APISERVER_ENDPOINT"
+            # Relay TCP connections use the HTTP CONNECT proxy for this node.
+            - name: WIREKUBE_RELAY_PROXY
+              value: "environment"
+            - name: HTTPS_PROXY
+              value: "http://REPLACE_WITH_PROXY_HOST:3128"
+            - name: HTTP_PROXY
+              value: "http://REPLACE_WITH_PROXY_HOST:3128"
+            # Keep local and in-cluster destinations direct. Do not include the
+            # apiserver or relay host here when those are reachable only through
+            # the proxy.
+            - name: NO_PROXY
+              value: "localhost,127.0.0.1,.svc,.cluster.local,10.96.0.0/12,10.244.0.0/16"
           securityContext:
-            # privileged is required to open /dev/net/tun on Ubuntu 24.04+
-            # hosts where containerd's default device cgroup denies TUN
-            # write even with CAP_NET_ADMIN. Older distros with permissive
-            # device cgroups could get by with capabilities alone, but the
-            # userspace engine needs the TUN device on every node so we
-            # enable privileged here.
             privileged: true
-            # Unconfined AppArmor: the default containerd profile denies
-            # TUN-related operations on Ubuntu 24.04.
             appArmorProfile:
               type: Unconfined
             capabilities:

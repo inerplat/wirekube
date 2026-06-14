@@ -369,7 +369,7 @@ kubectl -n wirekube-system rollout restart ds/wirekube-agent
 | `ip rule show` | Routing policy (check fwmark 0x574B) |
 | `ss -tnp \| grep 3478` | Relay TCP connection status |
 | `kubectl get wirekubepeers -o wide` | All peer CRDs |
-| `kubectl logs -n wirekube-system -l app=wirekube-agent` | Agent logs |
+| `kubectl logs -n wirekube-system -l app.kubernetes.io/name=wirekube-agent` | Agent logs |
 | `tcpdump -i wire_kube -n` | WireGuard decrypted traffic |
 | `tcpdump -i eth0 udp port 51820` | WireGuard encrypted packets |
 | `cat /proc/sys/net/ipv4/conf/wire_kube/disable_xfrm` | xfrm bypass status |

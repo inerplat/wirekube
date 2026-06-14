@@ -5,9 +5,11 @@ metadata:
   namespace: wirekube-system
   labels:
     app: wirekube-agent
+    app.kubernetes.io/name: wirekube-agent
+    app.kubernetes.io/component: agent
 spec:
   selector:
-    app: wirekube-agent
+    app.kubernetes.io/name: wirekube-agent
   ports:
     - name: metrics
       port: 9090

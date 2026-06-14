@@ -55,8 +55,8 @@ kubectl get wirekubemesh default -o yaml
 ## Agent Logs
 
 ```bash
-kubectl logs -n wirekube-system -l app=wirekube-agent --tail=50
-kubectl logs -n wirekube-system -l app=wirekube-agent \
+kubectl logs -n wirekube-system -l app.kubernetes.io/name=wirekube-agent --tail=50
+kubectl logs -n wirekube-system -l app.kubernetes.io/name=wirekube-agent \
   --field-selector spec.nodeName=<node-name> --tail=100
 ```
 
@@ -79,7 +79,9 @@ Key log messages:
 
 The agent exposes Prometheus metrics on `:9090/metrics`. Use the provided
 ServiceMonitor (`config/agent/servicemonitor.yaml`) for Prometheus Operator
-auto-discovery.
+auto-discovery. It selects `app.kubernetes.io/name=wirekube-agent`, so the
+standard agent DaemonSet and the proxy-node agent DaemonSet are scraped by the
+same ServiceMonitor.
 
 ### Available Metrics
 

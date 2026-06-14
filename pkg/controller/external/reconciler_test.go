@@ -432,6 +432,47 @@ func TestReconcile_AutoIngressKeepsFastPeerWhenLoadPenaltyIsSmallerThanRTTGap(t 
 	}
 }
 
+func TestReconcile_AutoIngressFallsBackWhenIngressProbeDisabled(t *testing.T) {
+	cr := newExternalPeer(testExternalName)
+	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer())
+	relayCtl := newProbeRelay(testRelayHost, nil)
+	relayCtl.probeErr = ErrIngressProbeDisabled
+	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: relayCtl}
+
+	reconcileTwice(t, r, testExternalName)
+
+	got := getCR(t, c, testExternalName)
+	if got.Status.Phase != wirekubev1alpha1.ExternalPeerPhaseActive {
+		t.Fatalf("phase = %q, want Active", got.Status.Phase)
+	}
+	if got.Status.IngressPeerName != testIngressPeer {
+		t.Fatalf("ingressPeerName = %q, want %q", got.Status.IngressPeerName, testIngressPeer)
+	}
+	if relayCtl.probeN.Load() != 1 {
+		t.Fatalf("ProbeIngressLatency calls = %d, want 1", relayCtl.probeN.Load())
+	}
+}
+
+func TestReconcile_ExplicitIngressPeerFallsBackWhenIngressProbeDisabled(t *testing.T) {
+	cr := newExternalPeer(testExternalName, func(p *wirekubev1alpha1.WireKubeExternalPeer) {
+		p.Spec.IngressPeer = "node-a"
+	})
+	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer())
+	relayCtl := newProbeRelay(testRelayHost, nil)
+	relayCtl.probeErr = ErrIngressProbeDisabled
+	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: relayCtl}
+
+	reconcileTwice(t, r, testExternalName)
+
+	got := getCR(t, c, testExternalName)
+	if got.Status.Phase != wirekubev1alpha1.ExternalPeerPhaseActive {
+		t.Fatalf("phase = %q, want Active", got.Status.Phase)
+	}
+	if got.Status.IngressPeerName != "node-a" {
+		t.Fatalf("ingressPeerName = %q, want node-a", got.Status.IngressPeerName)
+	}
+}
+
 func TestReconcile_ExplicitIngressPeerMustBeReachableFromRelay(t *testing.T) {
 	nodeAKey := ingressPubKey()
 	if _, err := decodeWGKey(nodeAKey); err != nil {

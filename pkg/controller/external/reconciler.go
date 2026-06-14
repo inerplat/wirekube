@@ -373,6 +373,9 @@ func (r *Reconciler) resolveNamedIngressPeer(ctx context.Context, cr *wirekubev1
 		defer cancel()
 		got, err := prober.ProbeIngressLatency(probeCtx, [][32]byte{pubKey})
 		if err != nil {
+			if errors.Is(err, ErrIngressProbeDisabled) {
+				return peerName, pubKey, ctrl.Result{}, nil, true
+			}
 			res, retErr := r.markPending(ctx, cr, reasonIngressProbeFailed,
 				fmt.Sprintf("relay ingress probe failed: %v", err), requeueShort)
 			return "", zero, res, retErr, false
@@ -430,6 +433,9 @@ func (r *Reconciler) probeIngressLatencies(ctx context.Context, relayCtl RelayCo
 	defer cancel()
 	got, err := prober.ProbeIngressLatency(probeCtx, keys)
 	if err != nil {
+		if errors.Is(err, ErrIngressProbeDisabled) {
+			return nil, false, nil
+		}
 		return nil, true, err
 	}
 	return got, true, nil

@@ -39,6 +39,7 @@ type Agent struct {
 	nodeName     string
 	podName      string
 	podNamespace string
+	apiServer    string
 	syncEvery    time.Duration
 
 	relayPool    *agentrelay.Pool
@@ -134,8 +135,13 @@ type peerTrafficSnapshot struct {
 // far above this threshold.
 const meaningfulTrafficDeltaBytes = 512
 
+const (
+	envRelayProxyMode        = "WIREKUBE_RELAY_PROXY"
+	nodeAnnotationRelayProxy = "wirekube.io/relay-proxy"
+)
+
 // NewAgent creates a new Agent.
-func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine, nodeName, podName, podNamespace string) *Agent {
+func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine, nodeName, podName, podNamespace, apiServer string) *Agent {
 	a := &Agent{
 		log:                  log,
 		client:               k8sClient,
@@ -143,6 +149,7 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		nodeName:             nodeName,
 		podName:              podName,
 		podNamespace:         podNamespace,
+		apiServer:            apiServer,
 		syncEvery:            parseSyncEvery(),
 		peerFirstSeen:        make(map[string]time.Time),
 		relayedPeers:         make(map[string]bool),
@@ -1384,8 +1391,10 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	copy(pubKey[:], keyBytes)
 
 	wgPort := a.wgMgr.ListenPort()
-	a.log.Info("relay proxy configured", "wgPort", wgPort)
 	a.relayPool = agentrelay.NewPool(endpoint, pubKey, wgPort)
+	proxyMode := a.relayProxyMode(ctx)
+	a.relayPool.SetProxyMode(proxyMode)
+	a.log.Info("relay proxy configured", "wgPort", wgPort, "proxyMode", proxyMode)
 
 	// Inject relay transport into the WG engine BEFORE Connect so that even
 	// if the initial dial fails, the Bind is wired up and ready when the
@@ -1428,6 +1437,39 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
 	return nil
+}
+
+func (a *Agent) relayProxyMode(ctx context.Context) agentrelay.ProxyMode {
+	defaultMode := agentrelay.ProxyDisabled
+	if mode, ok := parseRelayProxyMode(os.Getenv(envRelayProxyMode)); ok {
+		defaultMode = mode
+	}
+
+	node := &corev1.Node{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, node); err != nil {
+		a.log.Error(err, "failed to read node relay proxy annotation; using default relay proxy policy", "annotation", nodeAnnotationRelayProxy, "defaultMode", defaultMode)
+		return defaultMode
+	}
+	raw := strings.ToLower(strings.TrimSpace(node.Annotations[nodeAnnotationRelayProxy]))
+	if raw == "" {
+		return defaultMode
+	}
+	if mode, ok := parseRelayProxyMode(raw); ok {
+		return mode
+	}
+	a.log.Info("unknown relay proxy annotation value; using default relay proxy policy", "annotation", nodeAnnotationRelayProxy, "value", raw, "defaultMode", defaultMode)
+	return defaultMode
+}
+
+func parseRelayProxyMode(raw string) (agentrelay.ProxyMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "env", "environment", "enabled", "enable", "true", "on", "proxy":
+		return agentrelay.ProxyFromEnvironment, true
+	case "disabled", "disable", "false", "off", "direct", "none":
+		return agentrelay.ProxyDisabled, true
+	default:
+		return agentrelay.ProxyDisabled, false
+	}
 }
 
 func managedRelayControlEndpoint(namespace string, port int32) string {

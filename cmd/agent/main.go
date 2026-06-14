@@ -179,7 +179,7 @@ func main() {
 		}
 	}()
 
-	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace)
+	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace, restConfig.Host)
 	ctx := ctrl.SetupSignalHandler()
 
 	// Start the WireKubeExternalPeer reconciler in a sibling controller-

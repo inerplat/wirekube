@@ -269,17 +269,17 @@ kubectl get svc wirekube-relay -n wirekube-system -w
 
 ### Agent DaemonSet
 
-Update `KUBERNETES_SERVICE_HOST` with your EKS API endpoint, then deploy:
+Update `WIREKUBE_KUBE_APISERVER` with your EKS API endpoint, then deploy:
 
 ```bash
 EKS_ENDPOINT=$(aws eks describe-cluster --name <CLUSTER> \
-  --query 'cluster.endpoint' --output text | sed 's|https://||')
+  --query 'cluster.endpoint' --output text)
 
-echo "Set KUBERNETES_SERVICE_HOST to: ${EKS_ENDPOINT}"
+echo "Set WIREKUBE_KUBE_APISERVER to: ${EKS_ENDPOINT}"
 kubectl apply -f config/examples/eks-hybrid/daemonset.yaml
 ```
 
-!!! note "Why KUBERNETES_SERVICE_HOST?"
+!!! note "Why WIREKUBE_KUBE_APISERVER?"
     Hybrid nodes cannot reach the Kubernetes service ClusterIP before CNI
     is ready. The agent needs API access at startup to create its
     WireKubePeer CRD. The EKS public endpoint bypasses this dependency.

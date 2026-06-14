@@ -328,11 +328,12 @@ spec:
   listenPort: 51822
   interfaceName: wire_kube
   mtu: 1420
+  meshCIDR: 172.31.240.0/20
   stunServers:
     - stun.cloudflare.com:3478
     - stun.l.google.com:19302
   autoAllowedIPs:
-    strategy: node-internal-ip
+    includeNodeInternalIP: true
 EOF
 ```
 

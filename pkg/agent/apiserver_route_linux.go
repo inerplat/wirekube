@@ -3,12 +3,17 @@
 package agent
 
 import (
+	"errors"
 	"net"
 	"net/url"
-	"os"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
+)
+
+const (
+	apiServerRulePriority = 199
+	mainRouteTable        = 254
 )
 
 // ensureAPIServerRoute adds an ip rule that forces API server traffic to use
@@ -21,53 +26,93 @@ import (
 // Rule: to <API_SERVER_IP>/32 lookup main priority 199
 // This sits just below the fwmark rule and above the WK table rule (priority 200).
 func (a *Agent) ensureAPIServerRoute() {
-	apiIP := apiServerIP()
+	apiIP := apiServerIP(a.apiServer)
+
+	rules, err := netlink.RuleList(syscall.AF_INET)
+	if err == nil {
+		hasCurrent, stale := apiserverRulePlan(rules, apiIP)
+		for _, r := range stale {
+			rule := r
+			if err := netlink.RuleDel(&rule); err != nil && !errors.Is(err, syscall.ESRCH) {
+				a.log.Error(err, "failed to remove stale API server ip rule", "rule", rule.String())
+			} else {
+				a.log.Info("stale API server route rule removed", "rule", rule.String())
+			}
+		}
+		if hasCurrent {
+			return
+		}
+	}
+
 	if apiIP == nil {
 		return
 	}
 
 	rule := netlink.NewRule()
 	rule.Dst = &net.IPNet{IP: apiIP, Mask: net.CIDRMask(32, 32)}
-	rule.Table = 254 // main
-	rule.Priority = 199
+	rule.Table = mainRouteTable
+	rule.Priority = apiServerRulePriority
 
-	// Check if rule already exists.
-	rules, err := netlink.RuleList(syscall.AF_INET)
-	if err == nil {
-		for _, r := range rules {
-			if r.Dst != nil && r.Dst.IP.Equal(apiIP) && r.Table == 254 && r.Priority == 199 {
+	if err := netlink.RuleAdd(rule); err != nil {
+		if rules, listErr := netlink.RuleList(syscall.AF_INET); listErr == nil {
+			if hasCurrent, _ := apiserverRulePlan(rules, apiIP); hasCurrent {
 				return
 			}
 		}
-	}
-
-	if err := netlink.RuleAdd(rule); err != nil {
 		a.log.Error(err, "failed to add API server ip rule", "ip", apiIP)
 	} else {
 		a.log.Info("API server route protected", "ip", apiIP, "rule", "to "+apiIP.String()+"/32 lookup main prio 199")
 	}
 }
 
-// apiServerIP extracts the API server IP from environment or rest config host.
-func apiServerIP() net.IP {
-	// Try KUBERNETES_SERVICE_HOST first (set by kubelet for in-cluster pods).
-	if host := os.Getenv("KUBERNETES_SERVICE_HOST"); host != "" {
-		if ip := net.ParseIP(host); ip != nil {
-			return ip.To4()
+func apiserverRulePlan(rules []netlink.Rule, apiIP net.IP) (bool, []netlink.Rule) {
+	hasCurrent := false
+	stale := []netlink.Rule{}
+	for _, r := range rules {
+		if !isManagedAPIServerRule(r) {
+			continue
 		}
+		if apiIP != nil && r.Dst.IP.Equal(apiIP) {
+			hasCurrent = true
+			continue
+		}
+		stale = append(stale, r)
 	}
+	return hasCurrent, stale
+}
 
-	// Try WIREKUBE_KUBE_APISERVER flag/env.
-	if apiServer := os.Getenv("WIREKUBE_KUBE_APISERVER"); apiServer != "" {
-		return parseHostIP(apiServer)
+func isManagedAPIServerRule(r netlink.Rule) bool {
+	if r.Table != mainRouteTable || r.Priority != apiServerRulePriority {
+		return false
 	}
+	if r.Dst == nil || r.Src != nil || r.Mark != 0 || r.Mask != nil || r.Invert {
+		return false
+	}
+	if r.Tos != 0 || r.TunID != 0 || !isUnsetRuleInt(r.Flow) || r.IifName != "" || r.OifName != "" {
+		return false
+	}
+	if r.Dport != nil || r.Sport != nil || r.IPProto != 0 || r.UIDRange != nil {
+		return false
+	}
+	ones, bits := r.Dst.Mask.Size()
+	return bits == 32 && ones == 32
+}
 
-	return nil
+func isUnsetRuleInt(v int) bool {
+	return v == 0 || v == -1
+}
+
+// apiServerIP extracts the API server IP from the rest config host actually used
+// by this agent. Proxy-node deployments commonly override the in-cluster
+// KUBERNETES_SERVICE_HOST with an external apiserver URL; route protection must
+// follow the effective restConfig.Host, not the ambient kubelet env.
+func apiServerIP(apiServer string) net.IP {
+	return parseHostIP(apiServer)
 }
 
 // isAPIServerCIDR reports whether a CIDR matches the API server IP.
 func (a *Agent) isAPIServerCIDR(cidr string) bool {
-	apiIP := apiServerIP()
+	apiIP := apiServerIP(a.apiServer)
 	if apiIP == nil {
 		return false
 	}
