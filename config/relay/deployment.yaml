@@ -1,10 +1,10 @@
 ---
 # wirekube-relay ServiceAccount + RBAC
 #
-# The relay process itself needs no Kubernetes permissions. This ServiceAccount
-# exists only so optional `kubectl exec deploy/wirekube-relay -- wirekubectl ...`
-# read-only commands can inspect mesh and peer state. Mutating external-peer
-# commands should run from an admin context or the agent ServiceAccount.
+# The relay process itself needs no Kubernetes permissions. The admin-web
+# sidecar uses this ServiceAccount to list, issue, and delete
+# WireKubeExternalPeer resources from a localhost-only web UI, and stores
+# generated client configs in namespaced Secrets.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -19,21 +19,65 @@ rules:
 - apiGroups:
   - wirekube.io
   resources:
-  - wirekubepeers
-  - wirekubemeshes
-  - wirekubegateways
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - wirekube.io
-  resources:
   - wirekubeexternalpeers
   verbs:
   - get
   - list
-  - watch
+  - create
+  - delete
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubepeers
+  - wirekubemeshes
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-relay-admin-web
+  namespace: wirekube-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - create
+  - update
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - services
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-relay-admin-web
+  namespace: wirekube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-relay-admin-web
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: wirekube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -102,6 +146,22 @@ spec:
             limits:
               cpu: 500m
               memory: 128Mi
+        - name: admin-web
+          image: inerplat/wirekube:v0.0.0-dev.14
+          command: ["wirekube-admin-web"]
+          args:
+            - --addr=127.0.0.1:8080
+          ports:
+            - name: admin-web
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 96Mi
 ---
 apiVersion: v1
 kind: Service
