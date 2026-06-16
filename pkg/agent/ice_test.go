@@ -1419,6 +1419,80 @@ func TestStartICECheckProbesUnclassifiedPairs(t *testing.T) {
 	}
 }
 
+func TestShouldPermanentRelayExcludesUnknownNAT(t *testing.T) {
+	mkPeer := func(natType string) *wirekubev1alpha1.WireKubePeer {
+		p := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+		p.Status.NATType = natType
+		return p
+	}
+	cases := []struct {
+		name    string
+		myNAT   string
+		peerNAT string
+		wantPin bool
+	}{
+		{"unknown × unknown not pinned", "", "", false},
+		{"unknown × symmetric not pinned", "", "symmetric", false},
+		{"cone × unknown not pinned", "cone", "", false},
+		{"port-restricted-cone × symmetric pinned", "port-restricted-cone", "symmetric", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{detectedNATType: tc.myNAT}
+			if got := a.shouldPermanentRelay(mkPeer(tc.peerNAT), &peerICEState{}); got != tc.wantPin {
+				t.Fatalf("shouldPermanentRelay = %v, want %v", got, tc.wantPin)
+			}
+		})
+	}
+}
+
+// TestEvaluateICECheckBacksOffUnstableNATAfterRepeatedFailures verifies that an
+// unstable/unknown-NAT pair with no direct receive, after repeated probe
+// failures, is held on relay for the long unstable backoff instead of being
+// re-probed every relayRetry.
+func TestEvaluateICECheckBacksOffUnstableNATAfterRepeatedFailures(t *testing.T) {
+	a := &Agent{
+		log:             logr.Discard(),
+		wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}}, // LastDirectReceive → 0
+		detectedNATType: "",                                            // our NAT still unclassified → pair unstable
+		relayRetry:      30 * time.Second,
+		directProbing:   map[string]bool{"remote": true},
+		relayedPeers:    map[string]bool{},
+		directEndpoints: map[string]string{},
+		iceStates:       map[string]*peerICEState{},
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "remote",
+			Annotations: map[string]string{"wirekube.io/birthday-attack": "disabled"}, // avoid client lookup
+		},
+		Spec: wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key"},
+	}
+	peer.Status.NATType = "cone"
+
+	state := a.getICEState("remote")
+	state.State = iceStateChecking
+	state.ProbeFailCount = unstableProbeFailThreshold - 1 // ++ in evaluateICECheck reaches the threshold
+	state.LastCheck = time.Now().Add(-activeProbeWait - time.Second)
+	a.setICEState("remote", state)
+
+	a.evaluateICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+	got := a.getICEState("remote")
+	if got.State != iceStateFailed {
+		t.Fatalf("state = %s, want %s", got.State, iceStateFailed)
+	}
+	if got.NextProbeAfter.IsZero() || time.Until(got.NextProbeAfter) < 9*time.Minute {
+		t.Fatalf("NextProbeAfter in %v, want a long (~10m) backoff", time.Until(got.NextProbeAfter))
+	}
+
+	// A NAT re-classification clears the backoff so the peer can re-probe.
+	a.clearDirectReprobeBackoff()
+	if !a.getICEState("remote").NextProbeAfter.IsZero() {
+		t.Fatalf("clearDirectReprobeBackoff did not reset NextProbeAfter")
+	}
+}
+
 func TestCanStartBirthdayAttack(t *testing.T) {
 	localPP := &nat.PortPrediction{SamplePorts: []int{1000, 1100, 1200}}
 	peerPP := &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100, 2200}}
