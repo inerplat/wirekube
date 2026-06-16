@@ -646,6 +646,8 @@ func (a *Agent) sync(ctx context.Context) error {
 	myPeerName := a.nodeName
 	wgPeers := make([]wireguard.PeerConfig, 0, len(peerList.Items))
 	allRoutes := []string{}
+	routeOwners := map[string]string{}
+	allowRoutesBeforeHandshake := map[string]bool{}
 	ownAllowedIPsSet := false
 
 	// Build stats map for relay fallback decisions
@@ -710,6 +712,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			}
 			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
 			allRoutes = append(allRoutes, cidr)
+			routeOwners[cidr] = p.Spec.PublicKey
 		}
 		for _, cidr := range externalByIngress[p.Name] {
 			if a.shouldSkipGatewayRoute(ctx, cidr, myPeerName, ownIP) {
@@ -720,6 +723,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			}
 			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
 			allRoutes = append(allRoutes, cidr)
+			routeOwners[cidr] = p.Spec.PublicKey
 		}
 
 		// Symmetric peers must never be force-endpointed post-probe: the
@@ -740,6 +744,9 @@ func (a *Agent) sync(ctx context.Context) error {
 			KeepaliveSeconds: a.keepaliveForPeer(p),
 			ForceEndpoint:    forceEp,
 		})
+		if a.canRouteBeforeHandshake(p.Name) {
+			allowRoutesBeforeHandshake[p.Spec.PublicKey] = true
+		}
 	}
 
 	// Ingress-side external peer acceptance.
@@ -780,6 +787,7 @@ func (a *Agent) sync(ctx context.Context) error {
 				ForceEndpoint:    false,
 			})
 			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
+			routeOwners[ep.Status.AssignedMeshIP] = ep.Status.PublicKey
 		}
 	}
 
@@ -807,12 +815,12 @@ func (a *Agent) sync(ctx context.Context) error {
 		}
 	}
 
-	// Filter routes: only install routes for peers that have completed a
-	// handshake. Without a handshake, the tunnel can't carry traffic — adding
-	// routes would redirect existing connectivity (e.g. to the API server)
-	// into a dead tunnel, breaking the agent's own control plane access.
+	// Filter routes: direct-only peers need a handshake before routes are
+	// installed, but relay-capable peers may need routes before the first
+	// handshake so bootstrap traffic can traverse the relay. API server CIDRs
+	// remain excluded regardless of transport mode.
 	if len(allRoutes) > 0 {
-		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, wgPeers)
+		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, routeOwners, allowRoutesBeforeHandshake)
 		if len(connectedRoutes) < len(allRoutes) {
 			a.log.V(2).Info("deferred routes for peers without handshake",
 				"connected", len(connectedRoutes), "total", len(allRoutes))
@@ -1090,10 +1098,12 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 	}
 }
 
-// filterRoutesForConnectedPeers returns only the CIDRs whose peer has completed
-// at least one WireGuard handshake. This prevents routing traffic into a tunnel
-// that can't yet carry it, which would break the agent's API server connectivity.
-func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wireguard.PeerConfig) []string {
+// filterRoutesForConnectedPeers returns CIDRs that are safe to install in the
+// WireKube routing table. Direct-only peers still need a WireGuard handshake
+// before routes are installed. Relay-capable peers may need routes before the
+// first handshake because their first useful traffic can itself be what proves
+// the relay path. API server CIDRs are never routed through WireKube.
+func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, routeOwners map[string]string, allowBeforeHandshake map[string]bool) []string {
 	stats, err := a.wgMgr.GetStats()
 	if err != nil {
 		a.log.Info("filterRoutes: GetStats failed, deferring all routes", "error", err)
@@ -1109,14 +1119,6 @@ func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wiregu
 	}
 	a.log.Info("filterRoutes", "totalStats", len(stats), "connectedPeers", len(connected), "totalRoutes", len(allRoutes))
 
-	// Build map: CIDR → peer public key
-	cidrToKey := make(map[string]string)
-	for _, p := range peers {
-		for _, cidr := range p.AllowedIPs {
-			cidrToKey[cidr] = p.PublicKeyB64
-		}
-	}
-
 	var result []string
 	for _, cidr := range allRoutes {
 		// Never route API server traffic through the WG tunnel.
@@ -1125,12 +1127,30 @@ func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wiregu
 		if a.isAPIServerCIDR(cidr) {
 			continue
 		}
-		key, ok := cidrToKey[cidr]
-		if !ok || connected[key] {
+		key, ok := routeOwners[cidr]
+		if !ok || connected[key] || allowBeforeHandshake[key] {
 			result = append(result, cidr)
 		}
 	}
 	return result
+}
+
+func (a *Agent) canRouteBeforeHandshake(peerName string) bool {
+	if peerName == "" || a.relayMode == relayModeNever || !a.relayTransportUsable() {
+		return false
+	}
+	if a.relayedPeers[peerName] {
+		return true
+	}
+	if a.pathMonitor == nil {
+		return false
+	}
+	switch a.pathMonitor.ModeFor(peerName) {
+	case PathModeRelay, PathModeWarm:
+		return true
+	default:
+		return false
+	}
 }
 
 // updateOwnStatus reads WireGuard stats and updates this node's WireKubePeer status.
