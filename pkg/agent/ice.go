@@ -594,17 +594,13 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		a.probeDirectEndpoint(peer)
 
 	case myNAT == "symmetric" && peerNAT == "symmetric":
-		switch {
-		case !a.isBirthdayAttackEnabled(peer):
-			a.log.Info("symmetric↔symmetric — birthday attack disabled, staying on relay", "peer", peer.Name)
-			state.State = iceStateFailed
-		case !state.BirthdayTried:
+		if ok, reason := a.canStartBirthdayAttack(peer, state); ok {
 			a.log.Info("symmetric↔symmetric — initiating birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
 			go a.runBirthdayAttack(ctx, peer)
-		default:
-			a.log.Info("symmetric↔symmetric — birthday attack already attempted, staying on relay", "peer", peer.Name)
+		} else {
+			a.log.Info("symmetric↔symmetric — staying on relay", "peer", peer.Name, "reason", reason)
 			state.State = iceStateFailed
 		}
 	}
@@ -743,6 +739,41 @@ func (a *Agent) isBirthdayAttackEnabled(peer *wirekubev1alpha1.WireKubePeer) boo
 
 	// Default: disabled.
 	return false
+}
+
+// canStartBirthdayAttack is the single gate for launching a birthday attack.
+// Every entry point must consult it so that a mesh with NAT traversal disabled
+// can never spawn a hole-punch goroutine, regardless of how the ICE state
+// machine arrived at the decision. Returns false plus a human-readable reason
+// when any precondition is unmet.
+//
+// All conditions must hold:
+//   - birthday attack explicitly enabled (per-peer annotation or mesh global),
+//   - both ends classified symmetric — a birthday attack only makes sense when
+//     both NATs allocate a fresh port per destination,
+//   - local and peer port-prediction data each have at least one sample (both
+//     sides must be able to predict the other's ports),
+//   - this peer has not already exhausted its single birthday attempt.
+func (a *Agent) canStartBirthdayAttack(peer *wirekubev1alpha1.WireKubePeer, state *peerICEState) (bool, string) {
+	if !a.isBirthdayAttackEnabled(peer) {
+		return false, "birthday attack disabled"
+	}
+	if a.detectedNATType != string(nat.NATSymmetric) {
+		return false, "local NAT is not symmetric"
+	}
+	if peer.Status.NATType != string(nat.NATSymmetric) {
+		return false, "peer NAT is not symmetric"
+	}
+	if a.portPrediction == nil || len(a.portPrediction.SamplePorts) == 0 {
+		return false, "no local port prediction"
+	}
+	if peer.Status.PortPrediction == nil || len(peer.Status.PortPrediction.SamplePorts) == 0 {
+		return false, "no peer port prediction"
+	}
+	if state != nil && state.BirthdayTried {
+		return false, "birthday attack already attempted"
+	}
+	return true, ""
 }
 
 // probeDirectEndpoint switches WG to the peer's direct endpoint for a
@@ -889,7 +920,10 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			a.enableRelayForPeer(peer)
 		}
 
-		if a.detectedNATType == "symmetric" && peer.Status.NATType == "symmetric" && !state.BirthdayTried {
+		// Route through the same gate as startICECheck so a disabled mesh (or a
+		// pair lacking port prediction) can never start a birthday attack here,
+		// even if the NAT classification changed since the probe began.
+		if ok, _ := a.canStartBirthdayAttack(peer, state); ok {
 			a.log.Info("active probe failed, trying birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
