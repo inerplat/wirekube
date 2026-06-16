@@ -1257,11 +1257,11 @@ func (a *Agent) updatePeerConnections(
 }
 
 // publishedTransportForPeer reports the user-visible transport mode for a
-// peer ("direct" vs "relay"). PathMonitor is the single source of truth:
-// Direct and Warm both publish as "direct" because Warm still prefers the
-// direct leg — the relay copy is belt-and-suspenders. Only PathModeRelay
-// (all direct receive evidence has expired) publishes as "relay". This
-// mirrors Tailscale's "trusted bestAddr" vs "DERP-only" distinction.
+// peer ("direct" vs "relay"). PathMonitor is the single source of truth: only
+// PathModeDirect (confirmed via fresh direct-receive evidence) publishes as
+// "direct"; PathModeWarm (direct unproven or being demoted), PathUnknown, and
+// PathModeRelay all publish as "relay", so the status never reports a probing
+// or unknown path as confirmed direct.
 // driveTransportMode asks PathMonitor for the current mode of every known
 // peer and commits it to the Bind via SetPeerPath. This runs at the end of
 // sync() and is authoritative — it overrides any intermediate SetPeerPath
@@ -1316,23 +1316,19 @@ func (a *Agent) publishedTransportForPeer(
 	peer *wirekubev1alpha1.WireKubePeer,
 	_ map[string]wireguard.PeerStats,
 ) string {
-	if peer == nil {
-		return "direct"
-	}
-	if a.pathMonitor == nil {
-		// Some unit tests construct Agent literals directly without going
-		// through NewAgent. Default to the safe answer rather than panic.
-		return "direct"
-	}
-	switch a.pathMonitor.ModeFor(peer.Name) {
-	case PathModeRelay:
+	// Only a confirmed direct path is reported as "direct". PathMonitor enters
+	// PathModeDirect only after fresh direct-receive evidence; PathModeWarm
+	// (direct unproven or being demoted), PathUnknown (not yet evaluated), and
+	// PathModeRelay all report "relay" so the status never overstates a direct
+	// path as confirmed. A nil peer or nil pathMonitor (test-only literal) has no
+	// evidence of direct connectivity, so it reports the conservative "relay".
+	if peer == nil || a.pathMonitor == nil {
 		return "relay"
-	default:
-		// PathUnknown, PathModeWarm, PathModeDirect all map to "direct":
-		// the caller treats "direct" as "we have or are trying a direct
-		// path", and "relay" as "we have given up on direct for now".
+	}
+	if a.pathMonitor.ModeFor(peer.Name) == PathModeDirect {
 		return "direct"
 	}
+	return "relay"
 }
 
 // initRelay sets up the relay client from the mesh relay configuration.

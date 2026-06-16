@@ -274,78 +274,82 @@ func TestPreferredTransportForPeer(t *testing.T) {
 	}
 }
 
-func TestPublishedTransportForPeerPrefersObservedDirectPath(t *testing.T) {
-	wg := &fakeWGEngine{lastDirect: map[string]int64{
-		"pub-a": time.Now().Add(-500 * time.Millisecond).UnixNano(),
-	}}
-	a := &Agent{
-		wgMgr:                 wg,
-		relayedPeers:          map[string]bool{"peer-a": true},
-		handshakeValidWindow:  45 * time.Second,
-		directConnectedWindow: 3 * time.Minute,
-		healthProbeTimeout:    5 * time.Second,
-	}
-	peer := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-a"},
-		Spec: wirekubev1alpha1.WireKubePeerSpec{
-			PublicKey: "pub-a",
-		},
-	}
-	stats := map[string]wireguard.PeerStats{
-		"pub-a": {
-			PublicKeyB64:   "pub-a",
-			LastHandshake:  time.Now().Add(-5 * time.Second),
-			ActualEndpoint: "203.0.113.10:51820",
-		},
-	}
-
-	if got := a.publishedTransportForPeer(peer, stats); got != "direct" {
-		t.Fatalf("publishedTransportForPeer() = %q, want direct for observed direct dataplane", got)
-	}
-}
-
-// TestPublishedTransportForPeerReadsPathMonitor asserts the new status
-// contract: publishedTransportForPeer reflects whatever PathMonitor
-// currently says the peer's mode is. Direct and Warm both surface as
-// "direct" (we are using, or trying, the direct leg); only PathModeRelay
-// surfaces as "relay" (direct has been given up on). The legacy path —
-// inspecting WG's ActualEndpoint for "127.0.0.1:..." (the old UDPProxy
-// signal) — is gone along with UDPProxy itself.
+// TestPublishedTransportForPeerReadsPathMonitor asserts the status contract:
+// only PathModeDirect (confirmed direct via fresh direct-receive evidence) is
+// reported as "direct". PathModeWarm (direct unproven / being demoted),
+// PathUnknown (not yet evaluated), and PathModeRelay all report "relay", so the
+// status never overstates a probing/unknown path as a confirmed direct one.
 func TestPublishedTransportForPeerReadsPathMonitor(t *testing.T) {
-	// Drive a PathMonitor into PathModeRelay by setting its backoff
-	// deadline into the past and never feeding a direct RX.
-	rx := &fakeRX{last: map[string]int64{}}
-	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	pm := NewPathMonitor(logr.Discard(), rx, PathMonitorConfig{
-		WarmStall:  100 * time.Millisecond,
-		RelayStall: 100 * time.Millisecond, // short so the transition to Relay happens fast
-		PromoteAge: 50 * time.Millisecond,
-		RelayRetry: 5 * time.Second, // long so we stay in Relay
-	}, clk.now)
-	// Drive: Relay (first Evaluate) → Warm (forced probe) → Relay (stall).
-	pm.Evaluate("peer-a", "pub-a", true) // → Warm
-	clk.advance(200 * time.Millisecond)
-	pm.Evaluate("peer-a", "pub-a", false) // Warm → Relay
-
-	a := &Agent{pathMonitor: pm}
-	peer := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-a"},
-		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "pub-a"},
-	}
-	if got := a.publishedTransportForPeer(peer, nil); got != "relay" {
-		t.Fatalf("publishedTransportForPeer() = %q, want relay", got)
+	assertTransport := func(t *testing.T, pm *PathMonitor, peerName, pubKey, want string) {
+		t.Helper()
+		a := &Agent{pathMonitor: pm}
+		peer := &wirekubev1alpha1.WireKubePeer{
+			ObjectMeta: metav1.ObjectMeta{Name: peerName},
+			Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: pubKey},
+		}
+		if got := a.publishedTransportForPeer(peer, nil); got != want {
+			t.Fatalf("publishedTransportForPeer(%s) = %q, want %q", peerName, got, want)
+		}
 	}
 
-	// A second peer the monitor has never seen → "direct" (safe default;
-	// the sync loop will catch up on the next tick and place the peer on
-	// Relay if appropriate).
-	other := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-b"},
-		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "pub-b"},
+	newMon := func() (*PathMonitor, *fakeRX, *fakeClock) {
+		rx := &fakeRX{last: map[string]int64{}}
+		clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+		pm := NewPathMonitor(logr.Discard(), rx, PathMonitorConfig{
+			WarmStall:  100 * time.Millisecond,
+			RelayStall: 100 * time.Millisecond,
+			PromoteAge: 50 * time.Millisecond,
+			RelayRetry: 5 * time.Second,
+		}, clk.now)
+		return pm, rx, clk
 	}
-	if got := a.publishedTransportForPeer(other, nil); got != "direct" {
-		t.Fatalf("publishedTransportForPeer(new peer) = %q, want direct (unknown)", got)
-	}
+
+	// PathModeDirect: forced probe → Warm, then fresh direct RX promotes to Direct.
+	t.Run("direct reports direct", func(t *testing.T) {
+		pm, rx, clk := newMon()
+		pm.Evaluate("p", "k", true) // Relay → Warm
+		rx.last["k"] = clk.now().UnixNano()
+		clk.advance(10 * time.Millisecond) // still within promoteAge
+		if got := pm.Evaluate("p", "k", false); got != PathModeDirect {
+			t.Fatalf("precondition: mode = %s, want Direct", got)
+		}
+		assertTransport(t, pm, "p", "k", "direct")
+	})
+
+	// PathModeWarm: forced probe enters Warm; assert before any promotion.
+	t.Run("warm reports relay", func(t *testing.T) {
+		pm, _, _ := newMon()
+		if got := pm.Evaluate("p", "k", true); got != PathModeWarm {
+			t.Fatalf("precondition: mode = %s, want Warm", got)
+		}
+		assertTransport(t, pm, "p", "k", "relay")
+	})
+
+	// PathModeRelay: Warm → Relay after the stall window with no direct RX.
+	t.Run("relay reports relay", func(t *testing.T) {
+		pm, _, clk := newMon()
+		pm.Evaluate("p", "k", true) // Relay → Warm
+		clk.advance(200 * time.Millisecond)
+		if got := pm.Evaluate("p", "k", false); got != PathModeRelay { // Warm → Relay
+			t.Fatalf("precondition: mode = %s, want Relay", got)
+		}
+		assertTransport(t, pm, "p", "k", "relay")
+	})
+
+	// PathUnknown: a peer the monitor has never evaluated → conservative relay.
+	t.Run("unknown peer reports relay", func(t *testing.T) {
+		pm, _, _ := newMon()
+		assertTransport(t, pm, "never-seen", "nk", "relay")
+	})
+
+	// Nil pathMonitor (test-only literal) also reports the conservative relay.
+	t.Run("nil pathMonitor reports relay", func(t *testing.T) {
+		a := &Agent{}
+		peer := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "p"}}
+		if got := a.publishedTransportForPeer(peer, nil); got != "relay" {
+			t.Fatalf("nil pathMonitor = %q, want relay", got)
+		}
+	})
 }
 
 func TestHasPendingRestartRelayRecovery(t *testing.T) {
