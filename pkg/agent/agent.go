@@ -1429,6 +1429,18 @@ func (a *Agent) applyNATClassification(ctx context.Context, c *NATClassification
 	}
 
 	newType := string(c.NATType)
+
+	// The periodic classifier is STUN-only and cannot distinguish port-restricted
+	// cone from plain cone — that distinction needs the relay dual-probe run once
+	// at setup (DetectPortRestriction). A "cone" result must therefore NOT
+	// downgrade an existing port-restricted-cone refinement: they are the same NAT
+	// family, and downgrading would wrongly un-pin a port-restricted↔symmetric pair
+	// from relay (it would then probe a structurally impossible direct path) and
+	// drop the CGNAT keepalive override. Keep the more-specific refined type.
+	if oldType == string(nat.NATPortRestrictedCone) && c.NATType == nat.NATCone {
+		return
+	}
+
 	if newType == oldType {
 		// Same type: refresh port prediction for symmetric peers (mapped ports
 		// drift over time), otherwise nothing to do.

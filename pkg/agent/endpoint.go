@@ -250,7 +250,6 @@ func buildSTUNResult(sr *nat.STUNResult, listenPort int, useListenPort bool) *En
 type NATClassification struct {
 	NATType          nat.NATType
 	PortPrediction   *nat.PortPrediction
-	Source           DiscoveryMethod
 	ServersResponded int
 	ServersTotal     int
 	// Error summarizes why NATType is NATUnknown (partial or total STUN
@@ -279,12 +278,11 @@ func classificationFromSTUN(sr *nat.STUNResult, err error) *NATClassification {
 		if err != nil {
 			msg = err.Error()
 		}
-		return &NATClassification{NATType: nat.NATUnknown, Source: MethodSTUN, Error: msg}
+		return &NATClassification{NATType: nat.NATUnknown, Error: msg}
 	}
 	c := &NATClassification{
 		NATType:          sr.NATType,
 		PortPrediction:   sr.PortPrediction,
-		Source:           MethodSTUN,
 		ServersResponded: sr.ServersResponded,
 		ServersTotal:     sr.ServersTotal,
 	}
