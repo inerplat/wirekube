@@ -76,6 +76,12 @@ var virtualIfacePrefixes = []string{
 	"br-", "virbr", "wg", "wire_kube", "lxc",
 }
 
+// cgnatNet is the RFC 6598 shared address space (100.64.0.0/10) used by
+// carrier-grade NAT. net.IP.IsPrivate does NOT include this range, yet it is
+// not externally routable, so it must never be advertised as a reflexive
+// candidate. Double-NAT/CGNAT routers hand these addresses out (e.g. via UPnP).
+var _, cgnatNet, _ = net.ParseCIDR("100.64.0.0/10")
+
 // peerICEState tracks ICE negotiation state for a single peer.
 type peerICEState struct {
 	State         string
@@ -221,8 +227,11 @@ func (a *Agent) gatherICECandidates(epResult *EndpointResult) []wirekubev1alpha1
 		})
 	}
 
-	// Server-reflexive candidate: STUN-discovered public endpoint.
-	if epResult != nil && epResult.Endpoint != "" {
+	// Server-reflexive candidate: STUN/portmap-discovered endpoint. Publish it
+	// only when the discovered address is externally routable — a private or
+	// CGNAT address (e.g. a UPnP external IP behind double-NAT) must never be
+	// advertised as srflx, or peers will attempt direct paths that cannot work.
+	if epResult != nil && isPublicCandidateEndpoint(epResult.Endpoint) {
 		prio := int32(200)
 		if epResult.NATType == nat.NATSymmetric {
 			prio = 50 // low priority — mapped port is unstable
@@ -1405,4 +1414,31 @@ func isLocalhostEndpoint(ep string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// isPublicCandidateEndpoint reports whether endpoint ("host:port") has a host IP
+// that is externally routable and therefore valid as a server-reflexive (srflx)
+// ICE candidate. It rejects loopback, link-local, multicast, unspecified, the
+// IPv4 broadcast address (all excluded by !IsGlobalUnicast), RFC 1918 / IPv6 ULA
+// private addresses, and CGNAT shared address space (100.64.0.0/10). The CGNAT
+// range looks public to net.IP.IsPrivate but is handed out by double-NAT/CGNAT
+// routers and is unreachable from other peers, so a private or CGNAT address
+// must never be published as reflexive. IPv4-mapped IPv6 addresses are
+// normalized via To4() before the CGNAT check.
+func isPublicCandidateEndpoint(endpoint string) bool {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && cgnatNet != nil && cgnatNet.Contains(ip4) {
+		return false
+	}
+	return true
 }
