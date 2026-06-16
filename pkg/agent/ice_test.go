@@ -1344,3 +1344,146 @@ func TestGatherICECandidatesFiltersPrivateSrflx(t *testing.T) {
 		t.Fatalf("symmetric srflx = %+v, want priority 50", s)
 	}
 }
+
+func TestCanStartBirthdayAttack(t *testing.T) {
+	localPP := &nat.PortPrediction{SamplePorts: []int{1000, 1100, 1200}}
+	peerPP := &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100, 2200}}
+
+	// newPeer builds a remote peer. A non-empty annotation drives
+	// isBirthdayAttackEnabled directly (per-peer annotation has highest
+	// priority), so these cases never touch the k8s client.
+	newPeer := func(ann, natType string, pp *wirekubev1alpha1.PortPrediction) *wirekubev1alpha1.WireKubePeer {
+		p := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+		if ann != "" {
+			p.Annotations = map[string]string{"wirekube.io/birthday-attack": ann}
+		}
+		p.Status.NATType = natType
+		p.Status.PortPrediction = pp
+		return p
+	}
+
+	tests := []struct {
+		name     string
+		localNAT string
+		localPP  *nat.PortPrediction
+		ann      string
+		peerNAT  string
+		peerPP   *wirekubev1alpha1.PortPrediction
+		tried    bool
+		want     bool
+	}{
+		{"all conditions met", "symmetric", localPP, "enabled", "symmetric", peerPP, false, true},
+		{"disabled by annotation", "symmetric", localPP, "disabled", "symmetric", peerPP, false, false},
+		{"local NAT not symmetric", "cone", localPP, "enabled", "symmetric", peerPP, false, false},
+		{"peer NAT unknown", "symmetric", localPP, "enabled", "", peerPP, false, false},
+		{"peer NAT cone", "symmetric", localPP, "enabled", "cone", peerPP, false, false},
+		{"no local port prediction", "symmetric", nil, "enabled", "symmetric", peerPP, false, false},
+		{"empty local port prediction", "symmetric", &nat.PortPrediction{}, "enabled", "symmetric", peerPP, false, false},
+		{"no peer port prediction", "symmetric", localPP, "enabled", "symmetric", nil, false, false},
+		{"birthday already tried", "symmetric", localPP, "enabled", "symmetric", peerPP, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Agent{detectedNATType: tt.localNAT, portPrediction: tt.localPP}
+			peer := newPeer(tt.ann, tt.peerNAT, tt.peerPP)
+			got, reason := a.canStartBirthdayAttack(peer, &peerICEState{BirthdayTried: tt.tried})
+			if got != tt.want {
+				t.Fatalf("canStartBirthdayAttack() = %v (reason %q), want %v", got, reason, tt.want)
+			}
+			if !got && reason == "" {
+				t.Errorf("denied but no reason given")
+			}
+			if got && reason != "" {
+				t.Errorf("allowed but reason = %q, want empty", reason)
+			}
+		})
+	}
+}
+
+// TestCanStartBirthdayAttackDisabledByDefault is the safety guarantee: with
+// WireKubeMesh.spec.natTraversal absent, no birthday attack may start even when
+// both ends are symmetric and have port prediction. This is the condition under
+// which the previously-unguarded evaluateICECheck entry point could spawn a
+// hole-punch goroutine.
+func TestCanStartBirthdayAttackDisabledByDefault(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(wirekube): %v", err)
+	}
+	// Mesh with no NATTraversal block → birthday attack disabled by default.
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(mesh).Build()
+
+	a := &Agent{
+		client:          k8sClient,
+		nodeName:        "test-node",
+		detectedNATType: "symmetric",
+		portPrediction:  &nat.PortPrediction{SamplePorts: []int{1000, 1100}},
+	}
+	// Remote peer is fully birthday-eligible EXCEPT that nothing enables it.
+	peer := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+	peer.Status.NATType = "symmetric"
+	peer.Status.PortPrediction = &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100}}
+
+	if ok, reason := a.canStartBirthdayAttack(peer, &peerICEState{}); ok {
+		t.Fatalf("birthday attack allowed with natTraversal absent; want disabled (reason=%q)", reason)
+	}
+}
+
+// TestEvaluateICECheckDoesNotStartBirthdayWhenDisabled is the regression anchor
+// for the previously-unguarded entry point. When an active probe fails for a
+// symmetric↔symmetric pair but NAT traversal is disabled, evaluateICECheck must
+// fall back to relay (iceStateFailed) and must NOT spawn a birthday-attack
+// goroutine. This locks the fix against a future refactor re-inlining the check.
+func TestEvaluateICECheckDoesNotStartBirthdayWhenDisabled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(wirekube): %v", err)
+	}
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}} // no NATTraversal
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(mesh).Build()
+
+	a := &Agent{
+		client:          k8sClient,
+		nodeName:        "test-node",
+		log:             logr.Discard(),
+		wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}},
+		detectedNATType: "symmetric",
+		portPrediction:  &nat.PortPrediction{SamplePorts: []int{1000, 1100}},
+		directProbing:   map[string]bool{"remote": true},
+		iceStates:       map[string]*peerICEState{},
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key"},
+	}
+	peer.Status.NATType = "symmetric"
+	peer.Status.PortPrediction = &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100}}
+
+	// Active probe in flight, probe window elapsed, peer absent from stats (no
+	// fresh handshake) → evaluateICECheck reaches the birthday decision, which
+	// the gate denies, then falls back to relay.
+	state := a.getICEState("remote")
+	state.State = iceStateChecking
+	state.LastCheck = time.Now().Add(-activeProbeWait - time.Second)
+	a.setICEState("remote", state)
+
+	a.evaluateICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+	got := a.getICEState("remote")
+	if got.State != iceStateFailed {
+		t.Fatalf("state = %s, want %s (relay fallback, no birthday)", got.State, iceStateFailed)
+	}
+	if got.BirthdayTried {
+		t.Errorf("BirthdayTried = true, want false (no birthday attempt when disabled)")
+	}
+	if got.holePunch != nil {
+		t.Errorf("holePunch set, want nil (no hole-punch goroutine spawned)")
+	}
+}
