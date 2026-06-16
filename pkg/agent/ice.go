@@ -1158,15 +1158,23 @@ func (a *Agent) unstableProbeBackoff() time.Duration {
 	return d
 }
 
-// clearDirectReprobeBackoff resets every peer's NextProbeAfter so they re-probe
-// promptly. Called when local NAT re-classification changes, since the new type
-// may make previously-stuck pairs viable. Note this also clears the short
+// clearDirectReprobeBackoff lets every peer re-probe promptly after a local NAT
+// re-classification: it clears the probe backoff (NextProbeAfter) AND resets
+// ProbeFailCount so the next iceStateFailed/Relay cycle uses the fast retry
+// interval instead of the full relayRetry. Clearing also drops the short
 // directFailoverProbeCooldown set by deferDirectReprobe — intended, because a
-// NAT-type change invalidates the prior failover assumption. Runs on the sync
-// goroutine (the only writer of iceStates), so no lock is needed.
+// NAT-type change invalidates the prior failover assumption.
+//
+// Peers mid birthday-attack are skipped: their *peerICEState is concurrently
+// mutated by the background runBirthdayAttack goroutine (a pre-existing aspect of
+// the ICE state machine), so the sync goroutine must not also write it here.
 func (a *Agent) clearDirectReprobeBackoff() {
 	for _, s := range a.iceStates {
+		if s.State == iceStateBirthday {
+			continue
+		}
 		s.NextProbeAfter = time.Time{}
+		s.ProbeFailCount = 0
 	}
 }
 

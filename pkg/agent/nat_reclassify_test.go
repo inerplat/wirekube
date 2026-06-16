@@ -146,6 +146,31 @@ func TestApplyNATClassificationConeToSymmetricWritesPortPrediction(t *testing.T)
 	}
 }
 
+// TestApplyNATClassificationKeepsPortRestrictedConeOnConeResult guards the
+// regression where the STUN-only periodic classifier (which cannot detect port
+// restriction) downgrades a setup-refined port-restricted-cone node to plain
+// cone — which would wrongly un-pin port-restricted↔symmetric pairs from relay.
+func TestApplyNATClassificationKeepsPortRestrictedConeOnConeResult(t *testing.T) {
+	a := newReclassifyAgent(t, ownPeer(string(nat.NATPortRestrictedCone), false))
+	a.detectedNATType = string(nat.NATPortRestrictedCone)
+
+	// A plain "cone" result must NOT downgrade the refinement.
+	a.applyNATClassification(context.Background(), &NATClassification{NATType: nat.NATCone, ServersResponded: 2, ServersTotal: 2})
+	if a.detectedNATType != string(nat.NATPortRestrictedCone) {
+		t.Fatalf("detectedNATType = %q, want port-restricted-cone (cone must not downgrade refinement)", a.detectedNATType)
+	}
+
+	// A genuine change (symmetric) is still applied.
+	a.applyNATClassification(context.Background(), &NATClassification{
+		NATType:          nat.NATSymmetric,
+		PortPrediction:   &nat.PortPrediction{SamplePorts: []int{1, 2}},
+		ServersResponded: 2, ServersTotal: 2,
+	})
+	if a.detectedNATType != "symmetric" {
+		t.Fatalf("detectedNATType = %q, want symmetric (genuine change still applied)", a.detectedNATType)
+	}
+}
+
 // TestMaybeReclassifyNATAppliesDrainedResult drives the drain+apply path on the
 // sync goroutine without launching the (network-bound) background probe: a
 // completed classification is pre-placed on the channel and the pacing fields
