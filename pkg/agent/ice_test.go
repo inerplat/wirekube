@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -1232,5 +1233,113 @@ func TestRecoverICEStateFromWGWithoutPreservedInterfaceFallsBackToRelay(t *testi
 	}
 	if !state.LastCheck.IsZero() {
 		t.Fatalf("LastCheck = %v, want zero for immediate reprobe", state.LastCheck)
+	}
+}
+
+func TestIsPublicCandidateEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		ep   string
+		want bool
+	}{
+		{"public v4", "203.0.113.10:51820", true},
+		{"public v6", "[2606:4700:4700::1111]:51820", true},
+		{"public 100-block below cgnat", "100.63.0.1:51820", true},
+		{"public 100-block above cgnat", "100.128.0.1:51820", true},
+		{"rfc1918 192.168", "192.168.55.87:51822", false},
+		{"rfc1918 10", "10.0.0.5:51820", false},
+		{"rfc1918 172.16", "172.16.0.1:51820", false},
+		{"cgnat 100.64 low", "100.64.1.2:51820", false},
+		{"cgnat 100.127 high", "100.127.255.255:51820", false},
+		{"loopback", "127.0.0.1:51820", false},
+		{"link-local v4", "169.254.1.1:51820", false},
+		{"multicast v4", "224.0.0.1:51820", false},
+		{"unspecified", "0.0.0.0:51820", false},
+		{"ipv6 ula", "[fc00::1]:51820", false},
+		{"ipv6 link-local", "[fe80::1]:51820", false},
+		{"missing port", "203.0.113.10", false},
+		{"empty", "", false},
+		{"hostname not ip", "example.com:51820", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPublicCandidateEndpoint(tt.ep); got != tt.want {
+				t.Errorf("isPublicCandidateEndpoint(%q) = %v, want %v", tt.ep, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatherICECandidatesFiltersPrivateSrflx verifies that a private or CGNAT
+// discovered endpoint (e.g. a UPnP external IP behind double-NAT) is NOT
+// advertised as a server-reflexive candidate, while a genuinely public one is —
+// at full priority for stable NAT and reduced priority for symmetric NAT.
+func TestGatherICECandidatesFiltersPrivateSrflx(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+			{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+		}},
+	}
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	a := &Agent{
+		client:   k8sClient,
+		nodeName: "test-node",
+		wgMgr:    &fakeWGEngine{},
+		log:      logr.Discard(),
+	}
+
+	srflxOf := func(cands []wirekubev1alpha1.ICECandidate) *wirekubev1alpha1.ICECandidate {
+		for i := range cands {
+			if cands[i].Type == candidateTypeSrflx {
+				return &cands[i]
+			}
+		}
+		return nil
+	}
+	hasHost := func(cands []wirekubev1alpha1.ICECandidate) bool {
+		for _, c := range cands {
+			if c.Type == candidateTypeHost {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Private (UPnP-style) discovered endpoint: no srflx candidate, but the host
+	// candidate (LAN IP) is still published for same-NAT direct.
+	got := a.gatherICECandidates(&EndpointResult{Endpoint: "192.168.55.87:51822", Method: MethodUPnP})
+	if s := srflxOf(got); s != nil {
+		t.Fatalf("private endpoint published as srflx: %+v", *s)
+	}
+	if !hasHost(got) {
+		t.Fatalf("host candidate missing for private endpoint; got %+v", got)
+	}
+
+	// CGNAT (RFC 6598) discovered endpoint — looks public to IsPrivate but is not
+	// routable; the real-world double-NAT case. Must not be published as srflx.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "100.64.1.2:51822", Method: MethodUPnP})
+	if s := srflxOf(got); s != nil {
+		t.Fatalf("CGNAT endpoint published as srflx: %+v", *s)
+	}
+
+	// Public endpoint: srflx published at full priority.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "203.0.113.10:51822", Method: MethodSTUN})
+	s := srflxOf(got)
+	if s == nil {
+		t.Fatalf("public endpoint not published as srflx; got %+v", got)
+	}
+	if s.Address != "203.0.113.10:51822" || s.Priority != 200 {
+		t.Fatalf("public srflx = %+v, want addr 203.0.113.10:51822 priority 200", *s)
+	}
+
+	// Public endpoint behind symmetric NAT: srflx published at low priority.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "203.0.113.10:51822", Method: MethodSTUN, NATType: nat.NATSymmetric})
+	if s := srflxOf(got); s == nil || s.Priority != 50 {
+		t.Fatalf("symmetric srflx = %+v, want priority 50", s)
 	}
 }
