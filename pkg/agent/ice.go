@@ -339,19 +339,28 @@ func (a *Agent) publishICEState(ctx context.Context, peerName string, candidates
 	peer.Status.ICEState = iceState
 
 	if portPred != nil {
-		pp := &wirekubev1alpha1.PortPrediction{
-			BasePort:    int32(portPred.BasePort),
-			Increment:   int32(portPred.Increment),
-			Jitter:      int32(portPred.Jitter),
-			SamplePorts: make([]int32, len(portPred.SamplePorts)),
-		}
-		for i, p := range portPred.SamplePorts {
-			pp.SamplePorts[i] = int32(p)
-		}
-		peer.Status.PortPrediction = pp
+		peer.Status.PortPrediction = crdPortPrediction(portPred)
 	}
 
 	return a.client.Status().Patch(ctx, peer, patch)
+}
+
+// crdPortPrediction converts an internal nat.PortPrediction to the CRD status
+// type, returning nil for nil input so callers can clear the field.
+func crdPortPrediction(pp *nat.PortPrediction) *wirekubev1alpha1.PortPrediction {
+	if pp == nil {
+		return nil
+	}
+	out := &wirekubev1alpha1.PortPrediction{
+		BasePort:    int32(pp.BasePort),
+		Increment:   int32(pp.Increment),
+		Jitter:      int32(pp.Jitter),
+		SamplePorts: make([]int32, len(pp.SamplePorts)),
+	}
+	for i, p := range pp.SamplePorts {
+		out.SamplePorts[i] = int32(p)
+	}
+	return out
 }
 
 // runICENegotiation evaluates peers and attempts connectivity upgrades.
