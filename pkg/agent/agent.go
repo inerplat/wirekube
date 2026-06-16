@@ -87,6 +87,21 @@ type Agent struct {
 	ownPublicKeyB64 string
 	// portPrediction stores our NAT port prediction data from STUN.
 	portPrediction *nat.PortPrediction
+	// stunServers is the STUN server list from the mesh, cached at setup for
+	// periodic NAT re-classification.
+	stunServers []string
+	// reclassifyEvery is the minimum interval between periodic NAT
+	// re-classifications. Defaulted in setup if unset.
+	reclassifyEvery time.Duration
+	// natClassCh hands a completed background NAT classification back to the
+	// sync goroutine. STUN runs off-loop (it can block up to 10s), but the
+	// RESULT is applied only on the sync goroutine — the sole writer of
+	// detectedNATType/isSymmetricNAT/portPrediction — so no lock is needed.
+	natClassCh chan *NATClassification
+	// lastNATClassify / natClassifyInFlight are touched only on the sync
+	// goroutine; they pace the background classification and prevent overlap.
+	lastNATClassify     time.Time
+	natClassifyInFlight bool
 	// gwState tracks gateway configuration when this node serves as a VGW.
 	gwState *gatewayState
 	// wasInterfacePreserved is set during setup when an existing WireGuard
@@ -310,6 +325,19 @@ func (a *Agent) setup(ctx context.Context) error {
 			a.annotateOwnPod(ctx, ip)
 		}
 	}
+
+	// Cache STUN servers and arm periodic NAT re-classification so a transient
+	// STUN failure at startup self-heals without a pod restart. lastNATClassify
+	// is seeded to now because we classify once right here; the first periodic
+	// re-classification happens one reclassifyEvery later.
+	a.stunServers = mesh.Spec.STUNServers
+	if a.reclassifyEvery == 0 {
+		a.reclassifyEvery = 45 * time.Second
+	}
+	if a.natClassCh == nil {
+		a.natClassCh = make(chan *NATClassification, 1)
+	}
+	a.lastNATClassify = time.Now()
 
 	epResult, err := DiscoverEndpoint(ctx, node, int(mesh.Spec.ListenPort), mesh.Spec.STUNServers)
 	if err != nil {
@@ -868,6 +896,10 @@ func (a *Agent) sync(ctx context.Context) error {
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
 
+	// Apply any completed background NAT re-classification and arm the next one.
+	// Runs on the sync goroutine so it is the sole writer of detectedNATType etc.
+	a.maybeReclassifyNAT(ctx)
+
 	// Drive the PathMonitor FSM for every remote peer and commit the
 	// resulting transport mode to the Bind. This is the single authoritative
 	// SetPeerPath call per sync cycle — legacy SetPeerPath calls earlier in
@@ -1339,6 +1371,104 @@ func (a *Agent) publishedTransportForPeer(
 		return "direct"
 	}
 	return "relay"
+}
+
+// maybeReclassifyNAT applies a completed background NAT classification and arms
+// the next one. It runs on the sync goroutine only.
+//
+// Concurrency: the blocking STUN probe runs in a background goroutine (it can
+// take up to 10s and must not stall the sync loop), but that goroutine ONLY
+// produces a *NATClassification and hands it back on natClassCh. Every mutation
+// of detectedNATType / isSymmetricNAT / portPrediction happens here, on the sync
+// goroutine — the agent has no mutex, and this keeps it that way.
+func (a *Agent) maybeReclassifyNAT(ctx context.Context) {
+	// Drain a completed classification, if any, and apply it.
+	select {
+	case c := <-a.natClassCh:
+		if c != nil {
+			a.applyNATClassification(ctx, c)
+		}
+	default:
+	}
+
+	if a.natClassifyInFlight {
+		return
+	}
+	if !a.lastNATClassify.IsZero() && time.Since(a.lastNATClassify) < a.reclassifyEvery {
+		return
+	}
+	a.lastNATClassify = time.Now()
+	a.natClassifyInFlight = true
+	servers := a.stunServers
+	ch := a.natClassCh
+	go func() {
+		c := ClassifyNAT(ctx, servers)
+		select {
+		case ch <- c:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// applyNATClassification folds a fresh classification into agent state and the
+// published CRD status. Called only from maybeReclassifyNAT (sync goroutine).
+//
+// A NATUnknown result (partial or total STUN failure) is treated as transient:
+// it is logged but does NOT overwrite a previously-known type, so a brief STUN
+// outage self-heals on a later cycle instead of wiping classification and
+// flapping. Only a known type updates state, and only when it actually changed.
+func (a *Agent) applyNATClassification(ctx context.Context, c *NATClassification) {
+	a.natClassifyInFlight = false
+	oldType := a.detectedNATType
+
+	if c.NATType == nat.NATUnknown {
+		a.log.Info("NAT re-classification inconclusive, keeping previous type",
+			"previousNATType", oldType, "serversResponded", c.ServersResponded,
+			"serversTotal", c.ServersTotal, "reason", c.Error)
+		return
+	}
+
+	newType := string(c.NATType)
+	if newType == oldType {
+		// Same type: refresh port prediction for symmetric peers (mapped ports
+		// drift over time), otherwise nothing to do.
+		if c.NATType == nat.NATSymmetric && c.PortPrediction != nil {
+			a.portPrediction = c.PortPrediction
+		}
+		return
+	}
+
+	a.log.Info("NAT re-classification changed type",
+		"previousNATType", oldType, "natType", newType,
+		"serversResponded", c.ServersResponded, "serversTotal", c.ServersTotal)
+
+	a.detectedNATType = newType
+	a.isSymmetricNAT = c.NATType == nat.NATSymmetric
+	if c.NATType == nat.NATSymmetric {
+		a.portPrediction = c.PortPrediction
+	} else {
+		// Non-symmetric: drop any stale symmetric port prediction.
+		a.portPrediction = nil
+	}
+
+	if err := a.publishNATClassification(ctx); err != nil {
+		a.log.Error(err, "publishing re-classified NAT status")
+	}
+}
+
+// publishNATClassification writes the current detectedNATType / portPrediction
+// to this node's WireKubePeer status. Clearing portPrediction (symmetric → cone)
+// relies on MergeFrom emitting an explicit null for the now-nil pointer field;
+// TestPublishNATClassificationClears asserts the field is actually removed.
+func (a *Agent) publishNATClassification(ctx context.Context) error {
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, peer); err != nil {
+		return err
+	}
+	patch := client.MergeFrom(peer.DeepCopy())
+	peer.Status.NATType = a.detectedNATType
+	peer.Status.PortPrediction = crdPortPrediction(a.portPrediction)
+	return a.client.Status().Patch(ctx, peer, patch)
 }
 
 // initRelay sets up the relay client from the mesh relay configuration.
