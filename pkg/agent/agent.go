@@ -1451,6 +1451,10 @@ func (a *Agent) applyNATClassification(ctx context.Context, c *NATClassification
 		a.portPrediction = nil
 	}
 
+	// Our NAT type changed — let every peer re-probe promptly instead of waiting
+	// out an unstable-NAT backoff, since the new type may make a stuck pair viable.
+	a.clearDirectReprobeBackoff()
+
 	if err := a.publishNATClassification(ctx); err != nil {
 		a.log.Error(err, "publishing re-classified NAT status")
 	}

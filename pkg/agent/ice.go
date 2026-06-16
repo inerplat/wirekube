@@ -952,6 +952,18 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 		a.log.Info("active probe failed, reverting to relay", "peer", peer.Name, "failures", state.ProbeFailCount)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
+		// Unstable/unknown-NAT pairs that have never received direct traffic and
+		// keep failing are unlikely to go direct soon — back off probing longer to
+		// cut churn (relay stays fully active). Recovery still happens via NAT
+		// re-classification (clearDirectReprobeBackoff) or direct inbound.
+		if state.ProbeFailCount >= unstableProbeFailThreshold &&
+			a.wgMgr.LastDirectReceive(peer.Spec.PublicKey) <= 0 && // 0 = never, <0 = engine has no signal
+			(!isStableDirectNAT(a.detectedNATType) || !isStableDirectNAT(peer.Status.NATType)) {
+			backoff := a.unstableProbeBackoff()
+			state.NextProbeAfter = time.Now().Add(backoff)
+			a.log.Info("unstable NAT pair failing repeatedly, backing off direct probes",
+				"peer", peer.Name, "failures", state.ProbeFailCount, "backoff", backoff)
+		}
 		a.setICEState(peer.Name, state)
 		return
 	}
@@ -1123,6 +1135,38 @@ func (a *Agent) deferDirectReprobe(peerName string, delay time.Duration) {
 	if next.After(state.NextProbeAfter) {
 		state.NextProbeAfter = next
 		a.setICEState(peerName, state)
+	}
+}
+
+// unstableProbeFailThreshold is how many consecutive failed direct probes an
+// unstable/unknown-NAT peer may accumulate before the agent backs off probing
+// for unstableProbeBackoff instead of re-probing every relayRetry. This cuts
+// churn for pairs that cannot currently go direct (e.g. our NAT is still
+// unclassified) while leaving the relay path fully functional. Recovery still
+// happens promptly: NAT re-classification clears the backoff
+// (clearDirectReprobeBackoff), as does the relay-state direct-inbound fast-track.
+const unstableProbeFailThreshold = 3
+
+// unstableProbeBackoff is the relay hold applied after repeated direct-probe
+// failures on an unstable/unknown-NAT pair. Bounded well above relayRetry so the
+// agent is not re-probing a structurally-stuck pair every cycle.
+func (a *Agent) unstableProbeBackoff() time.Duration {
+	d := a.relayRetry * 5
+	if d < 10*time.Minute {
+		d = 10 * time.Minute
+	}
+	return d
+}
+
+// clearDirectReprobeBackoff resets every peer's NextProbeAfter so they re-probe
+// promptly. Called when local NAT re-classification changes, since the new type
+// may make previously-stuck pairs viable. Note this also clears the short
+// directFailoverProbeCooldown set by deferDirectReprobe — intended, because a
+// NAT-type change invalidates the prior failover assumption. Runs on the sync
+// goroutine (the only writer of iceStates), so no lock is needed.
+func (a *Agent) clearDirectReprobeBackoff() {
+	for _, s := range a.iceStates {
+		s.NextProbeAfter = time.Time{}
 	}
 }
 
