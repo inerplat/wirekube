@@ -556,44 +556,9 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		return
 	}
 
+	sym := string(nat.NATSymmetric)
 	switch {
-	case myNAT != "symmetric" && peerNAT != "symmetric":
-		// Cone ↔ Cone: both endpoints are stable. Active probe is safe and fast
-		// because the peer can reach us at our stable STUN endpoint simultaneously.
-		a.log.V(1).Info("cone↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT != "symmetric" && peerNAT == "symmetric":
-		// Cone ↔ Symmetric: simultaneous active probe from both sides.
-		//
-		// Passive-only approach fails for two reasons:
-		//   1. The symmetric peer's relay keepalives (sent while we stay on relay)
-		//      arrive at our relay proxy and are forwarded to our WG with a
-		//      localhost source. WG roams back to the localhost proxy address,
-		//      so ActualEndpoint stays "127.0.0.1:PORT" and probeOK is always
-		//      false even when the direct handshake succeeds.
-		//   2. Many home routers use address-restricted cone NAT: inbound packets
-		//      from a source IP are only forwarded if we have previously sent
-		//      something to that IP. Passive mode never sends to the symmetric
-		//      peer's IP, so the NAT filter blocks their probe.
-		//
-		// By probing actively on both sides simultaneously:
-		//   - We send to the symmetric peer's CRD endpoint (packet is dropped by
-		//     their symmetric NAT, but it opens our address-restricted filter for
-		//     their IP and stops our WG from sending keepalives via relay).
-		//   - The symmetric peer probes our stable STUN endpoint; with our NAT
-		//     filter now open their probe gets through and the handshake completes.
-		// Relay stays fully active while probing so failover remains seamless even
-		// when the direct path is impossible.
-		a.log.V(1).Info("cone↔symmetric — simultaneous probe (opens NAT filter)", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT == "symmetric" && peerNAT != "symmetric":
-		// Symmetric ↔ Cone: we should probe the peer's stable endpoint.
-		a.log.V(1).Info("symmetric↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT == "symmetric" && peerNAT == "symmetric":
+	case myNAT == sym && peerNAT == sym:
 		if ok, reason := a.canStartBirthdayAttack(peer, state); ok {
 			a.log.Info("symmetric↔symmetric — initiating birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
@@ -603,6 +568,39 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 			a.log.Info("symmetric↔symmetric — staying on relay", "peer", peer.Name, "reason", reason)
 			state.State = iceStateFailed
 		}
+
+	case myNAT == sym || peerNAT == sym:
+		// One side symmetric, the other non-symmetric: simultaneous active probe
+		// from both sides. Probing actively (rather than passively) matters:
+		//   1. The symmetric peer's relay keepalives arrive at our relay proxy and
+		//      are forwarded to WG with a localhost source, so WG roams back to the
+		//      127.0.0.1 proxy and a successful direct handshake is undetectable.
+		//   2. Address-restricted cone NAT only forwards inbound packets from an IP
+		//      we have already sent to; passive mode never sends to the peer's IP.
+		// By probing actively on both sides we send to the symmetric peer's CRD
+		// endpoint (opening our NAT filter for their IP and stopping the relay
+		// keepalive loop) while they probe our stable endpoint, so the handshake
+		// can complete. Relay stays fully active so failover remains seamless when
+		// the direct path is impossible.
+		a.log.V(1).Info("symmetric↔non-symmetric — simultaneous probe (opens NAT filter)", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
+
+	case isStableDirectNAT(myNAT) && isStableDirectNAT(peerNAT):
+		// Both ends confirmed stable (open/cone): the peer can reach us at our
+		// stable endpoint simultaneously, so an active probe is safe and fast.
+		a.log.V(1).Info("stable↔stable — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
+
+	default:
+		// At least one side is unclassified ("" / unknown), and neither is
+		// symmetric. We must NOT treat unknown as a stable cone — doing so is what
+		// let unclassified peers be probed as if confirmed-direct. We still attempt
+		// a probe (classification alone must never refuse a path that might work),
+		// but log it as speculative. PathMonitor remains the authority on whether
+		// the resulting path is actually direct; repeated failures are handled by
+		// the relay backoff in runICENegotiation.
+		a.log.V(1).Info("unclassified NAT — speculative probe", "peer", peer.Name, "myNAT", myNAT, "peerNAT", peerNAT, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
 	}
 
 	a.setICEState(peer.Name, state)
@@ -624,6 +622,16 @@ func isPortRestrictedSymmetricPair(myNAT, peerNAT string) bool {
 func isSymmetricSymmetricPair(myNAT, peerNAT string) bool {
 	sym := string(nat.NATSymmetric)
 	return myNAT == sym && peerNAT == sym
+}
+
+// isStableDirectNAT reports whether a NAT type is known-stable enough that an
+// immediate cone-style active probe is appropriate. Only "open" and "cone" map
+// a fixed external port that a peer can reach simultaneously. Crucially, the
+// unknown/unclassified type ("") is NOT stable: treating it as such is what let
+// unclassified peers be probed as if they were confirmed-direct. Symmetric and
+// port-restricted-cone are likewise not stable for cone-style probing.
+func isStableDirectNAT(natType string) bool {
+	return natType == string(nat.NATOpen) || natType == string(nat.NATCone)
 }
 
 // shouldPermanentRelay reports whether this peer pair has been determined

@@ -1345,6 +1345,76 @@ func TestGatherICECandidatesFiltersPrivateSrflx(t *testing.T) {
 	}
 }
 
+func TestIsStableDirectNAT(t *testing.T) {
+	tests := []struct {
+		natType string
+		want    bool
+	}{
+		{string(nat.NATOpen), true},
+		{string(nat.NATCone), true},
+		{"", false}, // unknown/unclassified must NOT be treated as stable
+		{string(nat.NATSymmetric), false},
+		{string(nat.NATPortRestrictedCone), false},
+		{"something-unexpected", false},
+	}
+	for _, tt := range tests {
+		name := tt.natType
+		if name == "" {
+			name = "unknown"
+		}
+		t.Run(name, func(t *testing.T) {
+			if got := isStableDirectNAT(tt.natType); got != tt.want {
+				t.Errorf("isStableDirectNAT(%q) = %v, want %v", tt.natType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStartICECheckProbesUnclassifiedPairs locks the behavior-preservation
+// invariant of Phase 4: making unknown ("") an explicit switch case must NOT
+// stop unclassified or port-restricted-cone pairs from being probed. Every
+// non-(both-symmetric) pair must still initiate a direct probe. This guards the
+// invariant against a future Phase 6 change to the default arm.
+func TestStartICECheckProbesUnclassifiedPairs(t *testing.T) {
+	cases := []struct {
+		name    string
+		myNAT   string
+		peerNAT string
+	}{
+		{"unknown × cone", "", string(nat.NATCone)},
+		{"cone × unknown", string(nat.NATCone), ""},
+		{"unknown × unknown", "", ""},
+		{"port-restricted-cone × cone", string(nat.NATPortRestrictedCone), string(nat.NATCone)},
+		{"cone × cone (control)", string(nat.NATCone), string(nat.NATCone)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{
+				log:             logr.Discard(),
+				wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}},
+				detectedNATType: tc.myNAT,
+				directProbing:   map[string]bool{},
+				directEndpoints: map[string]string{},
+				iceStates:       map[string]*peerICEState{},
+			}
+			peer := &wirekubev1alpha1.WireKubePeer{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+				Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key", Endpoint: "203.0.113.10:51820"},
+			}
+			peer.Status.NATType = tc.peerNAT
+
+			a.startICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+			if !a.directProbing["remote"] {
+				t.Errorf("directProbing[remote] = false, want true (pair must still probe)")
+			}
+			if got := a.getICEState("remote").State; got != iceStateChecking {
+				t.Errorf("state = %s, want %s", got, iceStateChecking)
+			}
+		})
+	}
+}
+
 func TestCanStartBirthdayAttack(t *testing.T) {
 	localPP := &nat.PortPrediction{SamplePorts: []int{1000, 1100, 1200}}
 	peerPP := &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100, 2200}}
