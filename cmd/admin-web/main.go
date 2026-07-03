@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -76,6 +77,13 @@ func main() {
 		log.Fatalf("admin-web auth: %v", err)
 	}
 
+	// Enforce the safe invariant: the console can download private keys, so it
+	// may only run without authentication when bound to loopback. A non-loopback
+	// bind with auth disabled is refused rather than silently exposed.
+	if auth == nil && !isLoopbackAddr(*addr) {
+		log.Fatalf("refusing to start: admin-web is bound to non-loopback address %q with authentication disabled; set WIREKUBE_ADMIN_WEB_USERNAME and WIREKUBE_ADMIN_WEB_PASSWORD_HASH", *addr)
+	}
+
 	s := newServer(c, *waitFor, *secretNamespace)
 	s.auth = auth
 	if auth == nil {
@@ -95,6 +103,21 @@ func main() {
 type basicAuthConfig struct {
 	username     string
 	passwordHash []byte // bcrypt hash of the password
+}
+
+// isLoopbackAddr reports whether a listen address binds only the loopback
+// interface. An empty or wildcard host (":8080", "0.0.0.0:8080") is not
+// loopback — it binds all interfaces — so it returns false.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // loadBasicAuth reads credentials from the environment. Authentication is
