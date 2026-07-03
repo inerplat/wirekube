@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -274,78 +275,82 @@ func TestPreferredTransportForPeer(t *testing.T) {
 	}
 }
 
-func TestPublishedTransportForPeerPrefersObservedDirectPath(t *testing.T) {
-	wg := &fakeWGEngine{lastDirect: map[string]int64{
-		"pub-a": time.Now().Add(-500 * time.Millisecond).UnixNano(),
-	}}
-	a := &Agent{
-		wgMgr:                 wg,
-		relayedPeers:          map[string]bool{"peer-a": true},
-		handshakeValidWindow:  45 * time.Second,
-		directConnectedWindow: 3 * time.Minute,
-		healthProbeTimeout:    5 * time.Second,
-	}
-	peer := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-a"},
-		Spec: wirekubev1alpha1.WireKubePeerSpec{
-			PublicKey: "pub-a",
-		},
-	}
-	stats := map[string]wireguard.PeerStats{
-		"pub-a": {
-			PublicKeyB64:   "pub-a",
-			LastHandshake:  time.Now().Add(-5 * time.Second),
-			ActualEndpoint: "203.0.113.10:51820",
-		},
-	}
-
-	if got := a.publishedTransportForPeer(peer, stats); got != "direct" {
-		t.Fatalf("publishedTransportForPeer() = %q, want direct for observed direct dataplane", got)
-	}
-}
-
-// TestPublishedTransportForPeerReadsPathMonitor asserts the new status
-// contract: publishedTransportForPeer reflects whatever PathMonitor
-// currently says the peer's mode is. Direct and Warm both surface as
-// "direct" (we are using, or trying, the direct leg); only PathModeRelay
-// surfaces as "relay" (direct has been given up on). The legacy path —
-// inspecting WG's ActualEndpoint for "127.0.0.1:..." (the old UDPProxy
-// signal) — is gone along with UDPProxy itself.
+// TestPublishedTransportForPeerReadsPathMonitor asserts the status contract:
+// only PathModeDirect (confirmed direct via fresh direct-receive evidence) is
+// reported as "direct". PathModeWarm (direct unproven / being demoted),
+// PathUnknown (not yet evaluated), and PathModeRelay all report "relay", so the
+// status never overstates a probing/unknown path as a confirmed direct one.
 func TestPublishedTransportForPeerReadsPathMonitor(t *testing.T) {
-	// Drive a PathMonitor into PathModeRelay by setting its backoff
-	// deadline into the past and never feeding a direct RX.
-	rx := &fakeRX{last: map[string]int64{}}
-	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	pm := NewPathMonitor(logr.Discard(), rx, PathMonitorConfig{
-		WarmStall:  100 * time.Millisecond,
-		RelayStall: 100 * time.Millisecond, // short so the transition to Relay happens fast
-		PromoteAge: 50 * time.Millisecond,
-		RelayRetry: 5 * time.Second, // long so we stay in Relay
-	}, clk.now)
-	// Drive: Relay (first Evaluate) → Warm (forced probe) → Relay (stall).
-	pm.Evaluate("peer-a", "pub-a", true) // → Warm
-	clk.advance(200 * time.Millisecond)
-	pm.Evaluate("peer-a", "pub-a", false) // Warm → Relay
-
-	a := &Agent{pathMonitor: pm}
-	peer := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-a"},
-		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "pub-a"},
-	}
-	if got := a.publishedTransportForPeer(peer, nil); got != "relay" {
-		t.Fatalf("publishedTransportForPeer() = %q, want relay", got)
+	assertTransport := func(t *testing.T, pm *PathMonitor, peerName, pubKey, want string) {
+		t.Helper()
+		a := &Agent{pathMonitor: pm}
+		peer := &wirekubev1alpha1.WireKubePeer{
+			ObjectMeta: metav1.ObjectMeta{Name: peerName},
+			Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: pubKey},
+		}
+		if got := a.publishedTransportForPeer(peer, nil); got != want {
+			t.Fatalf("publishedTransportForPeer(%s) = %q, want %q", peerName, got, want)
+		}
 	}
 
-	// A second peer the monitor has never seen → "direct" (safe default;
-	// the sync loop will catch up on the next tick and place the peer on
-	// Relay if appropriate).
-	other := &wirekubev1alpha1.WireKubePeer{
-		ObjectMeta: metav1.ObjectMeta{Name: "peer-b"},
-		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "pub-b"},
+	newMon := func() (*PathMonitor, *fakeRX, *fakeClock) {
+		rx := &fakeRX{last: map[string]int64{}}
+		clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+		pm := NewPathMonitor(logr.Discard(), rx, PathMonitorConfig{
+			WarmStall:  100 * time.Millisecond,
+			RelayStall: 100 * time.Millisecond,
+			PromoteAge: 50 * time.Millisecond,
+			RelayRetry: 5 * time.Second,
+		}, clk.now)
+		return pm, rx, clk
 	}
-	if got := a.publishedTransportForPeer(other, nil); got != "direct" {
-		t.Fatalf("publishedTransportForPeer(new peer) = %q, want direct (unknown)", got)
-	}
+
+	// PathModeDirect: forced probe → Warm, then fresh direct RX promotes to Direct.
+	t.Run("direct reports direct", func(t *testing.T) {
+		pm, rx, clk := newMon()
+		pm.Evaluate("p", "k", true) // Relay → Warm
+		rx.last["k"] = clk.now().UnixNano()
+		clk.advance(10 * time.Millisecond) // still within promoteAge
+		if got := pm.Evaluate("p", "k", false); got != PathModeDirect {
+			t.Fatalf("precondition: mode = %s, want Direct", got)
+		}
+		assertTransport(t, pm, "p", "k", "direct")
+	})
+
+	// PathModeWarm: forced probe enters Warm; assert before any promotion.
+	t.Run("warm reports relay", func(t *testing.T) {
+		pm, _, _ := newMon()
+		if got := pm.Evaluate("p", "k", true); got != PathModeWarm {
+			t.Fatalf("precondition: mode = %s, want Warm", got)
+		}
+		assertTransport(t, pm, "p", "k", "relay")
+	})
+
+	// PathModeRelay: Warm → Relay after the stall window with no direct RX.
+	t.Run("relay reports relay", func(t *testing.T) {
+		pm, _, clk := newMon()
+		pm.Evaluate("p", "k", true) // Relay → Warm
+		clk.advance(200 * time.Millisecond)
+		if got := pm.Evaluate("p", "k", false); got != PathModeRelay { // Warm → Relay
+			t.Fatalf("precondition: mode = %s, want Relay", got)
+		}
+		assertTransport(t, pm, "p", "k", "relay")
+	})
+
+	// PathUnknown: a peer the monitor has never evaluated → conservative relay.
+	t.Run("unknown peer reports relay", func(t *testing.T) {
+		pm, _, _ := newMon()
+		assertTransport(t, pm, "never-seen", "nk", "relay")
+	})
+
+	// Nil pathMonitor (test-only literal) also reports the conservative relay.
+	t.Run("nil pathMonitor reports relay", func(t *testing.T) {
+		a := &Agent{}
+		peer := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "p"}}
+		if got := a.publishedTransportForPeer(peer, nil); got != "relay" {
+			t.Fatalf("nil pathMonitor = %q, want relay", got)
+		}
+	})
 }
 
 func TestHasPendingRestartRelayRecovery(t *testing.T) {
@@ -1233,5 +1238,400 @@ func TestRecoverICEStateFromWGWithoutPreservedInterfaceFallsBackToRelay(t *testi
 	}
 	if !state.LastCheck.IsZero() {
 		t.Fatalf("LastCheck = %v, want zero for immediate reprobe", state.LastCheck)
+	}
+}
+
+func TestIsPublicCandidateEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		ep   string
+		want bool
+	}{
+		{"public v4", "203.0.113.10:51820", true},
+		{"public v6", "[2606:4700:4700::1111]:51820", true},
+		{"public 100-block below cgnat", "100.63.0.1:51820", true},
+		{"public 100-block above cgnat", "100.128.0.1:51820", true},
+		{"rfc1918 192.168", "192.168.55.87:51822", false},
+		{"rfc1918 10", "10.0.0.5:51820", false},
+		{"rfc1918 172.16", "172.16.0.1:51820", false},
+		{"cgnat 100.64 low", "100.64.1.2:51820", false},
+		{"cgnat 100.127 high", "100.127.255.255:51820", false},
+		{"loopback", "127.0.0.1:51820", false},
+		{"link-local v4", "169.254.1.1:51820", false},
+		{"multicast v4", "224.0.0.1:51820", false},
+		{"unspecified", "0.0.0.0:51820", false},
+		{"ipv6 ula", "[fc00::1]:51820", false},
+		{"ipv6 link-local", "[fe80::1]:51820", false},
+		{"missing port", "203.0.113.10", false},
+		{"empty", "", false},
+		{"hostname not ip", "example.com:51820", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPublicCandidateEndpoint(tt.ep); got != tt.want {
+				t.Errorf("isPublicCandidateEndpoint(%q) = %v, want %v", tt.ep, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatherICECandidatesFiltersPrivateSrflx verifies that a private or CGNAT
+// discovered endpoint (e.g. a UPnP external IP behind double-NAT) is NOT
+// advertised as a server-reflexive candidate, while a genuinely public one is —
+// at full priority for stable NAT and reduced priority for symmetric NAT.
+func TestGatherICECandidatesFiltersPrivateSrflx(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+			{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+		}},
+	}
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	a := &Agent{
+		client:   k8sClient,
+		nodeName: "test-node",
+		wgMgr:    &fakeWGEngine{},
+		log:      logr.Discard(),
+	}
+
+	srflxOf := func(cands []wirekubev1alpha1.ICECandidate) *wirekubev1alpha1.ICECandidate {
+		for i := range cands {
+			if cands[i].Type == candidateTypeSrflx {
+				return &cands[i]
+			}
+		}
+		return nil
+	}
+	hasHost := func(cands []wirekubev1alpha1.ICECandidate) bool {
+		for _, c := range cands {
+			if c.Type == candidateTypeHost {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Private (UPnP-style) discovered endpoint: no srflx candidate, but the host
+	// candidate (LAN IP) is still published for same-NAT direct.
+	got := a.gatherICECandidates(&EndpointResult{Endpoint: "192.168.55.87:51822", Method: MethodUPnP})
+	if s := srflxOf(got); s != nil {
+		t.Fatalf("private endpoint published as srflx: %+v", *s)
+	}
+	if !hasHost(got) {
+		t.Fatalf("host candidate missing for private endpoint; got %+v", got)
+	}
+
+	// CGNAT (RFC 6598) discovered endpoint — looks public to IsPrivate but is not
+	// routable; the real-world double-NAT case. Must not be published as srflx.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "100.64.1.2:51822", Method: MethodUPnP})
+	if s := srflxOf(got); s != nil {
+		t.Fatalf("CGNAT endpoint published as srflx: %+v", *s)
+	}
+
+	// Public endpoint: srflx published at full priority.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "203.0.113.10:51822", Method: MethodSTUN})
+	s := srflxOf(got)
+	if s == nil {
+		t.Fatalf("public endpoint not published as srflx; got %+v", got)
+	}
+	if s.Address != "203.0.113.10:51822" || s.Priority != 200 {
+		t.Fatalf("public srflx = %+v, want addr 203.0.113.10:51822 priority 200", *s)
+	}
+
+	// Public endpoint behind symmetric NAT: srflx published at low priority.
+	got = a.gatherICECandidates(&EndpointResult{Endpoint: "203.0.113.10:51822", Method: MethodSTUN, NATType: nat.NATSymmetric})
+	if s := srflxOf(got); s == nil || s.Priority != 50 {
+		t.Fatalf("symmetric srflx = %+v, want priority 50", s)
+	}
+}
+
+func TestIsStableDirectNAT(t *testing.T) {
+	tests := []struct {
+		natType string
+		want    bool
+	}{
+		{string(nat.NATOpen), true},
+		{string(nat.NATCone), true},
+		{"", false}, // unknown/unclassified must NOT be treated as stable
+		{string(nat.NATSymmetric), false},
+		{string(nat.NATPortRestrictedCone), false},
+		{"something-unexpected", false},
+	}
+	for _, tt := range tests {
+		name := tt.natType
+		if name == "" {
+			name = "unknown"
+		}
+		t.Run(name, func(t *testing.T) {
+			if got := isStableDirectNAT(tt.natType); got != tt.want {
+				t.Errorf("isStableDirectNAT(%q) = %v, want %v", tt.natType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStartICECheckProbesUnclassifiedPairs locks the behavior-preservation
+// invariant of Phase 4: making unknown ("") an explicit switch case must NOT
+// stop unclassified or port-restricted-cone pairs from being probed. Every
+// non-(both-symmetric) pair must still initiate a direct probe. This guards the
+// invariant against a future Phase 6 change to the default arm.
+func TestStartICECheckProbesUnclassifiedPairs(t *testing.T) {
+	cases := []struct {
+		name    string
+		myNAT   string
+		peerNAT string
+	}{
+		{"unknown × cone", "", string(nat.NATCone)},
+		{"cone × unknown", string(nat.NATCone), ""},
+		{"unknown × unknown", "", ""},
+		{"port-restricted-cone × cone", string(nat.NATPortRestrictedCone), string(nat.NATCone)},
+		{"cone × cone (control)", string(nat.NATCone), string(nat.NATCone)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{
+				log:             logr.Discard(),
+				wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}},
+				detectedNATType: tc.myNAT,
+				directProbing:   map[string]bool{},
+				directEndpoints: map[string]string{},
+				iceStates:       map[string]*peerICEState{},
+			}
+			peer := &wirekubev1alpha1.WireKubePeer{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+				Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key", Endpoint: "203.0.113.10:51820"},
+			}
+			peer.Status.NATType = tc.peerNAT
+
+			a.startICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+			if !a.directProbing["remote"] {
+				t.Errorf("directProbing[remote] = false, want true (pair must still probe)")
+			}
+			if got := a.getICEState("remote").State; got != iceStateChecking {
+				t.Errorf("state = %s, want %s", got, iceStateChecking)
+			}
+		})
+	}
+}
+
+func TestShouldPermanentRelayExcludesUnknownNAT(t *testing.T) {
+	mkPeer := func(natType string) *wirekubev1alpha1.WireKubePeer {
+		p := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+		p.Status.NATType = natType
+		return p
+	}
+	cases := []struct {
+		name    string
+		myNAT   string
+		peerNAT string
+		wantPin bool
+	}{
+		{"unknown × unknown not pinned", "", "", false},
+		{"unknown × symmetric not pinned", "", "symmetric", false},
+		{"cone × unknown not pinned", "cone", "", false},
+		{"port-restricted-cone × symmetric pinned", "port-restricted-cone", "symmetric", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{detectedNATType: tc.myNAT}
+			if got := a.shouldPermanentRelay(mkPeer(tc.peerNAT), &peerICEState{}); got != tc.wantPin {
+				t.Fatalf("shouldPermanentRelay = %v, want %v", got, tc.wantPin)
+			}
+		})
+	}
+}
+
+// TestEvaluateICECheckBacksOffUnstableNATAfterRepeatedFailures verifies that an
+// unstable/unknown-NAT pair with no direct receive, after repeated probe
+// failures, is held on relay for the long unstable backoff instead of being
+// re-probed every relayRetry.
+func TestEvaluateICECheckBacksOffUnstableNATAfterRepeatedFailures(t *testing.T) {
+	a := &Agent{
+		log:             logr.Discard(),
+		wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}}, // LastDirectReceive → 0
+		detectedNATType: "",                                            // our NAT still unclassified → pair unstable
+		relayRetry:      30 * time.Second,
+		directProbing:   map[string]bool{"remote": true},
+		relayedPeers:    map[string]bool{},
+		directEndpoints: map[string]string{},
+		iceStates:       map[string]*peerICEState{},
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "remote",
+			Annotations: map[string]string{"wirekube.io/birthday-attack": "disabled"}, // avoid client lookup
+		},
+		Spec: wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key"},
+	}
+	peer.Status.NATType = "cone"
+
+	state := a.getICEState("remote")
+	state.State = iceStateChecking
+	state.ProbeFailCount = unstableProbeFailThreshold - 1 // ++ in evaluateICECheck reaches the threshold
+	state.LastCheck = time.Now().Add(-activeProbeWait - time.Second)
+	a.setICEState("remote", state)
+
+	a.evaluateICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+	got := a.getICEState("remote")
+	if got.State != iceStateFailed {
+		t.Fatalf("state = %s, want %s", got.State, iceStateFailed)
+	}
+	if got.NextProbeAfter.IsZero() || time.Until(got.NextProbeAfter) < 9*time.Minute {
+		t.Fatalf("NextProbeAfter in %v, want a long (~10m) backoff", time.Until(got.NextProbeAfter))
+	}
+
+	// A NAT re-classification clears the backoff so the peer can re-probe.
+	a.clearDirectReprobeBackoff()
+	if !a.getICEState("remote").NextProbeAfter.IsZero() {
+		t.Fatalf("clearDirectReprobeBackoff did not reset NextProbeAfter")
+	}
+}
+
+func TestCanStartBirthdayAttack(t *testing.T) {
+	localPP := &nat.PortPrediction{SamplePorts: []int{1000, 1100, 1200}}
+	peerPP := &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100, 2200}}
+
+	// newPeer builds a remote peer. A non-empty annotation drives
+	// isBirthdayAttackEnabled directly (per-peer annotation has highest
+	// priority), so these cases never touch the k8s client.
+	newPeer := func(ann, natType string, pp *wirekubev1alpha1.PortPrediction) *wirekubev1alpha1.WireKubePeer {
+		p := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+		if ann != "" {
+			p.Annotations = map[string]string{"wirekube.io/birthday-attack": ann}
+		}
+		p.Status.NATType = natType
+		p.Status.PortPrediction = pp
+		return p
+	}
+
+	tests := []struct {
+		name     string
+		localNAT string
+		localPP  *nat.PortPrediction
+		ann      string
+		peerNAT  string
+		peerPP   *wirekubev1alpha1.PortPrediction
+		tried    bool
+		want     bool
+	}{
+		{"all conditions met", "symmetric", localPP, "enabled", "symmetric", peerPP, false, true},
+		{"disabled by annotation", "symmetric", localPP, "disabled", "symmetric", peerPP, false, false},
+		{"local NAT not symmetric", "cone", localPP, "enabled", "symmetric", peerPP, false, false},
+		{"peer NAT unknown", "symmetric", localPP, "enabled", "", peerPP, false, false},
+		{"peer NAT cone", "symmetric", localPP, "enabled", "cone", peerPP, false, false},
+		{"no local port prediction", "symmetric", nil, "enabled", "symmetric", peerPP, false, false},
+		{"empty local port prediction", "symmetric", &nat.PortPrediction{}, "enabled", "symmetric", peerPP, false, false},
+		{"no peer port prediction", "symmetric", localPP, "enabled", "symmetric", nil, false, false},
+		{"birthday already tried", "symmetric", localPP, "enabled", "symmetric", peerPP, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Agent{detectedNATType: tt.localNAT, portPrediction: tt.localPP}
+			peer := newPeer(tt.ann, tt.peerNAT, tt.peerPP)
+			got, reason := a.canStartBirthdayAttack(peer, &peerICEState{BirthdayTried: tt.tried})
+			if got != tt.want {
+				t.Fatalf("canStartBirthdayAttack() = %v (reason %q), want %v", got, reason, tt.want)
+			}
+			if !got && reason == "" {
+				t.Errorf("denied but no reason given")
+			}
+			if got && reason != "" {
+				t.Errorf("allowed but reason = %q, want empty", reason)
+			}
+		})
+	}
+}
+
+// TestCanStartBirthdayAttackDisabledByDefault is the safety guarantee: with
+// WireKubeMesh.spec.natTraversal absent, no birthday attack may start even when
+// both ends are symmetric and have port prediction. This is the condition under
+// which the previously-unguarded evaluateICECheck entry point could spawn a
+// hole-punch goroutine.
+func TestCanStartBirthdayAttackDisabledByDefault(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(wirekube): %v", err)
+	}
+	// Mesh with no NATTraversal block → birthday attack disabled by default.
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(mesh).Build()
+
+	a := &Agent{
+		client:          k8sClient,
+		nodeName:        "test-node",
+		detectedNATType: "symmetric",
+		portPrediction:  &nat.PortPrediction{SamplePorts: []int{1000, 1100}},
+	}
+	// Remote peer is fully birthday-eligible EXCEPT that nothing enables it.
+	peer := &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "remote"}}
+	peer.Status.NATType = "symmetric"
+	peer.Status.PortPrediction = &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100}}
+
+	if ok, reason := a.canStartBirthdayAttack(peer, &peerICEState{}); ok {
+		t.Fatalf("birthday attack allowed with natTraversal absent; want disabled (reason=%q)", reason)
+	}
+}
+
+// TestEvaluateICECheckDoesNotStartBirthdayWhenDisabled is the regression anchor
+// for the previously-unguarded entry point. When an active probe fails for a
+// symmetric↔symmetric pair but NAT traversal is disabled, evaluateICECheck must
+// fall back to relay (iceStateFailed) and must NOT spawn a birthday-attack
+// goroutine. This locks the fix against a future refactor re-inlining the check.
+func TestEvaluateICECheckDoesNotStartBirthdayWhenDisabled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(core): %v", err)
+	}
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(wirekube): %v", err)
+	}
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}} // no NATTraversal
+	k8sClient := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(mesh).Build()
+
+	a := &Agent{
+		client:          k8sClient,
+		nodeName:        "test-node",
+		log:             logr.Discard(),
+		wgMgr:           &fakeWGEngine{lastDirect: map[string]int64{}},
+		detectedNATType: "symmetric",
+		portPrediction:  &nat.PortPrediction{SamplePorts: []int{1000, 1100}},
+		directProbing:   map[string]bool{"remote": true},
+		iceStates:       map[string]*peerICEState{},
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+		Spec:       wirekubev1alpha1.WireKubePeerSpec{PublicKey: "remote-key"},
+	}
+	peer.Status.NATType = "symmetric"
+	peer.Status.PortPrediction = &wirekubev1alpha1.PortPrediction{SamplePorts: []int32{2000, 2100}}
+
+	// Active probe in flight, probe window elapsed, peer absent from stats (no
+	// fresh handshake) → evaluateICECheck reaches the birthday decision, which
+	// the gate denies, then falls back to relay.
+	state := a.getICEState("remote")
+	state.State = iceStateChecking
+	state.LastCheck = time.Now().Add(-activeProbeWait - time.Second)
+	a.setICEState("remote", state)
+
+	a.evaluateICECheck(context.Background(), peer, map[string]wireguard.PeerStats{})
+
+	got := a.getICEState("remote")
+	if got.State != iceStateFailed {
+		t.Fatalf("state = %s, want %s (relay fallback, no birthday)", got.State, iceStateFailed)
+	}
+	if got.BirthdayTried {
+		t.Errorf("BirthdayTried = true, want false (no birthday attempt when disabled)")
+	}
+	if got.holePunch != nil {
+		t.Errorf("holePunch set, want nil (no hole-punch goroutine spawned)")
 	}
 }

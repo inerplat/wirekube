@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	"github.com/wirekube/wirekube/pkg/externalpeer"
 	"github.com/wirekube/wirekube/pkg/wireguard"
 )
 
@@ -398,7 +399,7 @@ func writeExternalPeerTable(out io.Writer, peers []wirekubev1alpha1.WireKubeExte
 			valueOrDash(p.Status.AssignedMeshIP),
 			valueOrDash(p.Status.RelayEndpoint),
 			valueOrDash(p.Status.IngressPeerName),
-			externalPeerMTU(&p),
+			externalpeer.EffectiveMTU(&p),
 			age,
 		)
 	}
@@ -414,7 +415,7 @@ func writeExternalPeerDetail(out io.Writer, cr *wirekubev1alpha1.WireKubeExterna
 	fmt.Fprintf(out, "Ingress Peer:         %s\n", valueOrDash(cr.Status.IngressPeerName))
 	fmt.Fprintf(out, "Ingress Public Key:   %s\n", valueOrDash(cr.Status.IngressPublicKey))
 	fmt.Fprintf(out, "Public Key:           %s\n", valueOrDash(cr.Status.PublicKey))
-	fmt.Fprintf(out, "MTU:                  %d\n", externalPeerMTU(cr))
+	fmt.Fprintf(out, "MTU:                  %d\n", externalpeer.EffectiveMTU(cr))
 	fmt.Fprintf(out, "Allowed Destinations: %s\n", valueOrDash(strings.Join(cr.Status.AllowedDestinations, ", ")))
 	if len(cr.Status.Conditions) > 0 {
 		cond := cr.Status.Conditions[len(cr.Status.Conditions)-1]
@@ -423,24 +424,7 @@ func writeExternalPeerDetail(out io.Writer, cr *wirekubev1alpha1.WireKubeExterna
 }
 
 func removeExternalPeer(ctx context.Context, c client.Client, name string) error {
-	cr := &wirekubev1alpha1.WireKubeExternalPeer{}
-	if err := c.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
-		return fmt.Errorf("get external peer: %w", err)
-	}
-	if err := c.Delete(ctx, cr); err != nil {
-		return fmt.Errorf("delete external peer: %w", err)
-	}
-	return nil
-}
-
-func externalPeerMTU(cr *wirekubev1alpha1.WireKubeExternalPeer) int32 {
-	if cr.Status.MTU > 0 {
-		return cr.Status.MTU
-	}
-	if cr.Spec.MTU > 0 {
-		return cr.Spec.MTU
-	}
-	return wirekubev1alpha1.DefaultExternalPeerMTU
+	return externalpeer.Delete(ctx, c, name)
 }
 
 // inviteCmd creates a WireKubeExternalPeer, waits for the controller to
@@ -506,12 +490,12 @@ cluster never sees it.`,
 				return fmt.Errorf("create WireKubeExternalPeer: %w", err)
 			}
 
-			active, err := waitForActive(ctx, c, displayName, waitFor)
+			active, err := externalpeer.WaitForActive(ctx, c, displayName, waitFor)
 			if err != nil {
 				return err
 			}
 
-			conf := renderConf(kp.PrivateKeyBase64(), active)
+			conf := externalpeer.RenderConfig(kp.PrivateKeyBase64(), active)
 			if outputFile != "" {
 				if err := os.WriteFile(outputFile, []byte(conf), 0o600); err != nil {
 					return fmt.Errorf("write conf: %w", err)
@@ -561,77 +545,6 @@ func revokeCmd() *cobra.Command {
 		},
 	}
 	return cmd
-}
-
-// waitForActive polls the CR until Status.Phase==Active or timeout.
-func waitForActive(ctx context.Context, c client.Client, name string, timeout time.Duration) (*wirekubev1alpha1.WireKubeExternalPeer, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		cr := &wirekubev1alpha1.WireKubeExternalPeer{}
-		if err := c.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
-			return nil, fmt.Errorf("get peer: %w", err)
-		}
-		switch cr.Status.Phase {
-		case wirekubev1alpha1.ExternalPeerPhaseActive:
-			if cr.Status.AssignedMeshIP == "" || cr.Status.RelayEndpoint == "" || cr.Status.IngressPublicKey == "" {
-				return nil, fmt.Errorf("phase=Active but status incomplete: meshIP=%q endpoint=%q ingressPubKey-set=%v",
-					cr.Status.AssignedMeshIP, cr.Status.RelayEndpoint, cr.Status.IngressPublicKey != "")
-			}
-			return cr, nil
-		case wirekubev1alpha1.ExternalPeerPhaseFailed:
-			return nil, fmt.Errorf("controller marked peer as Failed: %s", lastConditionMessage(cr.Status.Conditions))
-		case wirekubev1alpha1.ExternalPeerPhaseRevoked:
-			return nil, fmt.Errorf("peer is Revoked")
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for Phase=Active (current=%q): %s",
-				cr.Status.Phase, lastConditionMessage(cr.Status.Conditions))
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
-// renderConf builds the WireGuard conf for an external peer. The ingress peer
-// is the only [Peer]; AllowedIPs comes from status.allowedDestinations
-// which the controller fills with either the operator's spec.allowedDestinations
-// or the default mesh+pod-CIDR set. status is authoritative; using spec here
-// would silently drop the controller's defaults whenever the operator left
-// spec.allowedDestinations empty.
-func renderConf(privateKey string, cr *wirekubev1alpha1.WireKubeExternalPeer) string {
-	allowed := cr.Status.AllowedDestinations
-	if len(allowed) == 0 {
-		// Last-resort fallback: the controller hasn't (yet) populated
-		// status.allowedDestinations. Render the peer's own /32 so the
-		// conf is at least syntactically valid; the user can re-issue
-		// once the controller has reconciled.
-		allowed = []string{cr.Status.AssignedMeshIP}
-	}
-	mtu := cr.Status.MTU
-	if mtu == 0 {
-		mtu = cr.Spec.MTU
-	}
-	if mtu == 0 {
-		mtu = wirekubev1alpha1.DefaultExternalPeerMTU
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "[Interface]\n")
-	fmt.Fprintf(&b, "PrivateKey = %s\n", privateKey)
-	fmt.Fprintf(&b, "Address = %s\n", cr.Status.AssignedMeshIP)
-	fmt.Fprintf(&b, "MTU = %d\n", mtu)
-	fmt.Fprintf(&b, "\n[Peer]\n")
-	fmt.Fprintf(&b, "PublicKey = %s\n", cr.Status.IngressPublicKey)
-	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(allowed, ", "))
-	fmt.Fprintf(&b, "Endpoint = %s\n", cr.Status.RelayEndpoint)
-	fmt.Fprintf(&b, "PersistentKeepalive = 25\n")
-	return b.String()
-}
-
-func lastConditionMessage(conds []metav1.Condition) string {
-	if len(conds) == 0 {
-		return "(no conditions yet)"
-	}
-	c := conds[len(conds)-1]
-	return fmt.Sprintf("%s: %s", c.Reason, c.Message)
 }
 
 func formatDuration(d time.Duration) string {

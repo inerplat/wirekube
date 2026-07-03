@@ -8,7 +8,7 @@ GOFLAGS = -ldflags="-s -w"
 ## ─── Build ───────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build: build-agent build-relay build-wirekubectl build-stun-server
+build: build-agent build-relay build-wirekubectl build-admin-web build-stun-server
 
 build-agent:
 	$(GO) build $(GOFLAGS) -o bin/agent ./cmd/agent
@@ -24,6 +24,11 @@ build-wirekubectl:
 	$(GO) build $(GOFLAGS) -o bin/wirekubectl ./cmd/wirekubectl
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-amd64 ./cmd/wirekubectl/
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-wirekubectl-linux-arm64 ./cmd/wirekubectl/
+
+build-admin-web:
+	$(GO) build $(GOFLAGS) -o bin/wirekube-admin-web ./cmd/admin-web
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-admin-web-linux-amd64 ./cmd/admin-web/
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/wirekube-admin-web-linux-arm64 ./cmd/admin-web/
 
 build-stun-server:
 	$(GO) build $(GOFLAGS) -o bin/wirekube-stun ./cmd/stun-server

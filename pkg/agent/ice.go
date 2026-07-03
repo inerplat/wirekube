@@ -76,6 +76,12 @@ var virtualIfacePrefixes = []string{
 	"br-", "virbr", "wg", "wire_kube", "lxc",
 }
 
+// cgnatNet is the RFC 6598 shared address space (100.64.0.0/10) used by
+// carrier-grade NAT. net.IP.IsPrivate does NOT include this range, yet it is
+// not externally routable, so it must never be advertised as a reflexive
+// candidate. Double-NAT/CGNAT routers hand these addresses out (e.g. via UPnP).
+var _, cgnatNet, _ = net.ParseCIDR("100.64.0.0/10")
+
 // peerICEState tracks ICE negotiation state for a single peer.
 type peerICEState struct {
 	State         string
@@ -221,8 +227,11 @@ func (a *Agent) gatherICECandidates(epResult *EndpointResult) []wirekubev1alpha1
 		})
 	}
 
-	// Server-reflexive candidate: STUN-discovered public endpoint.
-	if epResult != nil && epResult.Endpoint != "" {
+	// Server-reflexive candidate: STUN/portmap-discovered endpoint. Publish it
+	// only when the discovered address is externally routable — a private or
+	// CGNAT address (e.g. a UPnP external IP behind double-NAT) must never be
+	// advertised as srflx, or peers will attempt direct paths that cannot work.
+	if epResult != nil && isPublicCandidateEndpoint(epResult.Endpoint) {
 		prio := int32(200)
 		if epResult.NATType == nat.NATSymmetric {
 			prio = 50 // low priority — mapped port is unstable
@@ -330,19 +339,28 @@ func (a *Agent) publishICEState(ctx context.Context, peerName string, candidates
 	peer.Status.ICEState = iceState
 
 	if portPred != nil {
-		pp := &wirekubev1alpha1.PortPrediction{
-			BasePort:    int32(portPred.BasePort),
-			Increment:   int32(portPred.Increment),
-			Jitter:      int32(portPred.Jitter),
-			SamplePorts: make([]int32, len(portPred.SamplePorts)),
-		}
-		for i, p := range portPred.SamplePorts {
-			pp.SamplePorts[i] = int32(p)
-		}
-		peer.Status.PortPrediction = pp
+		peer.Status.PortPrediction = crdPortPrediction(portPred)
 	}
 
 	return a.client.Status().Patch(ctx, peer, patch)
+}
+
+// crdPortPrediction converts an internal nat.PortPrediction to the CRD status
+// type, returning nil for nil input so callers can clear the field.
+func crdPortPrediction(pp *nat.PortPrediction) *wirekubev1alpha1.PortPrediction {
+	if pp == nil {
+		return nil
+	}
+	out := &wirekubev1alpha1.PortPrediction{
+		BasePort:    int32(pp.BasePort),
+		Increment:   int32(pp.Increment),
+		Jitter:      int32(pp.Jitter),
+		SamplePorts: make([]int32, len(pp.SamplePorts)),
+	}
+	for i, p := range pp.SamplePorts {
+		out.SamplePorts[i] = int32(p)
+	}
+	return out
 }
 
 // runICENegotiation evaluates peers and attempts connectivity upgrades.
@@ -547,57 +565,51 @@ func (a *Agent) startICECheck(ctx context.Context, peer *wirekubev1alpha1.WireKu
 		return
 	}
 
+	sym := string(nat.NATSymmetric)
 	switch {
-	case myNAT != "symmetric" && peerNAT != "symmetric":
-		// Cone ↔ Cone: both endpoints are stable. Active probe is safe and fast
-		// because the peer can reach us at our stable STUN endpoint simultaneously.
-		a.log.V(1).Info("cone↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT != "symmetric" && peerNAT == "symmetric":
-		// Cone ↔ Symmetric: simultaneous active probe from both sides.
-		//
-		// Passive-only approach fails for two reasons:
-		//   1. The symmetric peer's relay keepalives (sent while we stay on relay)
-		//      arrive at our relay proxy and are forwarded to our WG with a
-		//      localhost source. WG roams back to the localhost proxy address,
-		//      so ActualEndpoint stays "127.0.0.1:PORT" and probeOK is always
-		//      false even when the direct handshake succeeds.
-		//   2. Many home routers use address-restricted cone NAT: inbound packets
-		//      from a source IP are only forwarded if we have previously sent
-		//      something to that IP. Passive mode never sends to the symmetric
-		//      peer's IP, so the NAT filter blocks their probe.
-		//
-		// By probing actively on both sides simultaneously:
-		//   - We send to the symmetric peer's CRD endpoint (packet is dropped by
-		//     their symmetric NAT, but it opens our address-restricted filter for
-		//     their IP and stops our WG from sending keepalives via relay).
-		//   - The symmetric peer probes our stable STUN endpoint; with our NAT
-		//     filter now open their probe gets through and the handshake completes.
-		// Relay stays fully active while probing so failover remains seamless even
-		// when the direct path is impossible.
-		a.log.V(1).Info("cone↔symmetric — simultaneous probe (opens NAT filter)", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT == "symmetric" && peerNAT != "symmetric":
-		// Symmetric ↔ Cone: we should probe the peer's stable endpoint.
-		a.log.V(1).Info("symmetric↔cone — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
-		a.probeDirectEndpoint(peer)
-
-	case myNAT == "symmetric" && peerNAT == "symmetric":
-		switch {
-		case !a.isBirthdayAttackEnabled(peer):
-			a.log.Info("symmetric↔symmetric — birthday attack disabled, staying on relay", "peer", peer.Name)
-			state.State = iceStateFailed
-		case !state.BirthdayTried:
+	case myNAT == sym && peerNAT == sym:
+		if ok, reason := a.canStartBirthdayAttack(peer, state); ok {
 			a.log.Info("symmetric↔symmetric — initiating birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
 			go a.runBirthdayAttack(ctx, peer)
-		default:
-			a.log.Info("symmetric↔symmetric — birthday attack already attempted, staying on relay", "peer", peer.Name)
+		} else {
+			a.log.Info("symmetric↔symmetric — staying on relay", "peer", peer.Name, "reason", reason)
 			state.State = iceStateFailed
 		}
+
+	case myNAT == sym || peerNAT == sym:
+		// One side symmetric, the other non-symmetric: simultaneous active probe
+		// from both sides. Probing actively (rather than passively) matters:
+		//   1. The symmetric peer's relay keepalives arrive at our relay proxy and
+		//      are forwarded to WG with a localhost source, so WG roams back to the
+		//      127.0.0.1 proxy and a successful direct handshake is undetectable.
+		//   2. Address-restricted cone NAT only forwards inbound packets from an IP
+		//      we have already sent to; passive mode never sends to the peer's IP.
+		// By probing actively on both sides we send to the symmetric peer's CRD
+		// endpoint (opening our NAT filter for their IP and stopping the relay
+		// keepalive loop) while they probe our stable endpoint, so the handshake
+		// can complete. Relay stays fully active so failover remains seamless when
+		// the direct path is impossible.
+		a.log.V(1).Info("symmetric↔non-symmetric — simultaneous probe (opens NAT filter)", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
+
+	case isStableDirectNAT(myNAT) && isStableDirectNAT(peerNAT):
+		// Both ends confirmed stable (open/cone): the peer can reach us at our
+		// stable endpoint simultaneously, so an active probe is safe and fast.
+		a.log.V(1).Info("stable↔stable — active probe", "peer", peer.Name, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
+
+	default:
+		// At least one side is unclassified ("" / unknown), and neither is
+		// symmetric. We must NOT treat unknown as a stable cone — doing so is what
+		// let unclassified peers be probed as if confirmed-direct. We still attempt
+		// a probe (classification alone must never refuse a path that might work),
+		// but log it as speculative. PathMonitor remains the authority on whether
+		// the resulting path is actually direct; repeated failures are handled by
+		// the relay backoff in runICENegotiation.
+		a.log.V(1).Info("unclassified NAT — speculative probe", "peer", peer.Name, "myNAT", myNAT, "peerNAT", peerNAT, "endpoint", peer.Spec.Endpoint)
+		a.probeDirectEndpoint(peer)
 	}
 
 	a.setICEState(peer.Name, state)
@@ -619,6 +631,16 @@ func isPortRestrictedSymmetricPair(myNAT, peerNAT string) bool {
 func isSymmetricSymmetricPair(myNAT, peerNAT string) bool {
 	sym := string(nat.NATSymmetric)
 	return myNAT == sym && peerNAT == sym
+}
+
+// isStableDirectNAT reports whether a NAT type is known-stable enough that an
+// immediate cone-style active probe is appropriate. Only "open" and "cone" map
+// a fixed external port that a peer can reach simultaneously. Crucially, the
+// unknown/unclassified type ("") is NOT stable: treating it as such is what let
+// unclassified peers be probed as if they were confirmed-direct. Symmetric and
+// port-restricted-cone are likewise not stable for cone-style probing.
+func isStableDirectNAT(natType string) bool {
+	return natType == string(nat.NATOpen) || natType == string(nat.NATCone)
 }
 
 // shouldPermanentRelay reports whether this peer pair has been determined
@@ -734,6 +756,41 @@ func (a *Agent) isBirthdayAttackEnabled(peer *wirekubev1alpha1.WireKubePeer) boo
 
 	// Default: disabled.
 	return false
+}
+
+// canStartBirthdayAttack is the single gate for launching a birthday attack.
+// Every entry point must consult it so that a mesh with NAT traversal disabled
+// can never spawn a hole-punch goroutine, regardless of how the ICE state
+// machine arrived at the decision. Returns false plus a human-readable reason
+// when any precondition is unmet.
+//
+// All conditions must hold:
+//   - birthday attack explicitly enabled (per-peer annotation or mesh global),
+//   - both ends classified symmetric — a birthday attack only makes sense when
+//     both NATs allocate a fresh port per destination,
+//   - local and peer port-prediction data each have at least one sample (both
+//     sides must be able to predict the other's ports),
+//   - this peer has not already exhausted its single birthday attempt.
+func (a *Agent) canStartBirthdayAttack(peer *wirekubev1alpha1.WireKubePeer, state *peerICEState) (bool, string) {
+	if !a.isBirthdayAttackEnabled(peer) {
+		return false, "birthday attack disabled"
+	}
+	if a.detectedNATType != string(nat.NATSymmetric) {
+		return false, "local NAT is not symmetric"
+	}
+	if peer.Status.NATType != string(nat.NATSymmetric) {
+		return false, "peer NAT is not symmetric"
+	}
+	if a.portPrediction == nil || len(a.portPrediction.SamplePorts) == 0 {
+		return false, "no local port prediction"
+	}
+	if peer.Status.PortPrediction == nil || len(peer.Status.PortPrediction.SamplePorts) == 0 {
+		return false, "no peer port prediction"
+	}
+	if state != nil && state.BirthdayTried {
+		return false, "birthday attack already attempted"
+	}
+	return true, ""
 }
 
 // probeDirectEndpoint switches WG to the peer's direct endpoint for a
@@ -880,7 +937,10 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			a.enableRelayForPeer(peer)
 		}
 
-		if a.detectedNATType == "symmetric" && peer.Status.NATType == "symmetric" && !state.BirthdayTried {
+		// Route through the same gate as startICECheck so a disabled mesh (or a
+		// pair lacking port prediction) can never start a birthday attack here,
+		// even if the NAT classification changed since the probe began.
+		if ok, _ := a.canStartBirthdayAttack(peer, state); ok {
 			a.log.Info("active probe failed, trying birthday attack", "peer", peer.Name)
 			state.State = iceStateBirthday
 			state.BirthdayTried = true
@@ -892,6 +952,18 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 		a.log.Info("active probe failed, reverting to relay", "peer", peer.Name, "failures", state.ProbeFailCount)
 		state.State = iceStateFailed
 		state.LastCheck = time.Now()
+		// Unstable/unknown-NAT pairs that have never received direct traffic and
+		// keep failing are unlikely to go direct soon — back off probing longer to
+		// cut churn (relay stays fully active). Recovery still happens via NAT
+		// re-classification (clearDirectReprobeBackoff) or direct inbound.
+		if state.ProbeFailCount >= unstableProbeFailThreshold &&
+			a.wgMgr.LastDirectReceive(peer.Spec.PublicKey) <= 0 && // 0 = never, <0 = engine has no signal
+			(!isStableDirectNAT(a.detectedNATType) || !isStableDirectNAT(peer.Status.NATType)) {
+			backoff := a.unstableProbeBackoff()
+			state.NextProbeAfter = time.Now().Add(backoff)
+			a.log.Info("unstable NAT pair failing repeatedly, backing off direct probes",
+				"peer", peer.Name, "failures", state.ProbeFailCount, "backoff", backoff)
+		}
 		a.setICEState(peer.Name, state)
 		return
 	}
@@ -1063,6 +1135,46 @@ func (a *Agent) deferDirectReprobe(peerName string, delay time.Duration) {
 	if next.After(state.NextProbeAfter) {
 		state.NextProbeAfter = next
 		a.setICEState(peerName, state)
+	}
+}
+
+// unstableProbeFailThreshold is how many consecutive failed direct probes an
+// unstable/unknown-NAT peer may accumulate before the agent backs off probing
+// for unstableProbeBackoff instead of re-probing every relayRetry. This cuts
+// churn for pairs that cannot currently go direct (e.g. our NAT is still
+// unclassified) while leaving the relay path fully functional. Recovery still
+// happens promptly: NAT re-classification clears the backoff
+// (clearDirectReprobeBackoff), as does the relay-state direct-inbound fast-track.
+const unstableProbeFailThreshold = 3
+
+// unstableProbeBackoff is the relay hold applied after repeated direct-probe
+// failures on an unstable/unknown-NAT pair. Bounded well above relayRetry so the
+// agent is not re-probing a structurally-stuck pair every cycle.
+func (a *Agent) unstableProbeBackoff() time.Duration {
+	d := a.relayRetry * 5
+	if d < 10*time.Minute {
+		d = 10 * time.Minute
+	}
+	return d
+}
+
+// clearDirectReprobeBackoff lets every peer re-probe promptly after a local NAT
+// re-classification: it clears the probe backoff (NextProbeAfter) AND resets
+// ProbeFailCount so the next iceStateFailed/Relay cycle uses the fast retry
+// interval instead of the full relayRetry. Clearing also drops the short
+// directFailoverProbeCooldown set by deferDirectReprobe — intended, because a
+// NAT-type change invalidates the prior failover assumption.
+//
+// Peers mid birthday-attack are skipped: their *peerICEState is concurrently
+// mutated by the background runBirthdayAttack goroutine (a pre-existing aspect of
+// the ICE state machine), so the sync goroutine must not also write it here.
+func (a *Agent) clearDirectReprobeBackoff() {
+	for _, s := range a.iceStates {
+		if s.State == iceStateBirthday {
+			continue
+		}
+		s.NextProbeAfter = time.Time{}
+		s.ProbeFailCount = 0
 	}
 }
 
@@ -1405,4 +1517,31 @@ func isLocalhostEndpoint(ep string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// isPublicCandidateEndpoint reports whether endpoint ("host:port") has a host IP
+// that is externally routable and therefore valid as a server-reflexive (srflx)
+// ICE candidate. It rejects loopback, link-local, multicast, unspecified, the
+// IPv4 broadcast address (all excluded by !IsGlobalUnicast), RFC 1918 / IPv6 ULA
+// private addresses, and CGNAT shared address space (100.64.0.0/10). The CGNAT
+// range looks public to net.IP.IsPrivate but is handed out by double-NAT/CGNAT
+// routers and is unreachable from other peers, so a private or CGNAT address
+// must never be published as reflexive. IPv4-mapped IPv6 addresses are
+// normalized via To4() before the CGNAT check.
+func isPublicCandidateEndpoint(endpoint string) bool {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && cgnatNet != nil && cgnatNet.Contains(ip4) {
+		return false
+	}
+	return true
 }

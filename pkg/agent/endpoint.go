@@ -241,3 +241,54 @@ func buildSTUNResult(sr *nat.STUNResult, listenPort int, useListenPort bool) *En
 		PortEstimated:  portEstimated,
 	}
 }
+
+// NATClassification is the result of NAT-type detection. It is kept separate
+// from EndpointResult so the agent can re-classify NAT periodically without
+// disturbing the chosen endpoint — endpoint selection and NAT classification
+// have independent lifecycles (a UPnP endpoint can stay published while NAT
+// classification recovers via STUN, and vice versa).
+type NATClassification struct {
+	NATType          nat.NATType
+	PortPrediction   *nat.PortPrediction
+	ServersResponded int
+	ServersTotal     int
+	// Error summarizes why NATType is NATUnknown (partial or total STUN
+	// failure). Empty when the type was determined.
+	Error string
+}
+
+// ClassifyNAT determines NAT type and port prediction by running STUN on an
+// ephemeral port. It never binds the WireGuard listen socket, so it is safe to
+// call repeatedly while the interface is up — the agent uses it to re-classify
+// periodically and self-heal after a transient STUN failure. It performs no
+// endpoint selection.
+func ClassifyNAT(ctx context.Context, stunServers []string) *NATClassification {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	sr, err := nat.DiscoverPublicEndpointWithNATType(cctx, 0, stunServers)
+	return classificationFromSTUN(sr, err)
+}
+
+// classificationFromSTUN maps a raw STUN outcome to a NATClassification. It is
+// split out from ClassifyNAT so the mapping (especially the partial-success
+// "1 of N responded → unknown" case) is unit-testable without a STUN server.
+func classificationFromSTUN(sr *nat.STUNResult, err error) *NATClassification {
+	if err != nil || sr == nil {
+		msg := "all STUN servers failed"
+		if err != nil {
+			msg = err.Error()
+		}
+		return &NATClassification{NATType: nat.NATUnknown, Error: msg}
+	}
+	c := &NATClassification{
+		NATType:          sr.NATType,
+		PortPrediction:   sr.PortPrediction,
+		ServersResponded: sr.ServersResponded,
+		ServersTotal:     sr.ServersTotal,
+	}
+	if sr.NATType == nat.NATUnknown {
+		c.Error = fmt.Sprintf("only %d of %d STUN servers responded — cannot detect NAT type",
+			sr.ServersResponded, sr.ServersTotal)
+	}
+	return c
+}

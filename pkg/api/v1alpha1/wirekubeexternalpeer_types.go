@@ -79,9 +79,9 @@ type WireKubeExternalPeerSpec struct {
 	// +optional
 	IngressPeer string `json:"ingressPeer,omitempty"`
 
-	// PublicKey is the external client's WireGuard public key. Issuance tooling
-	// generates the keypair locally and stores only the public half in the
-	// cluster; the private key is printed once and is never persisted.
+	// PublicKey is the external client's WireGuard public key. The
+	// WireKubeExternalPeer stores only the public half; issuance frontends that
+	// support later downloads may persist the rendered client config separately.
 	// +kubebuilder:validation:MinLength=44
 	// +kubebuilder:validation:MaxLength=44
 	PublicKey string `json:"publicKey"`

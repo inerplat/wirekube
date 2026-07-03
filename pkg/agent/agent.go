@@ -39,6 +39,7 @@ type Agent struct {
 	nodeName     string
 	podName      string
 	podNamespace string
+	apiServer    string
 	syncEvery    time.Duration
 
 	relayPool    *agentrelay.Pool
@@ -86,6 +87,21 @@ type Agent struct {
 	ownPublicKeyB64 string
 	// portPrediction stores our NAT port prediction data from STUN.
 	portPrediction *nat.PortPrediction
+	// stunServers is the STUN server list from the mesh, cached at setup for
+	// periodic NAT re-classification.
+	stunServers []string
+	// reclassifyEvery is the minimum interval between periodic NAT
+	// re-classifications. Defaulted in setup if unset.
+	reclassifyEvery time.Duration
+	// natClassCh hands a completed background NAT classification back to the
+	// sync goroutine. STUN runs off-loop (it can block up to 10s), but the
+	// RESULT is applied only on the sync goroutine — the sole writer of
+	// detectedNATType/isSymmetricNAT/portPrediction — so no lock is needed.
+	natClassCh chan *NATClassification
+	// lastNATClassify / natClassifyInFlight are touched only on the sync
+	// goroutine; they pace the background classification and prevent overlap.
+	lastNATClassify     time.Time
+	natClassifyInFlight bool
 	// gwState tracks gateway configuration when this node serves as a VGW.
 	gwState *gatewayState
 	// wasInterfacePreserved is set during setup when an existing WireGuard
@@ -134,8 +150,13 @@ type peerTrafficSnapshot struct {
 // far above this threshold.
 const meaningfulTrafficDeltaBytes = 512
 
+const (
+	envRelayProxyMode        = "WIREKUBE_RELAY_PROXY"
+	nodeAnnotationRelayProxy = "wirekube.io/relay-proxy"
+)
+
 // NewAgent creates a new Agent.
-func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine, nodeName, podName, podNamespace string) *Agent {
+func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine, nodeName, podName, podNamespace, apiServer string) *Agent {
 	a := &Agent{
 		log:                  log,
 		client:               k8sClient,
@@ -143,6 +164,7 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		nodeName:             nodeName,
 		podName:              podName,
 		podNamespace:         podNamespace,
+		apiServer:            apiServer,
 		syncEvery:            parseSyncEvery(),
 		peerFirstSeen:        make(map[string]time.Time),
 		relayedPeers:         make(map[string]bool),
@@ -303,6 +325,19 @@ func (a *Agent) setup(ctx context.Context) error {
 			a.annotateOwnPod(ctx, ip)
 		}
 	}
+
+	// Cache STUN servers and arm periodic NAT re-classification so a transient
+	// STUN failure at startup self-heals without a pod restart. lastNATClassify
+	// is seeded to now because we classify once right here; the first periodic
+	// re-classification happens one reclassifyEvery later.
+	a.stunServers = mesh.Spec.STUNServers
+	if a.reclassifyEvery == 0 {
+		a.reclassifyEvery = 45 * time.Second
+	}
+	if a.natClassCh == nil {
+		a.natClassCh = make(chan *NATClassification, 1)
+	}
+	a.lastNATClassify = time.Now()
 
 	epResult, err := DiscoverEndpoint(ctx, node, int(mesh.Spec.ListenPort), mesh.Spec.STUNServers)
 	if err != nil {
@@ -639,6 +674,8 @@ func (a *Agent) sync(ctx context.Context) error {
 	myPeerName := a.nodeName
 	wgPeers := make([]wireguard.PeerConfig, 0, len(peerList.Items))
 	allRoutes := []string{}
+	routeOwners := map[string]string{}
+	allowRoutesBeforeHandshake := map[string]bool{}
 	ownAllowedIPsSet := false
 
 	// Build stats map for relay fallback decisions
@@ -703,6 +740,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			}
 			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
 			allRoutes = append(allRoutes, cidr)
+			routeOwners[cidr] = p.Spec.PublicKey
 		}
 		for _, cidr := range externalByIngress[p.Name] {
 			if a.shouldSkipGatewayRoute(ctx, cidr, myPeerName, ownIP) {
@@ -713,6 +751,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			}
 			filteredAllowedIPs = append(filteredAllowedIPs, cidr)
 			allRoutes = append(allRoutes, cidr)
+			routeOwners[cidr] = p.Spec.PublicKey
 		}
 
 		// Symmetric peers must never be force-endpointed post-probe: the
@@ -733,6 +772,9 @@ func (a *Agent) sync(ctx context.Context) error {
 			KeepaliveSeconds: a.keepaliveForPeer(p),
 			ForceEndpoint:    forceEp,
 		})
+		if a.canRouteBeforeHandshake(p.Name) {
+			allowRoutesBeforeHandshake[p.Spec.PublicKey] = true
+		}
 	}
 
 	// Ingress-side external peer acceptance.
@@ -773,6 +815,7 @@ func (a *Agent) sync(ctx context.Context) error {
 				ForceEndpoint:    false,
 			})
 			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
+			routeOwners[ep.Status.AssignedMeshIP] = ep.Status.PublicKey
 		}
 	}
 
@@ -800,12 +843,12 @@ func (a *Agent) sync(ctx context.Context) error {
 		}
 	}
 
-	// Filter routes: only install routes for peers that have completed a
-	// handshake. Without a handshake, the tunnel can't carry traffic — adding
-	// routes would redirect existing connectivity (e.g. to the API server)
-	// into a dead tunnel, breaking the agent's own control plane access.
+	// Filter routes: direct-only peers need a handshake before routes are
+	// installed, but relay-capable peers may need routes before the first
+	// handshake so bootstrap traffic can traverse the relay. API server CIDRs
+	// remain excluded regardless of transport mode.
 	if len(allRoutes) > 0 {
-		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, wgPeers)
+		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, routeOwners, allowRoutesBeforeHandshake)
 		if len(connectedRoutes) < len(allRoutes) {
 			a.log.V(2).Info("deferred routes for peers without handshake",
 				"connected", len(connectedRoutes), "total", len(allRoutes))
@@ -852,6 +895,10 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
+
+	// Apply any completed background NAT re-classification and arm the next one.
+	// Runs on the sync goroutine so it is the sole writer of detectedNATType etc.
+	a.maybeReclassifyNAT(ctx)
 
 	// Drive the PathMonitor FSM for every remote peer and commit the
 	// resulting transport mode to the Bind. This is the single authoritative
@@ -1093,10 +1140,12 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 	}
 }
 
-// filterRoutesForConnectedPeers returns only the CIDRs whose peer has completed
-// at least one WireGuard handshake. This prevents routing traffic into a tunnel
-// that can't yet carry it, which would break the agent's API server connectivity.
-func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wireguard.PeerConfig) []string {
+// filterRoutesForConnectedPeers returns CIDRs that are safe to install in the
+// WireKube routing table. Direct-only peers still need a WireGuard handshake
+// before routes are installed. Relay-capable peers may need routes before the
+// first handshake because their first useful traffic can itself be what proves
+// the relay path. API server CIDRs are never routed through WireKube.
+func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, routeOwners map[string]string, allowBeforeHandshake map[string]bool) []string {
 	stats, err := a.wgMgr.GetStats()
 	if err != nil {
 		a.log.Info("filterRoutes: GetStats failed, deferring all routes", "error", err)
@@ -1112,14 +1161,6 @@ func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wiregu
 	}
 	a.log.Info("filterRoutes", "totalStats", len(stats), "connectedPeers", len(connected), "totalRoutes", len(allRoutes))
 
-	// Build map: CIDR → peer public key
-	cidrToKey := make(map[string]string)
-	for _, p := range peers {
-		for _, cidr := range p.AllowedIPs {
-			cidrToKey[cidr] = p.PublicKeyB64
-		}
-	}
-
 	var result []string
 	for _, cidr := range allRoutes {
 		// Never route API server traffic through the WG tunnel.
@@ -1128,12 +1169,30 @@ func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, peers []wiregu
 		if a.isAPIServerCIDR(cidr) {
 			continue
 		}
-		key, ok := cidrToKey[cidr]
-		if !ok || connected[key] {
+		key, ok := routeOwners[cidr]
+		if !ok || connected[key] || allowBeforeHandshake[key] {
 			result = append(result, cidr)
 		}
 	}
 	return result
+}
+
+func (a *Agent) canRouteBeforeHandshake(peerName string) bool {
+	if peerName == "" || a.relayMode == relayModeNever || !a.relayTransportUsable() {
+		return false
+	}
+	if a.relayedPeers[peerName] {
+		return true
+	}
+	if a.pathMonitor == nil {
+		return false
+	}
+	switch a.pathMonitor.ModeFor(peerName) {
+	case PathModeRelay, PathModeWarm:
+		return true
+	default:
+		return false
+	}
 }
 
 // updateOwnStatus reads WireGuard stats and updates this node's WireKubePeer status.
@@ -1240,11 +1299,11 @@ func (a *Agent) updatePeerConnections(
 }
 
 // publishedTransportForPeer reports the user-visible transport mode for a
-// peer ("direct" vs "relay"). PathMonitor is the single source of truth:
-// Direct and Warm both publish as "direct" because Warm still prefers the
-// direct leg — the relay copy is belt-and-suspenders. Only PathModeRelay
-// (all direct receive evidence has expired) publishes as "relay". This
-// mirrors Tailscale's "trusted bestAddr" vs "DERP-only" distinction.
+// peer ("direct" vs "relay"). PathMonitor is the single source of truth: only
+// PathModeDirect (confirmed via fresh direct-receive evidence) publishes as
+// "direct"; PathModeWarm (direct unproven or being demoted), PathUnknown, and
+// PathModeRelay all publish as "relay", so the status never reports a probing
+// or unknown path as confirmed direct.
 // driveTransportMode asks PathMonitor for the current mode of every known
 // peer and commits it to the Bind via SetPeerPath. This runs at the end of
 // sync() and is authoritative — it overrides any intermediate SetPeerPath
@@ -1299,23 +1358,133 @@ func (a *Agent) publishedTransportForPeer(
 	peer *wirekubev1alpha1.WireKubePeer,
 	_ map[string]wireguard.PeerStats,
 ) string {
-	if peer == nil {
-		return "direct"
-	}
-	if a.pathMonitor == nil {
-		// Some unit tests construct Agent literals directly without going
-		// through NewAgent. Default to the safe answer rather than panic.
-		return "direct"
-	}
-	switch a.pathMonitor.ModeFor(peer.Name) {
-	case PathModeRelay:
+	// Only a confirmed direct path is reported as "direct". PathMonitor enters
+	// PathModeDirect only after fresh direct-receive evidence; PathModeWarm
+	// (direct unproven or being demoted), PathUnknown (not yet evaluated), and
+	// PathModeRelay all report "relay" so the status never overstates a direct
+	// path as confirmed. A nil peer or nil pathMonitor (test-only literal) has no
+	// evidence of direct connectivity, so it reports the conservative "relay".
+	if peer == nil || a.pathMonitor == nil {
 		return "relay"
-	default:
-		// PathUnknown, PathModeWarm, PathModeDirect all map to "direct":
-		// the caller treats "direct" as "we have or are trying a direct
-		// path", and "relay" as "we have given up on direct for now".
+	}
+	if a.pathMonitor.ModeFor(peer.Name) == PathModeDirect {
 		return "direct"
 	}
+	return "relay"
+}
+
+// maybeReclassifyNAT applies a completed background NAT classification and arms
+// the next one. It runs on the sync goroutine only.
+//
+// Concurrency: the blocking STUN probe runs in a background goroutine (it can
+// take up to 10s and must not stall the sync loop), but that goroutine ONLY
+// produces a *NATClassification and hands it back on natClassCh. Every mutation
+// of detectedNATType / isSymmetricNAT / portPrediction happens here, on the sync
+// goroutine — the agent has no mutex, and this keeps it that way.
+func (a *Agent) maybeReclassifyNAT(ctx context.Context) {
+	// Drain a completed classification, if any, and apply it.
+	select {
+	case c := <-a.natClassCh:
+		if c != nil {
+			a.applyNATClassification(ctx, c)
+		}
+	default:
+	}
+
+	if a.natClassifyInFlight {
+		return
+	}
+	if !a.lastNATClassify.IsZero() && time.Since(a.lastNATClassify) < a.reclassifyEvery {
+		return
+	}
+	a.lastNATClassify = time.Now()
+	a.natClassifyInFlight = true
+	servers := a.stunServers
+	ch := a.natClassCh
+	go func() {
+		c := ClassifyNAT(ctx, servers)
+		select {
+		case ch <- c:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// applyNATClassification folds a fresh classification into agent state and the
+// published CRD status. Called only from maybeReclassifyNAT (sync goroutine).
+//
+// A NATUnknown result (partial or total STUN failure) is treated as transient:
+// it is logged but does NOT overwrite a previously-known type, so a brief STUN
+// outage self-heals on a later cycle instead of wiping classification and
+// flapping. Only a known type updates state, and only when it actually changed.
+func (a *Agent) applyNATClassification(ctx context.Context, c *NATClassification) {
+	a.natClassifyInFlight = false
+	oldType := a.detectedNATType
+
+	if c.NATType == nat.NATUnknown {
+		a.log.Info("NAT re-classification inconclusive, keeping previous type",
+			"previousNATType", oldType, "serversResponded", c.ServersResponded,
+			"serversTotal", c.ServersTotal, "reason", c.Error)
+		return
+	}
+
+	newType := string(c.NATType)
+
+	// The periodic classifier is STUN-only and cannot distinguish port-restricted
+	// cone from plain cone — that distinction needs the relay dual-probe run once
+	// at setup (DetectPortRestriction). A "cone" result must therefore NOT
+	// downgrade an existing port-restricted-cone refinement: they are the same NAT
+	// family, and downgrading would wrongly un-pin a port-restricted↔symmetric pair
+	// from relay (it would then probe a structurally impossible direct path) and
+	// drop the CGNAT keepalive override. Keep the more-specific refined type.
+	if oldType == string(nat.NATPortRestrictedCone) && c.NATType == nat.NATCone {
+		return
+	}
+
+	if newType == oldType {
+		// Same type: refresh port prediction for symmetric peers (mapped ports
+		// drift over time), otherwise nothing to do.
+		if c.NATType == nat.NATSymmetric && c.PortPrediction != nil {
+			a.portPrediction = c.PortPrediction
+		}
+		return
+	}
+
+	a.log.Info("NAT re-classification changed type",
+		"previousNATType", oldType, "natType", newType,
+		"serversResponded", c.ServersResponded, "serversTotal", c.ServersTotal)
+
+	a.detectedNATType = newType
+	a.isSymmetricNAT = c.NATType == nat.NATSymmetric
+	if c.NATType == nat.NATSymmetric {
+		a.portPrediction = c.PortPrediction
+	} else {
+		// Non-symmetric: drop any stale symmetric port prediction.
+		a.portPrediction = nil
+	}
+
+	// Our NAT type changed — let every peer re-probe promptly instead of waiting
+	// out an unstable-NAT backoff, since the new type may make a stuck pair viable.
+	a.clearDirectReprobeBackoff()
+
+	if err := a.publishNATClassification(ctx); err != nil {
+		a.log.Error(err, "publishing re-classified NAT status")
+	}
+}
+
+// publishNATClassification writes the current detectedNATType / portPrediction
+// to this node's WireKubePeer status. Clearing portPrediction (symmetric → cone)
+// relies on MergeFrom emitting an explicit null for the now-nil pointer field;
+// TestPublishNATClassificationClears asserts the field is actually removed.
+func (a *Agent) publishNATClassification(ctx context.Context) error {
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, peer); err != nil {
+		return err
+	}
+	patch := client.MergeFrom(peer.DeepCopy())
+	peer.Status.NATType = a.detectedNATType
+	peer.Status.PortPrediction = crdPortPrediction(a.portPrediction)
+	return a.client.Status().Patch(ctx, peer, patch)
 }
 
 // initRelay sets up the relay client from the mesh relay configuration.
@@ -1394,8 +1563,10 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	copy(pubKey[:], keyBytes)
 
 	wgPort := a.wgMgr.ListenPort()
-	a.log.Info("relay proxy configured", "wgPort", wgPort)
 	a.relayPool = agentrelay.NewPool(endpoint, pubKey, wgPort)
+	proxyMode := a.relayProxyMode(ctx)
+	a.relayPool.SetProxyMode(proxyMode)
+	a.log.Info("relay proxy configured", "wgPort", wgPort, "proxyMode", proxyMode)
 
 	// Inject relay transport into the WG engine BEFORE Connect so that even
 	// if the initial dial fails, the Bind is wired up and ready when the
@@ -1438,6 +1609,39 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
 	return nil
+}
+
+func (a *Agent) relayProxyMode(ctx context.Context) agentrelay.ProxyMode {
+	defaultMode := agentrelay.ProxyDisabled
+	if mode, ok := parseRelayProxyMode(os.Getenv(envRelayProxyMode)); ok {
+		defaultMode = mode
+	}
+
+	node := &corev1.Node{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: a.nodeName}, node); err != nil {
+		a.log.Error(err, "failed to read node relay proxy annotation; using default relay proxy policy", "annotation", nodeAnnotationRelayProxy, "defaultMode", defaultMode)
+		return defaultMode
+	}
+	raw := strings.ToLower(strings.TrimSpace(node.Annotations[nodeAnnotationRelayProxy]))
+	if raw == "" {
+		return defaultMode
+	}
+	if mode, ok := parseRelayProxyMode(raw); ok {
+		return mode
+	}
+	a.log.Info("unknown relay proxy annotation value; using default relay proxy policy", "annotation", nodeAnnotationRelayProxy, "value", raw, "defaultMode", defaultMode)
+	return defaultMode
+}
+
+func parseRelayProxyMode(raw string) (agentrelay.ProxyMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "env", "environment", "enabled", "enable", "true", "on", "proxy":
+		return agentrelay.ProxyFromEnvironment, true
+	case "disabled", "disable", "false", "off", "direct", "none":
+		return agentrelay.ProxyDisabled, true
+	default:
+		return agentrelay.ProxyDisabled, false
+	}
 }
 
 func managedRelayControlEndpoint(namespace string, port int32) string {

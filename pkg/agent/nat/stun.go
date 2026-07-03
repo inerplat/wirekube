@@ -148,6 +148,12 @@ type STUNResult struct {
 	Endpoint       string
 	NATType        NATType
 	PortPrediction *PortPrediction
+	// ServersResponded / ServersTotal record how many of the queried STUN
+	// servers answered. When only one responds, symmetric NAT cannot be
+	// detected (NATType is NATUnknown), so callers use these counts to tell a
+	// partial success (retry next cycle) apart from a total failure.
+	ServersResponded int
+	ServersTotal     int
 }
 
 // ErrSymmetricNAT is returned when Symmetric NAT is detected.
@@ -207,13 +213,21 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 		results = append(results, stunResponse{endpoint: endpoint, ip: ip, port: port})
 	}
 
-	if len(results) == 0 {
+	total := len(stunServers)
+	responded := len(results)
+
+	if responded == 0 {
 		return nil, fmt.Errorf("all STUN servers failed, last error: %w", lastErr)
 	}
 
-	if len(results) == 1 {
+	if responded == 1 {
 		log.Printf("[stun] warning: only 1 STUN server responded — cannot detect Symmetric NAT (need 2+ servers)\n")
-		return &STUNResult{Endpoint: results[0].endpoint, NATType: NATUnknown}, nil
+		return &STUNResult{
+			Endpoint:         results[0].endpoint,
+			NATType:          NATUnknown,
+			ServersResponded: responded,
+			ServersTotal:     total,
+		}, nil
 	}
 
 	// Collect all observed ports for port prediction.
@@ -243,8 +257,10 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 			nat = NATOpen
 		}
 		return &STUNResult{
-			Endpoint: results[0].endpoint,
-			NATType:  nat,
+			Endpoint:         results[0].endpoint,
+			NATType:          nat,
+			ServersResponded: responded,
+			ServersTotal:     total,
 		}, nil
 	}
 
@@ -254,9 +270,11 @@ func DiscoverPublicEndpointWithNATType(ctx context.Context, localPort int, stunS
 		samplePorts, pp.Increment, pp.Jitter)
 
 	return &STUNResult{
-		Endpoint:       results[0].endpoint,
-		NATType:        NATSymmetric,
-		PortPrediction: &pp,
+		Endpoint:         results[0].endpoint,
+		NATType:          NATSymmetric,
+		PortPrediction:   &pp,
+		ServersResponded: responded,
+		ServersTotal:     total,
 	}, nil
 }
 

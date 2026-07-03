@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ type Pool struct {
 	relayAddr string
 	myPubKey  [relayproto.PubKeySize]byte
 	wgPort    int
+	proxyMode ProxyMode
+	proxyURL  *url.URL
 
 	mu      sync.RWMutex
 	clients map[string]*Client // keyed by resolved IP:port
@@ -62,8 +65,29 @@ func NewPool(relayAddr string, myPubKey [relayproto.PubKeySize]byte, wgPort int)
 		relayAddr: relayAddr,
 		myPubKey:  myPubKey,
 		wgPort:    wgPort,
+		proxyMode: ProxyDisabled,
 		clients:   make(map[string]*Client),
 		proxies:   make(map[[relayproto.PubKeySize]byte]*UDPProxy),
+	}
+}
+
+func (p *Pool) SetProxyMode(mode ProxyMode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.proxyMode = mode.normalized()
+	p.proxyURL = nil
+	for _, c := range p.clients {
+		c.SetProxyMode(p.proxyMode)
+	}
+}
+
+func (p *Pool) SetProxyURL(proxyURL *url.URL) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.proxyMode = ProxyExplicit
+	p.proxyURL = proxyURL
+	for _, c := range p.clients {
+		c.SetProxyURL(proxyURL)
 	}
 }
 
@@ -384,7 +408,17 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 		return nil
 	}
 
+	p.mu.RLock()
+	proxyMode := p.proxyMode
+	proxyURL := p.proxyURL
+	p.mu.RUnlock()
+
 	c := NewClient(addr, p.myPubKey, p.wgPort)
+	if proxyMode == ProxyExplicit {
+		c.SetProxyURL(proxyURL)
+	} else {
+		c.SetProxyMode(proxyMode)
+	}
 	c.onData = p.handleData
 	c.onExternal = p.handleExternalData
 	c.onHint = p.handleHint

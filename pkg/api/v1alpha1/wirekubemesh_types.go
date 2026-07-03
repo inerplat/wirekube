@@ -48,7 +48,9 @@ type WireKubeMeshSpec struct {
 	// (derived from a hash of the node name), which becomes the sole AllowedIPs entry
 	// for that peer. This address is assigned to the WireGuard interface and is used
 	// for all intra-mesh traffic — completely independent of the node's physical IP.
-	// Recommended: "100.64.0.0/10" (CGNAT range, RFC 6598, ~4M addresses).
+	// Choose a CIDR that does not overlap with node, pod, service, VPC, proxy,
+	// or corporate networks. Small RFC1918 ranges are usually safer than public
+	// or already-routed infrastructure ranges.
 	// +optional
 	// +kubebuilder:validation:Pattern=`^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$`
 	MeshCIDR string `json:"meshCIDR,omitempty"`
