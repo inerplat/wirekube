@@ -338,3 +338,51 @@ func freeUDPPort(t *testing.T) uint16 {
 	defer conn.Close()
 	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
+
+func TestValidateProbeTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  net.IP
+		port    int
+		wantErr bool
+	}{
+		{"public global-unicast", net.IPv4(203, 0, 113, 7), 3478, false},
+		{"private RFC1918 (intra-VPC)", net.IPv4(10, 1, 2, 3), 3478, false},
+		// Deliberately allowed: CGNAT addresses real intra-cluster node ranges
+		// (EKS/GKE), same rationale as RFC1918. Pinned so a future tightening
+		// cannot silently regress the intra-cluster path.
+		{"CGNAT 100.64/10 (intra-cluster)", net.IPv4(100, 64, 1, 1), 3478, false},
+		{"cloud metadata link-local", net.IPv4(169, 254, 169, 254), 3478, true},
+		{"loopback", net.IPv4(127, 0, 0, 1), 3478, true},
+		{"unspecified", net.IPv4zero, 3478, true},
+		{"multicast", net.IPv4(224, 0, 0, 1), 3478, true},
+		{"limited broadcast", net.IPv4bcast, 3478, true},
+		{"nil", nil, 3478, true},
+		{"zero port", net.IPv4(203, 0, 113, 7), 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateProbeTarget(tc.target, tc.port); tc.wantErr != (err != nil) {
+				t.Fatalf("validateProbeTarget(%v, %d) err = %v, wantErr = %v", tc.target, tc.port, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestProbeLimiterBoundsRate(t *testing.T) {
+	s := NewServer()
+	// Drain the burst, then confirm the limiter starts denying — proving the
+	// relay cannot be driven as an unbounded UDP reflector.
+	allowed := 0
+	for range probeRateBurst + 50 {
+		if s.probeLimiter.Allow() {
+			allowed++
+		}
+	}
+	if allowed > probeRateBurst {
+		t.Fatalf("allowed %d probes, want <= burst %d", allowed, probeRateBurst)
+	}
+	if s.probeLimiter.Allow() {
+		t.Fatal("limiter still allowing after burst exhausted")
+	}
+}
