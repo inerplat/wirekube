@@ -102,6 +102,15 @@ type Agent struct {
 	// goroutine; they pace the background classification and prevent overlap.
 	lastNATClassify     time.Time
 	natClassifyInFlight bool
+	// birthdayCh hands a completed background birthday attack back to the sync
+	// goroutine. The attack blocks on UDP hole punching, but its RESULT — proxy
+	// adoption and the relay→direct upgrade — is applied only on the sync
+	// goroutine, the sole writer of iceStates/holePunchEndpoints/relayedPeers,
+	// so no lock is needed. Buffered generously (vs natClassCh's 1) because,
+	// unlike NAT classification, many symmetric↔symmetric pairs can have attacks
+	// completing in the same sync interval; a full buffer only blocks the
+	// background goroutine until the next drain (it never drops or leaks).
+	birthdayCh chan birthdayOutcome
 	// gwState tracks gateway configuration when this node serves as a VGW.
 	gwState *gatewayState
 	// wasInterfacePreserved is set during setup when an existing WireGuard
@@ -336,6 +345,9 @@ func (a *Agent) setup(ctx context.Context) error {
 	}
 	if a.natClassCh == nil {
 		a.natClassCh = make(chan *NATClassification, 1)
+	}
+	if a.birthdayCh == nil {
+		a.birthdayCh = make(chan birthdayOutcome, 16)
 	}
 	a.lastNATClassify = time.Now()
 
@@ -896,6 +908,11 @@ func (a *Agent) sync(ctx context.Context) error {
 	// Try upgrading relayed peers back to direct when conditions allow.
 	a.tryDirectUpgrade(peerList, statsByKey)
 
+	// Apply any completed background birthday attacks before driving transport,
+	// so a freshly hole-punched peer's direct path is reflected this cycle.
+	// Runs on the sync goroutine, the sole writer of the ICE/relay maps.
+	a.drainBirthdayResults()
+
 	// Apply any completed background NAT re-classification and arm the next one.
 	// Runs on the sync goroutine so it is the sole writer of detectedNATType etc.
 	a.maybeReclassifyNAT(ctx)
@@ -955,7 +972,13 @@ func (a *Agent) sync(ctx context.Context) error {
 	// Measure peer latency every 5th sync cycle (~2.5 min) to avoid overhead.
 	a.latencyCycle++
 	if a.latencyCycle%5 == 0 {
-		go a.measurePeerLatency(peerList)
+		// Snapshot the relayed-peer set on the sync goroutine; the latency
+		// goroutine must not read a.relayedPeers concurrently with sync.
+		relayed := make(map[string]bool, len(a.relayedPeers))
+		for name := range a.relayedPeers {
+			relayed[name] = true
+		}
+		go a.measurePeerLatency(peerList, relayed)
 	}
 
 	return nil
