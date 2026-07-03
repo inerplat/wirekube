@@ -92,6 +92,96 @@ func TestIssuePeerCreatesCRAndReturnsConfig(t *testing.T) {
 	}
 }
 
+func TestBasicAuth(t *testing.T) {
+	// bcrypt hash of "s3cret" (cost 10).
+	const hash = "$2a$10$QUOTjZgtTKnkj9pwIJZOoOCoKP8dWi8dbZ9.wto6FrQNdVFZx1HkO"
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s := newServer(c, time.Second, "wirekube-system")
+	s.auth = &basicAuthConfig{username: "admin", passwordHash: []byte(hash)}
+
+	cases := []struct {
+		name       string
+		setAuth    func(*http.Request)
+		wantStatus int
+	}{
+		{"no credentials", func(*http.Request) {}, http.StatusUnauthorized},
+		{"wrong password", func(r *http.Request) { r.SetBasicAuth("admin", "nope") }, http.StatusUnauthorized},
+		{"wrong username", func(r *http.Request) { r.SetBasicAuth("root", "s3cret") }, http.StatusUnauthorized},
+		{"correct", func(r *http.Request) { r.SetBasicAuth("admin", "s3cret") }, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/peers", nil)
+			tc.setAuth(req)
+			rec := httptest.NewRecorder()
+			s.routes().ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if tc.wantStatus == http.StatusUnauthorized {
+				if got := rec.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, "Basic ") {
+					t.Fatalf("WWW-Authenticate = %q, want Basic challenge", got)
+				}
+			}
+		})
+	}
+}
+
+func TestBasicAuthDisabledAllowsAccess(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s := newServer(c, time.Second, "wirekube-system") // s.auth == nil
+
+	req := httptest.NewRequest(http.MethodGet, "/peers", nil)
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (auth disabled)", rec.Code, http.StatusOK)
+	}
+}
+
+func TestHealthzSkipsAuth(t *testing.T) {
+	const hash = "$2a$10$QUOTjZgtTKnkj9pwIJZOoOCoKP8dWi8dbZ9.wto6FrQNdVFZx1HkO"
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s := newServer(c, time.Second, "wirekube-system")
+	s.auth = &basicAuthConfig{username: "admin", passwordHash: []byte(hash)}
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestLoadBasicAuth(t *testing.T) {
+	const hash = "$2a$10$QUOTjZgtTKnkj9pwIJZOoOCoKP8dWi8dbZ9.wto6FrQNdVFZx1HkO"
+	cases := []struct {
+		name        string
+		user, hash  string
+		wantEnabled bool
+		wantErr     bool
+	}{
+		{"both empty disables", "", "", false, false},
+		{"username only errors", "admin", "", false, true},
+		{"hash only errors", "", hash, false, true},
+		{"invalid hash errors", "admin", "not-a-bcrypt-hash", false, true},
+		{"valid enables", "admin", hash, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("WIREKUBE_ADMIN_WEB_USERNAME", tc.user)
+			t.Setenv("WIREKUBE_ADMIN_WEB_PASSWORD_HASH", tc.hash)
+			auth, err := loadBasicAuth()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && tc.wantEnabled != (auth != nil) {
+				t.Fatalf("enabled = %v, want %v", auth != nil, tc.wantEnabled)
+			}
+		})
+	}
+}
+
 func TestIssuePeerRejectsMissingCSRF(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	s := newServer(c, time.Second, "wirekube-system")

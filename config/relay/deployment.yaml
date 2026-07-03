@@ -150,7 +150,22 @@ spec:
           image: inerplat/wirekube:v0.0.0-dev.14
           command: ["wirekube-admin-web"]
           args:
+            # Binds to loopback only: the console is reachable via
+            # `kubectl port-forward` and is NOT exposed by either Service
+            # below. It ships with authentication DISABLED. Before exposing
+            # port 8080 (Ingress / NodePort / extra Service), you MUST enable
+            # HTTP Basic Auth by uncommenting the envFrom block below so the
+            # peer-management console (which can download private keys) is not
+            # left open.
             - --addr=127.0.0.1:8080
+          # envFrom:
+          #   # Create with:
+          #   #   HASH=$(htpasswd -bnBC 10 "" 's3cret' | tr -d ':\n' | sed 's/^\$2y/\$2a/')
+          #   #   kubectl -n wirekube-system create secret generic wirekube-admin-web-auth \
+          #   #     --from-literal=WIREKUBE_ADMIN_WEB_USERNAME=admin \
+          #   #     --from-literal=WIREKUBE_ADMIN_WEB_PASSWORD_HASH="$HASH"
+          #   - secretRef:
+          #       name: wirekube-admin-web-auth
           ports:
             - name: admin-web
               containerPort: 8080
