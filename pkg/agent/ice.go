@@ -454,9 +454,10 @@ func (a *Agent) runICENegotiation(ctx context.Context, peerList *wirekubev1alpha
 			a.evaluateICECheck(ctx, p, statsByKey)
 
 		case iceStateBirthday:
-			if state.holePunch != nil {
-				a.upgradeToDirect(p, state.holePunch.ListenAddr())
-			}
+			// A birthday attack is running in the background. Its result is
+			// folded in by drainBirthdayResults (which sets holePunch and flips
+			// the state to iceStateConnected), so there is nothing to do here —
+			// this cycle's runICENegotiation always runs before that drain.
 
 		case iceStateFailed:
 			if a.shouldPermanentRelay(p, state) {
@@ -975,17 +976,23 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 	}
 }
 
-// runBirthdayAttack executes the birthday attack for a symmetric↔symmetric peer pair.
-// Runs in a background goroutine.
-func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.WireKubePeer) {
-	state := a.getICEState(peer.Name)
+// birthdayOutcome is the result of a background birthday attack, applied on the
+// sync goroutine by applyBirthdayOutcome. A nil proxy means the attack failed.
+type birthdayOutcome struct {
+	peer  *wirekubev1alpha1.WireKubePeer
+	proxy *holePunchProxy
+}
 
+// runBirthdayAttack executes the birthday attack for a symmetric↔symmetric peer
+// pair. It runs in a background goroutine and MUST NOT touch shared agent state
+// (iceStates, relay maps, etc.): it only computes and hands the result back over
+// birthdayCh, which the sync goroutine drains and applies.
+func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.WireKubePeer) {
 	// Get peer's port prediction and public IP.
 	peerPP := peer.Status.PortPrediction
 	if peerPP == nil || len(peerPP.SamplePorts) == 0 {
 		a.log.Info("no port prediction data available", "peer", peer.Name)
-		state.State = iceStateFailed
-		state.LastCheck = time.Now()
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 
@@ -998,8 +1005,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	}
 	if peerPublicIP == "" {
 		a.log.Info("cannot determine public IP for birthday attack", "peer", peer.Name)
-		state.State = iceStateFailed
-		state.LastCheck = time.Now()
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 
@@ -1018,14 +1024,14 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	var myPubKey, peerPubKey [32]byte
 	myKeyBytes, err := base64.StdEncoding.DecodeString(a.getOwnPublicKey())
 	if err != nil {
-		state.State = iceStateFailed
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 	copy(myPubKey[:], myKeyBytes)
 
 	peerKeyBytes, err := base64.StdEncoding.DecodeString(peer.Spec.PublicKey)
 	if err != nil {
-		state.State = iceStateFailed
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 	copy(peerPubKey[:], peerKeyBytes)
@@ -1035,8 +1041,7 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	result, err := nat.BirthdayAttack(ctx, myPubKey, peerPubKey, peerPublicIP, candidatePorts)
 	if err != nil {
 		a.log.Error(err, "birthday attack failed", "peer", peer.Name)
-		state.State = iceStateFailed
-		state.LastCheck = time.Now()
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 
@@ -1045,16 +1050,53 @@ func (a *Agent) runBirthdayAttack(ctx context.Context, peer *wirekubev1alpha1.Wi
 	if err != nil {
 		a.log.Error(err, "birthday attack proxy creation failed", "peer", peer.Name)
 		result.LocalConn.Close()
-		state.State = iceStateFailed
-		state.LastCheck = time.Now()
+		a.reportBirthday(ctx, peer, nil)
 		return
 	}
 
 	go proxy.Run()
-	state.holePunch = proxy
+	a.reportBirthday(ctx, peer, proxy)
+}
+
+// reportBirthday hands a birthday-attack result to the sync goroutine. If the
+// agent is shutting down before the result is drained, a successful proxy is
+// closed here so it is not leaked.
+func (a *Agent) reportBirthday(ctx context.Context, peer *wirekubev1alpha1.WireKubePeer, proxy *holePunchProxy) {
+	select {
+	case a.birthdayCh <- birthdayOutcome{peer: peer, proxy: proxy}:
+	case <-ctx.Done():
+		if proxy != nil {
+			proxy.Close()
+		}
+	}
+}
+
+// drainBirthdayResults applies all completed background birthday attacks. Called
+// only from sync (the sole writer of the ICE/relay maps).
+func (a *Agent) drainBirthdayResults() {
+	for {
+		select {
+		case out := <-a.birthdayCh:
+			a.applyBirthdayOutcome(out)
+		default:
+			return
+		}
+	}
+}
+
+// applyBirthdayOutcome folds a birthday-attack result into agent state. Runs on
+// the sync goroutine.
+func (a *Agent) applyBirthdayOutcome(out birthdayOutcome) {
+	state := a.getICEState(out.peer.Name)
+	if out.proxy == nil {
+		state.State = iceStateFailed
+		state.LastCheck = time.Now()
+		return
+	}
+	state.holePunch = out.proxy
 	state.State = iceStateConnected
-	a.upgradeToDirect(peer, proxy.ListenAddr())
-	a.log.Info("hole-punched path established", "peer", peer.Name, "proxyAddr", proxy.ListenAddr())
+	a.upgradeToDirect(out.peer, out.proxy.ListenAddr())
+	a.log.Info("hole-punched path established", "peer", out.peer.Name, "proxyAddr", out.proxy.ListenAddr())
 }
 
 // upgradeToDirect switches a peer from relay to direct transport.
@@ -1165,9 +1207,10 @@ func (a *Agent) unstableProbeBackoff() time.Duration {
 // directFailoverProbeCooldown set by deferDirectReprobe — intended, because a
 // NAT-type change invalidates the prior failover assumption.
 //
-// Peers mid birthday-attack are skipped: their *peerICEState is concurrently
-// mutated by the background runBirthdayAttack goroutine (a pre-existing aspect of
-// the ICE state machine), so the sync goroutine must not also write it here.
+// Peers mid birthday-attack are skipped: a pending background result will set
+// their state via drainBirthdayResults, so re-arming the probe backoff now would
+// be premature (it would race the imminent relay→direct upgrade in intent, not
+// in memory — all ICE-state writes are on the sync goroutine).
 func (a *Agent) clearDirectReprobeBackoff() {
 	for _, s := range a.iceStates {
 		if s.State == iceStateBirthday {
