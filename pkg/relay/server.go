@@ -12,7 +12,26 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/wirekube/wirekube/pkg/relay/portalloc"
+)
+
+// NAT probe rate limiting. Legitimate probing is rare (startup plus periodic
+// re-classification), so a modest global cap keeps the relay from being abused
+// as a UDP reflector while never throttling real traffic. Each allowed probe
+// emits two ~19-byte datagrams, so even at the sustained cap the reflected
+// volume is negligible.
+//
+// The cap is global, not per-peer: it bounds a mesh of up to ~100 agents
+// probing simultaneously at startup. Beyond that, some legitimate probes are
+// dropped and the affected agents fall back to conservative NAT classification
+// until the next re-classification cycle (a slow degradation, not a failure).
+// Per-peer fairness — so one peer cannot starve others — requires trusted peer
+// identity and is deferred to control-plane authentication.
+const (
+	probeRateLimit = 100 // probes per second, sustained
+	probeRateBurst = 100
 )
 
 // Server is a WireKube relay server that forwards WireGuard UDP packets
@@ -34,6 +53,11 @@ type Server struct {
 	// probeSem limits concurrent NAT probe goroutines to prevent unbounded
 	// goroutine creation from rapid probe requests.
 	probeSem chan struct{}
+
+	// probeLimiter caps the sustained NAT-probe rate across all peers so the
+	// relay cannot be driven as a UDP reflector by an unauthenticated flood of
+	// probe frames on the public control port.
+	probeLimiter *rate.Limiter
 
 	// forwarder + alloc handle external-peer traffic. Both may be nil if
 	// the operator opted out of external-peer support; in that case the
@@ -57,8 +81,9 @@ type clientConn struct {
 
 func NewServer() *Server {
 	return &Server{
-		peers:    make(map[[PubKeySize]byte]*clientConn),
-		probeSem: make(chan struct{}, 16),
+		peers:        make(map[[PubKeySize]byte]*clientConn),
+		probeSem:     make(chan struct{}, 16),
+		probeLimiter: rate.NewLimiter(probeRateLimit, probeRateBurst),
 	}
 }
 
@@ -339,6 +364,14 @@ func (s *Server) handleConn(conn net.Conn) {
 				log.Printf("relay: bad NAT probe frame from %x: %v", pubKey[:8], err)
 				continue
 			}
+			if err := validateProbeTarget(ip, port); err != nil {
+				log.Printf("relay: rejecting NAT probe from %x to %s: %v", pubKey[:8], ip, err)
+				continue
+			}
+			if !s.probeLimiter.Allow() {
+				log.Printf("relay: NAT probe rate-limited (from %x to %s)", pubKey[:8], ip)
+				continue
+			}
 			select {
 			case s.probeSem <- struct{}{}:
 				go func() {
@@ -558,6 +591,29 @@ func (s *Server) handleForwarderUnregister(conn net.Conn, frame Frame) {
 	_ = WriteFrame(writer, MakeForwarderUnregisterFrame(port))
 	_ = writer.Flush()
 	log.Printf("relay: forwarder unregistered: port=%d", port)
+}
+
+// validateProbeTarget guards the relay's NAT-probe primitive from being aimed
+// at internal infrastructure. It rejects addresses that can never be a real
+// external NAT endpoint — loopback, link-local (including the cloud metadata
+// range 169.254.169.254), multicast, the unspecified address and the limited
+// broadcast address — so the relay cannot be used to reach a node's own network
+// or a metadata service. Private (RFC1918) and CGNAT (100.64.0.0/10) targets
+// are deliberately ALLOWED: intra-VPC / intra-cluster peers (e.g. EKS/GKE node
+// ranges) legitimately probe such endpoints, so treating them like public
+// targets (rate-limited, not blocked) is consistent. The rate limiter bounds
+// abuse of the allowed paths; per-peer fairness is deferred to control-plane
+// authentication.
+func validateProbeTarget(target net.IP, port int) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid target port %d", port)
+	}
+	if target == nil || target.IsUnspecified() || target.IsLoopback() ||
+		target.IsLinkLocalUnicast() || target.IsLinkLocalMulticast() ||
+		target.IsMulticast() || target.Equal(net.IPv4bcast) {
+		return fmt.Errorf("non-routable target")
+	}
+	return nil
 }
 
 // sendNATProbe sends two UDP probes to the specified endpoint:
