@@ -22,6 +22,7 @@ import (
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/bcrypt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -70,11 +71,49 @@ func main() {
 		log.Fatalf("kubernetes client: %v", err)
 	}
 
+	auth, err := loadBasicAuth()
+	if err != nil {
+		log.Fatalf("admin-web auth: %v", err)
+	}
+
 	s := newServer(c, *waitFor, *secretNamespace)
+	s.auth = auth
+	if auth == nil {
+		log.Printf("WARNING: admin-web authentication is DISABLED; set WIREKUBE_ADMIN_WEB_USERNAME and WIREKUBE_ADMIN_WEB_PASSWORD_HASH to require login")
+	} else {
+		log.Printf("admin-web authentication enabled for user %q", auth.username)
+	}
 	log.Printf("wirekube-admin-web listening on %s", *addr)
 	if err := http.ListenAndServe(*addr, s.routes()); err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+}
+
+// basicAuthConfig holds HTTP Basic Auth credentials sourced from the
+// environment (injected from a Kubernetes Secret). A nil *basicAuthConfig
+// means authentication is disabled.
+type basicAuthConfig struct {
+	username     string
+	passwordHash []byte // bcrypt hash of the password
+}
+
+// loadBasicAuth reads credentials from the environment. Authentication is
+// enabled only when both the username and the bcrypt password hash are set;
+// setting exactly one is treated as a misconfiguration and is rejected so a
+// deploy that intends to require auth never silently runs open.
+func loadBasicAuth() (*basicAuthConfig, error) {
+	user := os.Getenv("WIREKUBE_ADMIN_WEB_USERNAME")
+	hash := os.Getenv("WIREKUBE_ADMIN_WEB_PASSWORD_HASH")
+	if user == "" && hash == "" {
+		return nil, nil
+	}
+	if user == "" || hash == "" {
+		return nil, fmt.Errorf("both WIREKUBE_ADMIN_WEB_USERNAME and WIREKUBE_ADMIN_WEB_PASSWORD_HASH must be set to enable authentication")
+	}
+	if _, err := bcrypt.Cost([]byte(hash)); err != nil {
+		return nil, fmt.Errorf("WIREKUBE_ADMIN_WEB_PASSWORD_HASH is not a valid bcrypt hash: %w", err)
+	}
+	return &basicAuthConfig{username: user, passwordHash: []byte(hash)}, nil
 }
 
 func restConfig(kubeconfig string) (*rest.Config, error) {
@@ -116,6 +155,7 @@ type server struct {
 	client          client.Client
 	waitFor         time.Duration
 	secretNamespace string
+	auth            *basicAuthConfig
 	csrfToken       string
 	waitForActive   func(context.Context, client.Client, string, time.Duration) (*wirekubev1alpha1.WireKubeExternalPeer, error)
 }
@@ -147,14 +187,46 @@ func (s *server) routes() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/relays", s.handleRelays)
-	mux.HandleFunc("/mesh-nodes", s.handleMeshNodes)
-	mux.HandleFunc("/mesh-nodes/", s.handleMeshNodeAction)
-	mux.HandleFunc("/peers", s.handlePeers)
-	mux.HandleFunc("/peers/delete", s.handleBulkDelete)
-	mux.HandleFunc("/peers/", s.handlePeerAction)
+	mux.HandleFunc("/", s.requireAuth(s.handleIndex))
+	mux.HandleFunc("/relays", s.requireAuth(s.handleRelays))
+	mux.HandleFunc("/mesh-nodes", s.requireAuth(s.handleMeshNodes))
+	mux.HandleFunc("/mesh-nodes/", s.requireAuth(s.handleMeshNodeAction))
+	mux.HandleFunc("/peers", s.requireAuth(s.handlePeers))
+	mux.HandleFunc("/peers/delete", s.requireAuth(s.handleBulkDelete))
+	mux.HandleFunc("/peers/", s.requireAuth(s.handlePeerAction))
 	return mux
+}
+
+// requireAuth wraps a handler with HTTP Basic Auth when credentials are
+// configured. When s.auth is nil, authentication is disabled and the handler
+// runs unguarded (the operator was warned at startup). The bcrypt password
+// comparison is run on every request regardless of whether the username
+// matched, so its fixed cost dominates response timing and hides whether the
+// username was correct.
+func (s *server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.auth == nil {
+			next(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			s.challengeAuth(w)
+			return
+		}
+		userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(s.auth.username)) == 1
+		passMatch := bcrypt.CompareHashAndPassword(s.auth.passwordHash, []byte(pass)) == nil
+		if !userMatch || !passMatch {
+			s.challengeAuth(w)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *server) challengeAuth(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="wirekube-admin", charset="UTF-8"`)
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
