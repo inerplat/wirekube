@@ -182,6 +182,28 @@ func TestLoadBasicAuth(t *testing.T) {
 	}
 }
 
+func TestIsLoopbackAddr(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"localhost:8080", true},
+		{"[::1]:8080", true},
+		{":8080", false},        // wildcard: all interfaces
+		{"0.0.0.0:8080", false}, // all interfaces
+		{"10.0.0.5:8080", false},
+		{"garbage", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			if got := isLoopbackAddr(tc.addr); got != tc.want {
+				t.Fatalf("isLoopbackAddr(%q) = %v, want %v", tc.addr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIssuePeerRejectsMissingCSRF(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	s := newServer(c, time.Second, "wirekube-system")
