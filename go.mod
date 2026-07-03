@@ -82,7 +82,3 @@ require (
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
 )
-
-// github.com/munnerz/gopapertrail has been deleted from GitHub but is referenced
-// as a transitive dependency. Using a local stub to satisfy the module graph.
-replace github.com/munnerz/gopapertrail => ./internal/gopapertrail-stub

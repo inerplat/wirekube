@@ -11,7 +11,6 @@ site/
 /operator
 /wirekubectl
 /stun-server
-internal/
 
 # Test binaries produced by `go test -c`. These are build artifacts
 # that must not be committed (kind_e2e.test is ~48MB).
