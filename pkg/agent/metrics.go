@@ -220,9 +220,11 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 	a.dropStaleMetricLabels(currentPeers)
 }
 
-// measurePeerLatency runs a single ICMP ping to each connected peer and
-// records the round-trip time. Skips peers without a reachable AllowedIP.
-func (a *Agent) measurePeerLatency(peerList *wirekubev1alpha1.WireKubePeerList) {
+// measurePeerLatency runs a single ICMP ping to each connected peer and records
+// the round-trip time. Skips peers without a reachable AllowedIP. It runs in a
+// background goroutine and must not touch shared agent maps: the relayed-peer
+// set is passed in as a snapshot taken on the sync goroutine.
+func (a *Agent) measurePeerLatency(peerList *wirekubev1alpha1.WireKubePeerList, relayed map[string]bool) {
 	myPeerName := a.nodeName
 
 	for i := range peerList.Items {
@@ -248,7 +250,7 @@ func (a *Agent) measurePeerLatency(peerList *wirekubev1alpha1.WireKubePeerList) 
 		}
 
 		transport := "direct"
-		if a.relayedPeers[p.Name] {
+		if relayed[p.Name] {
 			transport = "relay"
 		}
 
