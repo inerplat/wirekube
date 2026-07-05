@@ -868,12 +868,14 @@ func (a *Agent) sync(ctx context.Context) error {
 		allRoutes = connectedRoutes
 	}
 
-	// Reassert the WireKube ip rules every tick so they self-heal if a
+	// Reassert the WireKube-managed ip rules every tick so they self-heal if a
 	// co-resident component (e.g. Cilium's ip-rule reconciliation) flushes
-	// them. Routes live in the WK table but are inert without these rules; a
-	// one-time flush would otherwise silently bypass the overlay, dropping
-	// traffic into the main table until the next agent restart. Non-fatal:
-	// log and continue so a transient netlink error doesn't abort the sync.
+	// them. Routes live in the WK table but are inert without these rules, and
+	// the API server bypass rule must survive the same flush events to keep the
+	// agent from routing its own control-plane traffic through the overlay.
+	// Non-fatal: log and continue so a transient netlink error doesn't abort
+	// the sync.
+	a.ensureAPIServerRoute()
 	if err := a.wgMgr.EnsureRoutingRules(); err != nil {
 		a.log.Error(err, "reasserting routing rules")
 	}
