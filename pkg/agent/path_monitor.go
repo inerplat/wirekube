@@ -128,6 +128,11 @@ type pathEntry struct {
 	// attack disabled). Cleared via ClearNeverDirect when conditions
 	// change (e.g. NAT type re-discovery).
 	neverDirect bool
+	// probeBackoffUntil temporarily suppresses Relay→Warm probes after the
+	// ICE layer has already proven direct probing unstable. Unlike
+	// neverDirect, this is time-bound and is cleared automatically after the
+	// deadline or explicitly on NAT re-classification.
+	probeBackoffUntil time.Time
 }
 
 // PathMonitorConfig bundles the thresholds. Defaults are applied for any
@@ -245,6 +250,48 @@ func (m *PathMonitor) ClearNeverDirect(peerName string) {
 	}
 }
 
+// BackoffDirectProbeUntil keeps a peer in Relay mode until the given deadline.
+// It is used to mirror ICE's unstable-direct-probe backoff into the transport
+// FSM; without this, PathMonitor would keep moving Relay→Warm on its own timer
+// even while ICE is intentionally holding direct probes back.
+func (m *PathMonitor) BackoffDirectProbeUntil(peerName, pubKey string, until time.Time) {
+	if until.IsZero() {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now()
+	e, ok := m.entries[peerName]
+	if !ok {
+		e = &pathEntry{
+			pubKey:        pubKey,
+			mode:          PathModeRelay,
+			modeEnteredAt: now,
+			lastProbeAt:   now,
+		}
+		m.entries[peerName] = e
+	}
+	e.pubKey = pubKey
+	if until.After(e.probeBackoffUntil) {
+		e.probeBackoffUntil = until
+	}
+	e.lastProbeAt = now
+	if e.mode != PathModeRelay {
+		e.setMode(PathModeRelay, now)
+	}
+}
+
+// ClearProbeBackoff clears the temporary direct-probe hold for a peer.
+func (m *PathMonitor) ClearProbeBackoff(peerName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[peerName]; ok {
+		e.probeBackoffUntil = time.Time{}
+	}
+}
+
 // ForgetMissing removes entries for any peers not present in `alive`. Call
 // from the sync loop after listing the current peer set so the monitor's
 // map does not accumulate stale entries across CRD churn.
@@ -353,6 +400,12 @@ func (m *PathMonitor) Evaluate(peerName, pubKey string, forceProbe bool) PathMod
 		// must call ClearNeverDirect to re-enable probing.
 		if e.neverDirect {
 			break
+		}
+		if !forceProbe && !e.probeBackoffUntil.IsZero() {
+			if now.Before(e.probeBackoffUntil) {
+				break
+			}
+			e.probeBackoffUntil = time.Time{}
 		}
 		if forceProbe || now.Sub(e.lastProbeAt) >= m.relayRetry {
 			e.lastProbeAt = now

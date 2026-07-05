@@ -277,3 +277,41 @@ func TestClearNeverDirectRestoresProbing(t *testing.T) {
 		t.Fatalf("Evaluate after ClearNeverDirect = %v, want PathModeWarm", got)
 	}
 }
+
+func TestBackoffDirectProbeUntilSuppressesTimerProbe(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false) // Relay, lastProbeAt = now
+
+	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
+	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+		t.Fatalf("Evaluate during probe backoff = %v, want PathModeRelay", got)
+	}
+
+	clk.advance(time.Second)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("Evaluate after probe backoff = %v, want PathModeWarm", got)
+	}
+}
+
+func TestForceProbeOverridesTemporaryBackoff(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false)
+	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
+
+	if got := pm.Evaluate("p1", "key1", true); got != PathModeWarm {
+		t.Fatalf("forced Evaluate during probe backoff = %v, want PathModeWarm", got)
+	}
+}
+
+func TestClearProbeBackoffRestoresTimerProbe(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false)
+	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
+
+	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
+	pm.ClearProbeBackoff("p1")
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("Evaluate after ClearProbeBackoff = %v, want PathModeWarm", got)
+	}
+}
