@@ -962,6 +962,9 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 			(!isStableDirectNAT(a.detectedNATType) || !isStableDirectNAT(peer.Status.NATType)) {
 			backoff := a.unstableProbeBackoff()
 			state.NextProbeAfter = time.Now().Add(backoff)
+			if a.pathMonitor != nil {
+				a.pathMonitor.BackoffDirectProbeUntil(peer.Name, peer.Spec.PublicKey, state.NextProbeAfter)
+			}
 			a.log.Info("unstable NAT pair failing repeatedly, backing off direct probes",
 				"peer", peer.Name, "failures", state.ProbeFailCount, "backoff", backoff)
 		}
@@ -1212,12 +1215,15 @@ func (a *Agent) unstableProbeBackoff() time.Duration {
 // be premature (it would race the imminent relay→direct upgrade in intent, not
 // in memory — all ICE-state writes are on the sync goroutine).
 func (a *Agent) clearDirectReprobeBackoff() {
-	for _, s := range a.iceStates {
+	for name, s := range a.iceStates {
 		if s.State == iceStateBirthday {
 			continue
 		}
 		s.NextProbeAfter = time.Time{}
 		s.ProbeFailCount = 0
+		if a.pathMonitor != nil {
+			a.pathMonitor.ClearProbeBackoff(name)
+		}
 	}
 }
 
