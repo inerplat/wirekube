@@ -195,12 +195,11 @@ func (l *ExternalWGListener) writeToIngress(ingressKey [PubKeySize]byte, token u
 		return fmt.Errorf("ingress peer %x not connected", ingressKey[:8])
 	}
 	frame := MakeExternalDataFrame(token, src.String(), payload)
-	ingress.mu.Lock()
-	defer ingress.mu.Unlock()
-	if err := WriteFrame(ingress.writer, frame); err != nil {
+	if err := ingress.writeFrame(frame); err != nil {
+		l.server.dropPeer(ingress)
 		return err
 	}
-	return ingress.writer.Flush()
+	return nil
 }
 
 func (l *ExternalWGListener) AllowsIngress(ingress [PubKeySize]byte) bool {
