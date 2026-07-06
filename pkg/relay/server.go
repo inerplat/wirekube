@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/wirekube/wirekube/pkg/relay/portalloc"
 )
+
+var relayDebug = os.Getenv("WIREKUBE_RELAY_DEBUG") == "1"
 
 // NAT probe rate limiting. Legitimate probing is rare (startup plus periodic
 // re-classification), so a modest global cap keeps the relay from being abused
@@ -79,6 +82,39 @@ type clientConn struct {
 	probes  map[uint64]chan struct{}
 }
 
+var relayClientWriteTimeout = 2 * time.Second
+
+func (c *clientConn) writeFrame(frame Frame) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if relayClientWriteTimeout > 0 {
+		if err := c.conn.SetWriteDeadline(time.Now().Add(relayClientWriteTimeout)); err != nil {
+			return err
+		}
+	}
+	err := WriteFrame(c.writer, frame)
+	if err == nil {
+		err = c.writer.Flush()
+	}
+	if relayClientWriteTimeout > 0 {
+		_ = c.conn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		_ = c.conn.Close()
+	}
+	return err
+}
+
+func (s *Server) dropPeer(c *clientConn) {
+	_ = c.conn.Close()
+	s.mu.Lock()
+	if s.peers[c.pubKey] == c {
+		delete(s.peers, c.pubKey)
+	}
+	s.mu.Unlock()
+}
+
 func NewServer() *Server {
 	return &Server{
 		peers:        make(map[[PubKeySize]byte]*clientConn),
@@ -120,12 +156,11 @@ func (s *Server) Dispatch(ingress, external [PubKeySize]byte, payload []byte, _ 
 		return fmt.Errorf("ingress %x not connected", ingress[:8])
 	}
 	out := MakeDataFrame(external, payload)
-	dest.mu.Lock()
-	defer dest.mu.Unlock()
-	if err := WriteFrame(dest.writer, out); err != nil {
+	if err := dest.writeFrame(out); err != nil {
+		s.dropPeer(dest)
 		return err
 	}
-	return dest.writer.Flush()
+	return nil
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -298,15 +333,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 
 			outFrame := MakeDataFrame(pubKey, payload)
-			dest.mu.Lock()
-			err = WriteFrame(dest.writer, outFrame)
-			if err == nil {
-				err = dest.writer.Flush()
-			}
-			dest.mu.Unlock()
-
-			if err != nil {
+			if err := dest.writeFrame(outFrame); err != nil {
 				log.Printf("relay: forward error to %x: %v", destKey[:8], err)
+				s.dropPeer(dest)
 			}
 			// Successful forwards intentionally not logged: a busy relay
 			// (RelayModeAlways / warm-bimodal) can push tens of frames per
@@ -331,6 +360,8 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.externalWG.BindTokenIngress(token, pubKey)
 			if err := s.externalWG.SendToExternal(token, payload); err != nil {
 				log.Printf("relay: external data response from %x token=%d failed: %v", pubKey[:8], token, err)
+			} else if relayDebug {
+				log.Printf("relay: external data response from %x token=%d len=%d sent", pubKey[:8], token, len(payload))
 			}
 
 		case MsgBimodalHint:
@@ -348,14 +379,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			// Forward with sender pubkey so the destination can key the hint
 			// by peer; body carries the sender (not the dest) on the wire.
 			outFrame := Frame{Type: MsgBimodalHint, Body: pubKey[:]}
-			dest.mu.Lock()
-			err = WriteFrame(dest.writer, outFrame)
-			if err == nil {
-				err = dest.writer.Flush()
-			}
-			dest.mu.Unlock()
-			if err != nil {
+			if err := dest.writeFrame(outFrame); err != nil {
 				log.Printf("relay: forward bimodal hint to %x: %v", destKey[:8], err)
+				s.dropPeer(dest)
 			}
 
 		case MsgNATProbe:
@@ -477,13 +503,7 @@ func (c *clientConn) probe(ctx context.Context, token uint64, timeout time.Durat
 	}()
 
 	start := time.Now()
-	c.mu.Lock()
-	err := WriteFrame(c.writer, MakeRelayProbeFrame(token))
-	if err == nil {
-		err = c.writer.Flush()
-	}
-	c.mu.Unlock()
-	if err != nil {
+	if err := c.writeFrame(MakeRelayProbeFrame(token)); err != nil {
 		return 0, err
 	}
 

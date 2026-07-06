@@ -364,6 +364,10 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			return syscall.ENOTCONN
 		}
 		for _, buf := range bufs {
+			if bindDebug {
+				log.Printf("[bind] external send relay=%s token=%d len=%d",
+					wkep.externalSource.RelayAddr, wkep.externalSource.Token, len(buf))
+			}
 			if err := relay.SendToExternal(wkep.externalSource.RelayAddr, wkep.externalSource.Token, buf); err != nil {
 				return err
 			}
@@ -675,6 +679,10 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 				eps[0] = &WireKubeEndpoint{
 					dst:            dst,
 					externalSource: pkt.ExternalSource,
+				}
+				if bindDebug {
+					log.Printf("[bind] external receive relay=%s token=%d source=%s len=%d",
+						pkt.ExternalSource.RelayAddr, pkt.ExternalSource.Token, pkt.ExternalSource.Addr, n)
 				}
 				return 1, nil
 			}

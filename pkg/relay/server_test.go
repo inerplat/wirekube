@@ -1,11 +1,36 @@
 package relay
 
 import (
+	"bufio"
 	"net"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestClientConnWriteFrameTimesOut(t *testing.T) {
+	oldTimeout := relayClientWriteTimeout
+	relayClientWriteTimeout = 20 * time.Millisecond
+	defer func() { relayClientWriteTimeout = oldTimeout }()
+
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	cc := &clientConn{
+		pubKey: pubkey(1),
+		conn:   serverSide,
+		writer: bufio.NewWriter(serverSide),
+	}
+
+	start := time.Now()
+	err := cc.writeFrame(MakeKeepaliveFrame())
+	if err == nil {
+		t.Fatal("writeFrame succeeded; want timeout")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("writeFrame blocked for %s; want bounded timeout", elapsed)
+	}
+}
 
 func TestServer_ExplicitForwarderRegisterReservesPort(t *testing.T) {
 	port := freeUDPPort(t)

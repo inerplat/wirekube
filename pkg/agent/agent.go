@@ -639,36 +639,40 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 func (a *Agent) sync(ctx context.Context) error {
 	// Re-read relay mode from mesh CR so runtime changes are picked up.
 	pokeAfterSync := false
-	if mesh, err := a.getMesh(ctx); err == nil && mesh.Spec.Relay != nil {
-		oldMode := a.relayMode
-		newMode := mesh.Spec.Relay.Mode
-		if oldMode != newMode {
-			a.log.Info("relay mode changed", "oldMode", oldMode, "newMode", newMode)
-			a.relayMode = newMode
-			// When switching away from "always", reset ICE states so peers
-			// re-evaluate connectivity immediately instead of waiting for
-			// the relay retry interval. Without this, peers that were forced
-			// to relay by mode=always stay stuck because their ICE state
-			// (iceStateConnected) + relay endpoint causes probe failures.
-			if oldMode == relayModeAlways && newMode != relayModeAlways {
-				for name, state := range a.iceStates {
-					if state.State == iceStateConnected && a.relayedPeers[name] {
-						state.State = iceStateRelay
-						state.LastCheck = time.Time{} // zero → immediate retry
-						a.setICEState(name, state)
-						a.log.Info("reset ICE state due to mode change", "peer", name, "newMode", newMode)
+	var meshCIDR string
+	if mesh, err := a.getMesh(ctx); err == nil {
+		meshCIDR = mesh.Spec.MeshCIDR
+		if mesh.Spec.Relay != nil {
+			oldMode := a.relayMode
+			newMode := mesh.Spec.Relay.Mode
+			if oldMode != newMode {
+				a.log.Info("relay mode changed", "oldMode", oldMode, "newMode", newMode)
+				a.relayMode = newMode
+				// When switching away from "always", reset ICE states so peers
+				// re-evaluate connectivity immediately instead of waiting for
+				// the relay retry interval. Without this, peers that were forced
+				// to relay by mode=always stay stuck because their ICE state
+				// (iceStateConnected) + relay endpoint causes probe failures.
+				if oldMode == relayModeAlways && newMode != relayModeAlways {
+					for name, state := range a.iceStates {
+						if state.State == iceStateConnected && a.relayedPeers[name] {
+							state.State = iceStateRelay
+							state.LastCheck = time.Time{} // zero → immediate retry
+							a.setICEState(name, state)
+							a.log.Info("reset ICE state due to mode change", "peer", name, "newMode", newMode)
+						}
 					}
 				}
+				// Poke peers AFTER SyncPeers so that SetPeerPath(PathModeRelay)
+				// has been applied in the bind. Poking before would send the
+				// keepalive via the old path (Direct), causing the handshake
+				// to complete over direct UDP instead of relay.
+				if newMode == relayModeAlways && oldMode != relayModeAlways {
+					pokeAfterSync = true
+				}
+			} else {
+				a.relayMode = newMode
 			}
-			// Poke peers AFTER SyncPeers so that SetPeerPath(PathModeRelay)
-			// has been applied in the bind. Poking before would send the
-			// keepalive via the old path (Direct), causing the handshake
-			// to complete over direct UDP instead of relay.
-			if newMode == relayModeAlways && oldMode != relayModeAlways {
-				pokeAfterSync = true
-			}
-		} else {
-			a.relayMode = newMode
 		}
 	}
 
@@ -828,6 +832,7 @@ func (a *Agent) sync(ctx context.Context) error {
 			})
 			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
 			routeOwners[ep.Status.AssignedMeshIP] = ep.Status.PublicKey
+			allowRoutesBeforeHandshake[ep.Status.PublicKey] = true
 		}
 	}
 
@@ -860,7 +865,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	// handshake so bootstrap traffic can traverse the relay. API server CIDRs
 	// remain excluded regardless of transport mode.
 	if len(allRoutes) > 0 {
-		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, routeOwners, allowRoutesBeforeHandshake)
+		connectedRoutes := a.filterRoutesForConnectedPeers(allRoutes, routeOwners, allowRoutesBeforeHandshake, meshCIDR)
 		if len(connectedRoutes) < len(allRoutes) {
 			a.log.V(2).Info("deferred routes for peers without handshake",
 				"connected", len(connectedRoutes), "total", len(allRoutes))
@@ -1167,10 +1172,13 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 
 // filterRoutesForConnectedPeers returns CIDRs that are safe to install in the
 // WireKube routing table. Direct-only peers still need a WireGuard handshake
-// before routes are installed. Relay-capable peers may need routes before the
-// first handshake because their first useful traffic can itself be what proves
-// the relay path. API server CIDRs are never routed through WireKube.
-func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, routeOwners map[string]string, allowBeforeHandshake map[string]bool) []string {
+// before routes are installed. Relay-capable peers may need the peer mesh /32
+// before the first handshake because their first useful traffic can itself be
+// what proves the relay path. Physical node/underlay AllowedIPs must still wait
+// for a handshake; installing them early can route the relay's own underlay path
+// into wire_kube and create a circular dependency. API server CIDRs are never
+// routed through WireKube.
+func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, routeOwners map[string]string, allowBeforeHandshake map[string]bool, meshCIDR string) []string {
 	stats, err := a.wgMgr.GetStats()
 	if err != nil {
 		a.log.Info("filterRoutes: GetStats failed, deferring all routes", "error", err)
@@ -1195,11 +1203,30 @@ func (a *Agent) filterRoutesForConnectedPeers(allRoutes []string, routeOwners ma
 			continue
 		}
 		key, ok := routeOwners[cidr]
-		if !ok || connected[key] || allowBeforeHandshake[key] {
+		if !ok || connected[key] || (allowBeforeHandshake[key] && isMeshHostRoute(cidr, meshCIDR)) {
 			result = append(result, cidr)
 		}
 	}
 	return result
+}
+
+func isMeshHostRoute(cidr, meshCIDR string) bool {
+	if meshCIDR == "" {
+		return false
+	}
+	ip, routeNet, err := net.ParseCIDR(cidr)
+	if err != nil || ip == nil || ip.To4() == nil {
+		return false
+	}
+	ones, bits := routeNet.Mask.Size()
+	if bits != 32 || ones != 32 {
+		return false
+	}
+	_, meshNet, err := net.ParseCIDR(meshCIDR)
+	if err != nil || meshNet == nil {
+		return false
+	}
+	return meshNet.Contains(ip)
 }
 
 func (a *Agent) canRouteBeforeHandshake(peerName string) bool {
@@ -1570,6 +1597,9 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 			return fmt.Errorf("external relay endpoint not configured")
 		}
 		endpoint = relay.External.Endpoint
+		if relay.External.ControlEndpoint != "" {
+			endpoint = relay.External.ControlEndpoint
+		}
 	case "managed":
 		port := int32(3478)
 		if relay.Managed != nil && relay.Managed.Port != 0 {

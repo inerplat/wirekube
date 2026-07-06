@@ -7,12 +7,15 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	relayproto "github.com/wirekube/wirekube/pkg/relay"
 )
+
+var clientDebug = os.Getenv("WIREKUBE_BIND_DEBUG") == "1"
 
 // Client manages a TCP connection to the relay server and routes packets
 // between local UDP proxies and remote peers via the relay.
@@ -381,7 +384,13 @@ func (c *Client) SendToExternal(sourceToken uint64, payload []byte) error {
 	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
 		return err
 	}
-	return c.writer.Flush()
+	if err := c.writer.Flush(); err != nil {
+		return err
+	}
+	if clientDebug {
+		log.Printf("relay-client: external response sent relay=%s token=%d len=%d", c.relayAddr, sourceToken, len(payload))
+	}
+	return nil
 }
 
 // SendBimodalHint asks the relay to deliver a hint to destPubKey telling it
