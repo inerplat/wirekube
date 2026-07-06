@@ -91,8 +91,8 @@ func TestBirthdayResultsHandoffRace(t *testing.T) {
 		}
 	}()
 
-	wg.Wait()     // all results sent (drainer keeps the buffer clear)
-	close(stop)   // let the drainer finish and exit
+	wg.Wait()   // all results sent (drainer keeps the buffer clear)
+	close(stop) // let the drainer finish and exit
 	<-drained
 
 	if got := len(a.iceStates); got != target {
