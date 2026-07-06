@@ -130,15 +130,13 @@ spec:
               containerPort: 3478
               protocol: UDP
           readinessProbe:
-            tcpSocket:
-              host: 127.0.0.1
-              port: 3478
+            exec:
+              command: ["sh", "-c", "nc -z 127.0.0.1 3478"]
             initialDelaySeconds: 2
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
-              host: 127.0.0.1
-              port: 3478
+            exec:
+              command: ["sh", "-c", "nc -z 127.0.0.1 3478"]
             initialDelaySeconds: 5
             periodSeconds: 30
           resources:
