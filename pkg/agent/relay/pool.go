@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 // Pool manages connections to multiple relay server instances.

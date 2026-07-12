@@ -14,7 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 type Server struct {

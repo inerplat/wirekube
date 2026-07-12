@@ -24,10 +24,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	agentpkg "github.com/wirekube/wirekube/pkg/agent"
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	externalctrl "github.com/wirekube/wirekube/pkg/controller/external"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	agentpkg "github.com/inerplat/wirekube/pkg/agent"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	externalctrl "github.com/inerplat/wirekube/pkg/controller/external"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 var scheme = runtime.NewScheme()
@@ -248,10 +248,14 @@ func relayControlAddrFromMesh(mesh *wirekubev1alpha1.WireKubeMesh, _ string) str
 }
 
 func relayPublicHostFromService(ctx context.Context, c client.Reader, namespace string) string {
-	svc := &corev1.Service{}
-	if err := c.Get(ctx, client.ObjectKey{Name: "wirekube-relay", Namespace: namespace}, svc); err != nil {
+	udpService := &corev1.Service{}
+	if err := c.Get(ctx, client.ObjectKey{Name: "wirekube-relay-udp", Namespace: namespace}, udpService); err != nil {
 		return ""
 	}
+	return loadBalancerHost(udpService)
+}
+
+func loadBalancerHost(svc *corev1.Service) string {
 	for _, ip := range svc.Spec.ExternalIPs {
 		if ip != "" {
 			return ip

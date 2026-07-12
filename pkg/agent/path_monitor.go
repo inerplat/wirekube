@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 // PathMode is the agent-owned transport mode for a single peer. It mirrors
@@ -210,6 +210,33 @@ func (m *PathMonitor) Forget(peerName string) {
 	m.mu.Lock()
 	delete(m.entries, peerName)
 	m.mu.Unlock()
+}
+
+// ForceRelay makes relay the authoritative path without permanently disabling
+// future direct probes. Callers may invoke it on every sync while an external
+// policy such as relay.mode=always is active.
+func (m *PathMonitor) ForceRelay(peerName, pubKey string) PathMode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now()
+	lastDirect := m.rx.LastDirectReceive(pubKey)
+	e, ok := m.entries[peerName]
+	if !ok {
+		e = &pathEntry{
+			modeEnteredAt: now,
+		}
+		m.entries[peerName] = e
+	}
+	e.pubKey = pubKey
+	e.lastDirectSeen = lastDirect
+	e.lastProbeAt = now
+	if e.mode != PathModeRelay {
+		prev := e.mode
+		e.setMode(PathModeRelay, now)
+		m.log.Info("path monitor: relay forced", "peer", peerName, "from", prev)
+	}
+	return e.mode
 }
 
 // MarkNeverDirect pins a peer to PathModeRelay and suppresses subsequent

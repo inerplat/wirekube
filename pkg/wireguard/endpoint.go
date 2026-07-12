@@ -14,8 +14,8 @@ var _ conn.Endpoint = (*WireKubeEndpoint)(nil)
 // When peerKey is set (relay-received packets), Send() uses it directly to look
 // up the pathTable instead of going through the addrToPeer reverse map.
 type WireKubeEndpoint struct {
-	dst            netip.AddrPort
-	peerKey        [32]byte // set by relay ReceiveFunc; zero value means unset
+	dst netip.AddrPort
+	relayPeerKey
 	externalSource ExternalSource
 }
 
@@ -43,6 +43,9 @@ func (e *WireKubeEndpoint) DstToString() string {
 // DstToBytes returns the binary representation of the destination address,
 // used by wireguard-go for mac2 cookie calculations.
 func (e *WireKubeEndpoint) DstToBytes() []byte {
+	if e.relayPeerKeySet() && !e.dst.IsValid() {
+		return nil
+	}
 	b, _ := e.dst.MarshalBinary()
 	return b
 }

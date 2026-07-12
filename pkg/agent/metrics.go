@@ -11,8 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 var (

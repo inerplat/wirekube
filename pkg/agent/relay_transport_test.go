@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 func TestExternalRelayDialConfigDefaultsToTCP(t *testing.T) {

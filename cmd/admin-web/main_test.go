@@ -19,7 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 func TestIssuePeerCreatesCRAndReturnsConfig(t *testing.T) {
