@@ -45,20 +45,15 @@ No coordination server, no external etcd, no control plane beyond the Kubernetes
 ## Quick Start
 
 ```bash
-# 1. Install CRDs and create default mesh configuration
-kubectl apply -f config/crd/
-kubectl apply -f config/examples/wirekubemesh-basic.yaml
-
-# 2. Create the namespace, RBAC, and agent DaemonSet
-kubectl create namespace wirekube-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f config/agent/rbac.yaml
-kubectl apply -f config/agent/daemonset.yaml
-
-# 3. Verify
-kubectl get wirekubepeers -o wide
+# Download a wirekubectl binary from the GitHub Release for your platform,
+# verify it with wirekubectl-checksums.txt, and place it on PATH.
+wirekubectl install --kubeconfig ~/.kube/config --context my-cluster
+wirekubectl status
 ```
 
-Each agent auto-discovers its endpoint and registers as a WireKubePeer. Set `meshCIDR` on the `WireKubeMesh` CR and every peer is automatically assigned a deterministic `/32` overlay IP from that range (derived from the node name):
+The installer inspects the cluster and shows the exact CRDs, privileged workloads, relay infrastructure, image digest, and mesh CIDR before mutation. Automation must select the relay topology and mesh CIDR explicitly, for example `wirekubectl install --relay load-balancer --mesh-cidr 100.96.0.0/11 --yes --output json`.
+
+Each agent auto-discovers its endpoint and registers as a WireKubePeer. Every peer receives a deterministic `/32` overlay IP from the selected mesh CIDR:
 
 ```yaml
 apiVersion: wirekube.io/v1alpha1
@@ -101,7 +96,7 @@ See the [Quick Start guide](https://inerplat.github.io/wirekube/getting-started/
 |-----------|---------|---------|
 | **Agent** | DaemonSet (`hostNetwork: true`) | Manages WireGuard interface, discovers endpoints, syncs peers, handles relay failover |
 | **Relay** | Deployment + Service | Bridges WireGuard UDP over TCP when NAT blocks direct P2P |
-| **wirekubectl** | CLI | Status inspection and peer management |
+| **wirekubectl** | CLI | Installation lifecycle, status inspection, diagnostics, and peer management |
 | **Admin web** | Relay sidecar | Manages external peers through the Kubernetes API |
 
 For details on NAT traversal, routing design, and the relay protocol, see the [Architecture documentation](https://inerplat.github.io/wirekube/architecture/overview/).

@@ -14,7 +14,7 @@ import (
 	clientgotesting "k8s.io/client-go/testing"
 	controllerfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 func TestAuthenticatePodBoundAgent(t *testing.T) {

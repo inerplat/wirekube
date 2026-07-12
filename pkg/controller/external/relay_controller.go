@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wirekube/wirekube/pkg/relay"
-	"github.com/wirekube/wirekube/pkg/relay/portalloc"
+	"github.com/inerplat/wirekube/pkg/relay"
+	"github.com/inerplat/wirekube/pkg/relay/portalloc"
 )
 
 // ErrNotImplemented is returned by the noop RelayController for legacy

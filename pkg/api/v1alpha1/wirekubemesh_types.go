@@ -127,7 +127,7 @@ type RelaySpec struct {
 
 	// Provider selects how the relay server is provisioned.
 	// "external": user provides a pre-existing relay endpoint (public IP server, third-party).
-	// "managed": operator deploys and manages the relay as a Pod + LoadBalancer Service.
+	// "managed": the installation owner provisions the relay resources and agents use the cluster-local control Service.
 	// +kubebuilder:validation:Enum=external;managed
 	Provider string `json:"provider"`
 
@@ -157,9 +157,11 @@ type RelaySpec struct {
 
 // ExternalRelaySpec configures a user-provided relay server.
 type ExternalRelaySpec struct {
-	// Endpoint is the relay server address (host:port).
+	// Endpoint is the raw WireGuard UDP address advertised to external peers.
 	// Example: "relay.example.com:3478" or "203.0.113.10:3478"
-	Endpoint string `json:"endpoint"`
+	// Leave empty when no UDP entrypoint is available; external peers remain Pending.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
 
 	// ControlEndpoint is the agent-facing relay endpoint. It is required for
 	// ws/wss transport and may hold a separate raw TCP address for tcp transport.
@@ -179,7 +181,7 @@ type ExternalRelaySpec struct {
 	AuthSecretRef *SecretKeyRef `json:"authSecretRef,omitempty"`
 }
 
-// ManagedRelaySpec configures the operator-managed relay.
+// ManagedRelaySpec configures a relay provisioned alongside the WireKube installation.
 type ManagedRelaySpec struct {
 	// Replicas is the number of relay pod replicas.
 	// +kubebuilder:default=1

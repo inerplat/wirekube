@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wirekube/wirekube/pkg/relay"
-	"github.com/wirekube/wirekube/pkg/relay/portalloc"
+	"github.com/inerplat/wirekube/pkg/relay"
+	"github.com/inerplat/wirekube/pkg/relay/portalloc"
 )
 
 // pickRange returns a small allocator range that does not collide with

@@ -12,7 +12,7 @@ import (
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 // newTestProxy builds a holePunchProxy backed by real loopback UDP sockets but
