@@ -9,11 +9,46 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
 )
+
+func TestRelayTransportConfigured(t *testing.T) {
+	ctx := context.Background()
+	var mesh wirekubev1alpha1.WireKubeMesh
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: meshName}, &mesh); err != nil {
+		t.Fatalf("get WireKubeMesh: %v", err)
+	}
+	if mesh.Spec.Relay == nil || mesh.Spec.Relay.External == nil {
+		t.Fatal("external relay is not configured")
+	}
+	external := mesh.Spec.Relay.External
+	if external.Transport != relayTransport() {
+		t.Fatalf("relay transport=%q, want %q", external.Transport, relayTransport())
+	}
+	if relayTransport() == relayTransportTCP {
+		if external.ControlEndpoint != "" {
+			t.Fatalf("TCP control endpoint=%q, want empty", external.ControlEndpoint)
+		}
+		return
+	}
+
+	expectedEndpoint := fmt.Sprintf("wss://%s:8443/relay", cpNode().ip)
+	if external.ControlEndpoint != expectedEndpoint {
+		t.Fatalf("WSS control endpoint=%q, want %q", external.ControlEndpoint, expectedEndpoint)
+	}
+	eventually(t, func() bool {
+		var deployment appsv1.Deployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: agentNamespace, Name: "wirekube-relay-ws"}, &deployment); err != nil {
+			t.Logf("get WSS relay deployment: %v", err)
+			return false
+		}
+		return deployment.Status.ReadyReplicas == 1
+	}, 2*time.Minute, pollInterval, "WSS relay gateway should be ready")
+}
 
 func resetTransportState(ctx context.Context, t *testing.T) []string {
 	t.Helper()

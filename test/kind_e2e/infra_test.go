@@ -5,8 +5,15 @@ package kind_e2e
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -17,6 +24,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -295,9 +304,9 @@ func enforceVPCIsolation() error {
 			}
 		}
 
-		// Allow API server and relay (OUTPUT from workers, INPUT on CP)
+		// Allow API server and relay entrypoints (OUTPUT from workers, INPUT on CP)
 		if self.name != cp.name {
-			for _, port := range []int{6443, 3478} {
+			for _, port := range []int{6443, 3478, 8443} {
 				if _, err := ctrExec("exec", self.name, "iptables", "-A", "OUTPUT",
 					"-d", cp.ip, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
 					return fmt.Errorf("allow tcp/%d on %s: %w", port, self.name, err)
@@ -325,6 +334,7 @@ func enforceVPCIsolation() error {
 				}{
 					{"tcp", 6443},
 					{"tcp", 3478},
+					{"tcp", 8443},
 					{"udp", stunPort1},
 					{"udp", stunPort2},
 				} {
@@ -1117,15 +1127,21 @@ func deployWireKubeCRDs(_ context.Context) error {
 	return nil
 }
 
-func deployWireKubeAgents(_ context.Context) error {
+func deployWireKubeAgents(ctx context.Context) error {
 	image := wireKubeImage()
 
-	if err := applyDaemonSet(image); err != nil {
-		return fmt.Errorf("apply DaemonSet: %w", err)
+	if relayTransport() == relayTransportWSS {
+		if err := ensureRelayTLSSecret(ctx); err != nil {
+			return fmt.Errorf("prepare relay TLS: %w", err)
+		}
 	}
 
 	if err := deployRelay(image); err != nil {
 		return fmt.Errorf("deploy relay: %w", err)
+	}
+
+	if err := applyDaemonSet(image); err != nil {
+		return fmt.Errorf("apply DaemonSet: %w", err)
 	}
 
 	return nil
@@ -1149,6 +1165,14 @@ func applyDaemonSet(image string) error {
 		}
 	}
 	content = strings.Join(lines, "\n")
+	if relayTransport() == relayTransportWSS {
+		content = strings.Replace(content,
+			"          volumeMounts:\n",
+			"          volumeMounts:\n            - name: relay-e2e-ca\n              mountPath: /etc/ssl/certs/wirekube-relay-e2e-ca.pem\n              subPath: wirekube-relay-e2e-ca.pem\n              readOnly: true\n", 1)
+		content = strings.Replace(content,
+			"      volumes:\n",
+			"      volumes:\n        - name: relay-e2e-ca\n          secret:\n            secretName: wirekube-relay-e2e-tls\n            items:\n              - key: tls.crt\n                path: wirekube-relay-e2e-ca.pem\n", 1)
+	}
 
 	// Inject direct API server address. Required for no-kube-proxy mode
 	// (Cilium kube-proxy replacement) and also avoids conntrack issues
@@ -1228,6 +1252,177 @@ spec:
 	}
 	tmp.Close()
 
+	if err := kubectlApply(tmp.Name()); err != nil {
+		return err
+	}
+	if relayTransport() == relayTransportWSS {
+		return deployWebSocketRelay(image)
+	}
+	return nil
+}
+
+func ensureRelayTLSSecret(ctx context.Context) error {
+	certPEM, keyPEM, err := relayTLSCertificate()
+	if err != nil {
+		return err
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay-e2e-tls", Namespace: agentNamespace},
+		Type:       corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+	existing := &corev1.Secret{}
+	key := client.ObjectKeyFromObject(secret)
+	if err := k8sClient.Get(ctx, key, existing); apierrors.IsNotFound(err) {
+		return k8sClient.Create(ctx, secret)
+	} else if err != nil {
+		return err
+	}
+	patch := client.MergeFrom(existing.DeepCopy())
+	existing.Type = secret.Type
+	existing.Data = secret.Data
+	return k8sClient.Patch(ctx, existing, patch)
+}
+
+func relayTLSCertificate() ([]byte, []byte, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{CommonName: "wirekube-relay-e2e"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(24 * time.Hour),
+		IPAddresses:           []net.IP{net.ParseIP(cpNode().ip)},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM, nil
+}
+
+func deployWebSocketRelay(image string) error {
+	yaml := fmt.Sprintf(`---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wirekube-relay
+  namespace: %[1]s
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wirekube-relay-e2e
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["wirekube.io"]
+    resources: ["wirekubepeers"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wirekube-relay-e2e
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wirekube-relay-e2e
+subjects:
+  - kind: ServiceAccount
+    name: wirekube-relay
+    namespace: %[1]s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wirekube-relay-ws
+  namespace: %[1]s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wirekube-relay-ws
+  template:
+    metadata:
+      labels:
+        app: wirekube-relay-ws
+    spec:
+      serviceAccountName: wirekube-relay
+      hostNetwork: true
+      dnsPolicy: Default
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: relay-ws
+          image: %[2]s
+          command: ["wirekube-relay-ws"]
+          args:
+            - --addr=:8443
+            - --backend-addr=127.0.0.1:3478
+            - --path=/relay
+            - --tls-cert-file=/var/run/wirekube-relay-tls/tls.crt
+            - --tls-private-key-file=/var/run/wirekube-relay-tls/tls.key
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /readyz
+              port: 8443
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - name: relay-tls
+              mountPath: /var/run/wirekube-relay-tls
+              readOnly: true
+      volumes:
+        - name: relay-tls
+          secret:
+            secretName: wirekube-relay-e2e-tls
+`, agentNamespace, image)
+
+	tmp, err := os.CreateTemp("", "wk-relay-wss-*.yaml")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(yaml); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
 	return kubectlApply(tmp.Name())
 }
 
@@ -1241,10 +1436,13 @@ func applyWireKubeMeshCR(ctx context.Context, stunServers []string, relayEndpoin
 		Provider: "external",
 		External: &wirekubev1alpha1.ExternalRelaySpec{
 			Endpoint:  relayEndpoint,
-			Transport: "tcp",
+			Transport: relayTransport(),
 		},
 		HandshakeTimeoutSeconds:    15,
 		DirectRetryIntervalSeconds: 30,
+	}
+	if relayTransport() == relayTransportWSS {
+		mesh.Spec.Relay.External.ControlEndpoint = fmt.Sprintf("wss://%s:8443/relay", cpNode().ip)
 	}
 	mesh.Spec.NATTraversal = &wirekubev1alpha1.NATTraversalSpec{
 		HandshakeValidWindowSeconds:  10,

@@ -57,30 +57,31 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `mode` | string | No | `auto` | `auto`: try direct first, fallback to relay. `always`: always relay. `never`: direct only |
-| `provider` | string | No | - | `external`: user-provided relay. `managed`: deployed within the cluster |
-| `handshakeTimeoutSeconds` | int | No | `30` | Seconds to wait for direct handshake before activating relay |
+| `mode` | string | No | `auto` | `auto`: start with relay available and promote healthy peers to direct. `always`: always relay. `never`: direct only |
+| `provider` | string | No | - | `external`: connect to a user-provided endpoint. `managed`: connect to the separately deployed cluster-local relay control Service. |
+| `handshakeTimeoutSeconds` | int | No | `30` | Retained API field. The current PathMonitor relay-first flow stores this value but does not use it for path transitions. |
 | `directRetryIntervalSeconds` | int | No | `120` | Seconds between attempts to upgrade a relayed peer back to direct P2P |
 
 #### `spec.relay.external`
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `endpoint` | string | Yes (if external) | - | Relay server address (`host:port`) |
-| `transport` | string | No | `tcp` | Transport protocol (`tcp`) |
+| `endpoint` | string | Yes (if external) | - | Raw relay address (`host:port`) used by TCP agents, NAT probing, and external WireGuard peers. |
+| `transport` | string | No | `tcp` | Selects exactly one agent transport: `tcp`, `ws`, or `wss`. |
+| `controlEndpoint` | string | Required for `ws`/`wss` | - | Agent-facing endpoint. It may be a separate raw address for `tcp` or a matching `ws://`/`wss://` URL. |
+| `authSecretRef` | SecretKeyRef | No | - | Reserved authentication configuration. The current relay client does not read this Secret or send a relay credential. |
 
 #### `spec.relay.managed`
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | int | No | `1` | Number of relay pod replicas |
-| `serviceType` | string | No | `LoadBalancer` | Kubernetes Service type |
-| `port` | int | No | `3478` | Relay service port |
+| `replicas` | int | No | `1` | Desired replicas in the API shape; no controller currently reconciles this into a Deployment. |
+| `serviceType` | string | No | `LoadBalancer` | Desired Service type in the API shape; no controller currently reconciles this field. |
+| `port` | int | No | `3478` | Port used when constructing the cluster-local managed relay endpoint. |
+| `image` | string | No | - | Reserved deployment configuration; currently not reconciled. |
+| `resources` | RelayResources | No | - | Reserved deployment configuration; currently not reconciled. |
 
-When `provider: managed`, the agent discovers the relay's externally reachable
-address by querying the Service (ExternalIP → LB Ingress → NodePort). The agent
-does **not** fall back to ClusterIP DNS because CoreDNS may be unreachable on
-hybrid/NAT'd nodes before the mesh tunnel is established.
+When `provider: managed`, agents connect to the cluster-local `wirekube-relay-control` Service. The relay Deployment and Services must be installed separately. Nodes that cannot use cluster DNS or service routing during bootstrap should use `provider: external` with a reachable LoadBalancer, NodePort, or future WSS endpoint.
 
 For multi-instance scaling, use a Headless Service. The relay pool re-resolves
 DNS every 30s to track replica changes.
@@ -102,7 +103,7 @@ One per mesh-participating node.
 apiVersion: wirekube.io/v1alpha1
 kind: WireKubePeer
 metadata:
-  name: node-my-node
+  name: my-node
   labels:
     wirekube.io/node: my-node
 spec:
@@ -128,7 +129,7 @@ spec:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `connected` | bool | Whether a recent WireGuard handshake has been observed |
+| `connected` | bool | Whether the agent currently considers at least one usable transport path available |
 | `natType` | string | Detected NAT mapping behavior: `open` (no NAT — public IP on NIC), `cone`, `port-restricted-cone`, `symmetric`, or empty (undetermined). Published by the agent so other peers can decide transport path. |
 | `transportMode` | string | Aggregate transport state derived from `peerTransports`: `direct`, `relay`, or `mixed`. |
 | `peerTransports` | map[string]string | Per-peer transport mode. Key is peer CRD name (e.g., `node-worker7`), value is `direct` or `relay`. |
@@ -153,7 +154,7 @@ The `natType` and `transportMode` fields are shown as `NAT` and `Mode` columns i
 
 ### Naming Convention
 
-Peer resources are named `node-<node-name>` (e.g., `node-my-node`).
+Agent-managed peer resources use the Kubernetes Node name directly (for example, Node `worker-a` owns WireKubePeer `worker-a`).
 
 ---
 
@@ -248,3 +249,40 @@ spec:
 NAME             ACTIVE      READY   ROUTES   AGE
 vpc-b-gateway    node-b1     true    1        5m
 ```
+
+---
+
+## WireKubeExternalPeer
+
+| Property | Value |
+|----------|-------|
+| API Version | `wirekube.io/v1alpha1` |
+| Kind | `WireKubeExternalPeer` |
+| Scope | Cluster |
+| Short Name | `wkep` |
+
+WireKubeExternalPeer authorizes an off-cluster host that runs a standard WireGuard client. The external-peer reconciler is embedded in every agent Pod and uses leader election so only one agent performs allocation.
+
+### Spec
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `displayName` | string | Yes | Stable human-readable identity used by the deterministic mesh-IP allocator. |
+| `publicKey` | string | Yes | External client's 44-character base64 WireGuard public key. |
+| `ttl` | duration | No | Optional lifetime after which the CR is deleted. |
+| `allowedDestinations` | []string | No | CIDRs rendered into the external client's AllowedIPs. Defaults are resolved by the reconciler. |
+| `mtu` | int | No | Client MTU override; the effective default is `1248`. |
+| `ingressPeer` | string | No | Pins the client to a specific WireKubePeer; otherwise the reconciler selects an ingress peer. |
+
+### Status
+
+| Field | Description |
+|-------|-------------|
+| `assignedMeshIP` | Allocated overlay `/32`. |
+| `relayEndpoint` | Shared raw-WireGuard UDP endpoint rendered into the client configuration. |
+| `ingressPeerName` | Selected in-cluster ingress peer. |
+| `ingressPublicKey` | WireGuard public key authenticated by the external client. |
+| `allowedDestinations` | Effective AllowedIPs rendered for the client. |
+| `mtu` | Effective client MTU. |
+| `phase` | `Pending`, `Active`, `Revoked`, or `Failed`. |
+| `connected`, `lastHandshake` | Reserved health fields; the allocation reconciler does not currently populate them. |

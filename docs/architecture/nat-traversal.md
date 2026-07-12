@@ -62,12 +62,7 @@ All major cloud NAT gateways use Symmetric NAT:
 Most home/ISP routers use Cone NAT (STUN-based P2P works).
 
 !!! info "When is relay needed?"
-    Relay is needed only when **both** peers are behind Symmetric NAT. Cone ↔
-    Symmetric pairs achieve direct P2P: the Symmetric side initiates a
-    handshake to the Cone peer's stable STUN endpoint; the Cone NAT accepts
-    the packet (Endpoint-Independent Filtering), and WireGuard responds to
-    the actual source address. Each node publishes its `natType` in its
-    WireKubePeer status, so peers can determine the optimal transport path.
+    Relay is required whenever direct probing cannot establish a usable path. Symmetric ↔ Symmetric is the common case, but restrictive firewalls, port-restricted mappings, and asymmetric filtering can also require relay. Each node publishes its `natType` so peers can choose an appropriate probe strategy.
 
 ## Traversal Strategy
 
@@ -271,22 +266,20 @@ When relay is activated for a peer:
 
 1. Agent connects to the relay server (or relay pool) via TCP
 2. Registers its WireGuard public key with the relay
-3. Creates a local UDP proxy (`127.0.0.1:random → 127.0.0.1:<wg-port>`)
-4. Sets the peer's WireGuard endpoint to the proxy's local address
-5. All subsequent WireGuard traffic for this peer routes through the relay
+3. Sets the userspace Bind path for that peer to relay or warm mode
+4. Bind sends encrypted WireGuard packets through the relay transport while preserving the direct endpoint for later probing
+5. Incoming relay packets are delivered directly from the relay pool to the userspace Bind
 
-The relay connection auto-reconnects with exponential backoff (1s–30s) if the
-TCP connection drops. Existing UDP proxies are preserved across reconnections.
+The relay connection auto-reconnects with exponential backoff (1s–30s) if the TCP connection drops. Bind path state remains available while the relay client reconnects.
 
 ### Stage 4: Direct Path Recovery
 
-Every `directRetryIntervalSeconds` (default 120s), the agent probes relayed
-peers to check if direct connectivity has become available:
+Every `directRetryIntervalSeconds` (default 120s), the agent probes relayed peers to check if direct connectivity has become available:
 
-1. Temporarily set the peer's WireGuard endpoint back to the direct address
-2. Wait for the next sync cycle to check WireGuard stats
-3. If a successful handshake is detected on the non-proxy endpoint → upgrade to direct
-4. If no handshake → cancel probe, resume relay, wait for next retry interval
+1. Move the peer from relay to warm mode so direct and relay can run together
+2. Observe direct receive evidence and WireGuard health
+3. Promote to direct when the direct path becomes healthy
+4. Demote to relay when the probe fails and wait for the next retry interval
 
 !!! note "Skipping futile probes"
     The agent skips direct probes for peers whose `WireKubePeer.Status.NATType`

@@ -1,0 +1,30 @@
+---
+# Optional relay entry point for clusters where a public LoadBalancer Service is unavailable.
+# Apply after config/relay/deployment.yaml; this changes the same wirekube-relay Service from LoadBalancer to NodePort.
+#
+# Agents outside the cluster connect to <PUBLIC_NODE_IP>:30478.
+# Open TCP 30478 for WireKube agents and UDP 30478 only when external WireGuard peers use the shared relay listener.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay
+    app.kubernetes.io/part-of: wirekube
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: wirekube-relay
+  ports:
+    - name: relay-tcp
+      port: 3478
+      targetPort: 3478
+      nodePort: 30478
+      protocol: TCP
+    - name: relay-udp
+      port: 3478
+      targetPort: 3478
+      nodePort: 30478
+      protocol: UDP

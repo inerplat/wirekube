@@ -85,8 +85,8 @@ nc -zv <relay-endpoint> 3478
 # Check relay pods
 kubectl get pods -n wirekube-system -l app=wirekube-relay
 
-# Check Service external address (for managed relay)
-kubectl get svc wirekube-relay -n wirekube-system -o wide
+# Check the cluster-local control Service for managed relay
+kubectl get svc wirekube-relay-control -n wirekube-system -o wide
 ```
 
 **Fix:**
@@ -94,9 +94,10 @@ kubectl get svc wirekube-relay -n wirekube-system -o wide
 The relay client auto-reconnects with exponential backoff (1s–30s). If the relay
 is persistently unreachable:
 
-1. Check firewall / security group rules (TCP 3478 inbound)
-2. For managed relay, verify the Service has an ExternalIP or LoadBalancer IP
-3. After fixing, the agent reconnects automatically — no restart needed
+1. Check firewall or security group rules for the selected relay endpoint
+2. For managed relay, verify cluster DNS and routing to `wirekube-relay-control.<namespace>.svc.cluster.local`
+3. For external relay, verify the public LoadBalancer or NodePort address
+4. After fixing, the agent reconnects automatically without a restart
 
 ---
 
@@ -172,17 +173,16 @@ kubectl patch wirekubepeer <name> --type merge \
 
 ```bash
 ip rule show | grep 0x574B
-# Should show: 100: from all fwmark 0x574B lookup main
+# Should show a main-table fwmark rule below the local-table rule and above priority 200
 ```
 
 **Fix:**
 
 ```bash
-ip rule add fwmark 0x574B lookup main priority 100
+ip rule add fwmark 0x574B lookup main priority 110
 ```
 
-The agent creates this rule automatically on startup. The initContainer also
-removes stale rules from previous runs.
+The agent creates and repairs this rule automatically. The exact priority is dynamic and may be greater than `110` when the host moves the local-table rule.
 
 ---
 
@@ -198,7 +198,7 @@ RTNETLINK answers: File exists
 
 **Fix:**
 
-The DaemonSet's initContainer cleans up stale interfaces on startup. For manual fix:
+The default DaemonSet has no initContainer. The userspace engine attempts to reattach an existing TUN, migrates a legacy kernel WireGuard link, and refuses to delete a foreign interface. For manual cleanup of abandoned WireKube state:
 
 ```bash
 ip link del wire_kube 2>/dev/null
@@ -253,29 +253,23 @@ kubectl patch wirekubepeer <name> --type merge \
 
 ---
 
-## Scenario 10: Managed Relay Unreachable
+## Scenario 10: Managed Relay DNS or Service Unreachable
 
 **Symptoms:**
 
-Agent logs show `managed relay: no externally reachable address found on wirekube-relay Service`.
+The agent repeatedly fails to connect to `wirekube-relay-control.wirekube-system.svc.cluster.local:3478`.
 
-**Root Cause:** The managed relay Service does not have an ExternalIP, LoadBalancer
-Ingress, or NodePort with a reachable node IP. The agent does **not** use
-ClusterIP/CoreDNS for relay discovery because it may be unreachable on hybrid/NAT'd
-nodes before the mesh tunnel is established.
+**Root Cause:** `provider: managed` uses the cluster-local relay control Service, but this node cannot resolve cluster DNS or route to Services during bootstrap.
 
 **Fix:**
 
-Ensure the relay Service has an externally reachable address:
+Verify the control Service and DNS from the affected node. If cluster service routing cannot be made available before WireKube starts, switch the mesh to `provider: external` and use the relay's public LoadBalancer or NodePort address:
 
 ```bash
-kubectl get svc wirekube-relay -n wirekube-system -o wide
+kubectl get svc wirekube-relay-control -n wirekube-system -o wide
 ```
 
-If using `serviceType: LoadBalancer`, wait for the external IP to be assigned.
-For `NodePort`, ensure at least one cluster node has a public IP (ExternalIP or
-a public InternalIP). The agent retries relay initialization with exponential
-backoff, so it will connect once the external address becomes available.
+See [Relay Entry Points](../guides/relay-entrypoints.md) for LoadBalancer, NodePort, and HTTP CONNECT proxy configurations.
 
 ---
 

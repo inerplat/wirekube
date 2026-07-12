@@ -1,10 +1,7 @@
 ---
 # wirekube-relay ServiceAccount + RBAC
 #
-# The relay process itself needs no Kubernetes permissions. The admin-web
-# sidecar uses this ServiceAccount to list, issue, and delete
-# WireKubeExternalPeer resources from a localhost-only web UI, and stores
-# generated client configs in namespaced Secrets.
+# The raw relay uses WireKube peer resources, while the optional WebSocket gateway uses TokenReview and bound Pod lookup. The admin-web sidecar manages WireKubeExternalPeer resources and generated client Secrets.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -23,6 +20,18 @@ rules:
   verbs:
   - get
   - list
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
   - create
   - delete
 - apiGroups:

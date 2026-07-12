@@ -2,24 +2,18 @@
 
 ## Agent Restart Behavior
 
-The WireKube agent preserves the WireGuard kernel interface and routes across
-pod restarts. Because WireGuard operates at the kernel level, direct P2P tunnels
-continue forwarding traffic even while the agent process is restarting.
+The current agent runs wireguard-go in userspace. A rolling restart or process failure interrupts direct and relay forwarding until the new agent process recreates or reattaches the TUN and restores peer state.
 
-On startup, the agent validates the existing interface:
+On startup, the agent validates the interface name and type:
 
-- **Key matches:** The interface is reused as-is. STUN discovery may fail
-  (port already bound), but the existing CR endpoint is preserved.
-- **Key mismatch:** The interface is torn down and recreated with the new key.
+- **Existing userspace TUN:** The engine attempts to reattach and configure it.
+- **Legacy kernel WireGuard link:** The engine deletes it and migrates to a userspace TUN.
+- **Foreign interface with the same name:** Startup fails rather than deleting an interface it does not own.
 
-User-space resources (relay TCP connections, ICE negotiation, metrics) are
-released on shutdown and re-established on the next startup. Relay connections
-reconnect automatically with exponential backoff (1–30 seconds).
+During graceful shutdown the agent closes relay connections, flushes WireKube routes, removes routing rules, and deletes the TUN interface. Relay connections reconnect with exponential backoff after the next startup.
 
-!!! info "Zero-downtime for direct tunnels"
-    Pod restarts (rolling updates, OOM kills, node reboots) cause **no
-    disruption** to direct WireGuard P2P tunnels. Relay-based connections
-    experience a brief reconnection window (typically under 30 seconds).
+!!! note "Restart impact"
+    Restart duration depends on pod scheduling, Kubernetes API access, endpoint discovery, and relay availability. Treat agent restarts as a short network interruption and use rollout settings appropriate for the workload.
 
 ---
 
@@ -71,12 +65,8 @@ NODE=<node-name> && \
   sed "s/TARGET_NODE_NAME/$NODE/g" config/cleanup/cleanup-job.yaml | kubectl apply -f -
 ```
 
-!!! warning "DaemonSet label"
-    If the `wirekube.io/vpn-enabled=true` label is still on the node, the
-    DaemonSet will reschedule the agent after cleanup. Remove the label first:
-    ```bash
-    kubectl label node <node-name> wirekube.io/vpn-enabled-
-    ```
+!!! warning "DaemonSet placement"
+    The default DaemonSet targets every node except `wirekube.io/proxy-node=true` nodes. Before running the cleanup Job, change the DaemonSet affinity or otherwise prevent the standard agent Pod from being recreated on the target node.
 
 ---
 

@@ -64,38 +64,34 @@ Key log messages:
 
 | Log Pattern | Meaning |
 |-------------|---------|
-| `endpoint discovered: X.X.X.X:51820 via stun` | STUN discovery succeeded |
-| `symmetric NAT detected` | Node behind Symmetric NAT |
-| `peer handshake completed` | Direct P2P working |
-| `handshake timeout, activating relay` | Falling back to relay |
-| `relay connected` | TCP connection to relay established |
-| `relay-pool: connected to new replica` | New relay instance joined pool |
-| `peer X: upgraded to direct` | Relayed peer successfully probed for direct |
-| `peer X: direct probe failed, staying on relay` | Direct probe attempt failed |
-| `EPERM detected, switching to raw syscall.Write` | Cilium BPF bypass activated |
-| `xfrm bypass enabled on wire_kube` | IPSec xfrm bypass set |
+| `[stun] symmetric NAT detected` | STUN servers observed endpoint-dependent port mappings |
+| `relay connected` | Agent initialized a relay pool endpoint |
+| `relay-client: connected to` | A relay TCP client connected and registered |
+| `path monitor: new peer, starting on relay` | New peer entered the safe relay-first path |
+| `upgraded to direct (relay proxy in standby)` | A direct path was proven and promoted |
+| `active probe failed, reverting to relay` | Direct probing failed and relay remained active |
+| `relay-client: reconnect failed` | Relay reconnect is backing off after a failure |
+| `[wireguard] xfrm bypass enabled` | IPSec xfrm bypass was applied |
 
 ## Prometheus Metrics
 
-The agent exposes Prometheus metrics on `:9090/metrics`. Use the provided
-ServiceMonitor (`config/agent/servicemonitor.yaml`) for Prometheus Operator
-auto-discovery. It selects `app.kubernetes.io/name=wirekube-agent`, so the
-standard agent DaemonSet and the proxy-node agent DaemonSet are scraped by the
-same ServiceMonitor.
+The agent exposes Prometheus metrics on `:9090/metrics`. The provided Service selects Pods with `app.kubernetes.io/name=wirekube-agent`, including the standard and proxy-node DaemonSets, and the ServiceMonitor selects that Service by its `app=wirekube-agent` label.
 
 ### Available Metrics
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `wirekube_peer_latency_seconds` | Gauge | peer, endpoint, transport | ICMP RTT to peer |
-| `wirekube_peer_bytes_sent_total` | Gauge | peer | Total bytes sent via WireGuard |
-| `wirekube_peer_bytes_received_total` | Gauge | peer | Total bytes received via WireGuard |
-| `wirekube_peer_connected` | Gauge | peer, nat_type | Connection status (1=connected, 0=disconnected) |
-| `wirekube_peer_transport_mode` | Gauge | peer | Transport (1=direct, 2=relay, 3=mixed) |
-| `wirekube_peer_last_handshake_seconds` | Gauge | peer | Seconds since last WireGuard handshake |
-| `wirekube_node_nat_type` | Gauge | node | NAT type (1=cone, 2=symmetric, 0=unknown) |
+| `wirekube_peer_latency_seconds` | Gauge | source, peer, transport | ICMP RTT to peer |
+| `wirekube_peer_bytes_sent_total` | Gauge | source, peer | Total bytes sent via WireGuard |
+| `wirekube_peer_bytes_received_total` | Gauge | source, peer | Total bytes received via WireGuard |
+| `wirekube_peer_connected` | Gauge | source, peer, nat_type | Connection status (1=connected, 0=disconnected) |
+| `wirekube_peer_transport_mode` | Gauge | source, peer | Transport (1=direct, 2=relay) |
+| `wirekube_peer_last_handshake_seconds` | Gauge | source, peer | Seconds since last WireGuard handshake |
+| `wirekube_node_nat_type` | Gauge | node | NAT type (0=unknown, 1=cone, 2=symmetric, 3=port-restricted-cone, 4=open) |
 | `wirekube_peers_total` | Gauge | — | Total WireKubePeer count |
 | `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |
+| `wirekube_direct_peers_total` | Gauge | — | Peers currently using direct P2P |
+| `wirekube_peer_ice_state` | Gauge | source, peer | ICE state (0=relay, 1=gathering, 2=checking, 3=connected, 4=birthday, 5=failed) |
 
 ### Grafana Dashboard
 
