@@ -1395,6 +1395,11 @@ spec:
             - --path=/relay
             - --tls-cert-file=/var/run/wirekube-relay-tls/tls.crt
             - --tls-private-key-file=/var/run/wirekube-relay-tls/tls.key
+          env:
+            - name: KUBERNETES_SERVICE_HOST
+              value: "%[3]s"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
           readinessProbe:
             httpGet:
               scheme: HTTPS
@@ -1410,7 +1415,7 @@ spec:
         - name: relay-tls
           secret:
             secretName: wirekube-relay-e2e-tls
-`, agentNamespace, image)
+`, agentNamespace, image, cpNode().ip)
 
 	tmp, err := os.CreateTemp("", "wk-relay-wss-*.yaml")
 	if err != nil {
@@ -1718,40 +1723,5 @@ func patchMeshRelayMode(ctx context.Context, t *testing.T, newMode string) func(
 		if err := k8sClient.Patch(rctx, &m, p); err != nil {
 			t.Logf("warning: restore relay.mode=%q: %v", originalMode, err)
 		}
-	}
-}
-
-func relayEndpointFromMesh(ctx context.Context, t *testing.T) string {
-	t.Helper()
-	var mesh wirekubev1alpha1.WireKubeMesh
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: meshName}, &mesh); err != nil {
-		t.Fatalf("get WireKubeMesh: %v", err)
-	}
-	if mesh.Spec.Relay != nil && mesh.Spec.Relay.External != nil {
-		return mesh.Spec.Relay.External.Endpoint
-	}
-	return ""
-}
-
-func setRelayEndpoint(ctx context.Context, t *testing.T, endpoint string) {
-	t.Helper()
-	tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	var mesh wirekubev1alpha1.WireKubeMesh
-	if err := k8sClient.Get(tctx, types.NamespacedName{Name: meshName}, &mesh); err != nil {
-		t.Logf("warning: get WireKubeMesh: %v", err)
-		return
-	}
-	p := client.MergeFrom(mesh.DeepCopy())
-	if mesh.Spec.Relay == nil {
-		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{}
-	}
-	if mesh.Spec.Relay.External == nil {
-		mesh.Spec.Relay.External = &wirekubev1alpha1.ExternalRelaySpec{}
-	}
-	mesh.Spec.Relay.External.Endpoint = endpoint
-	if err := k8sClient.Patch(tctx, &mesh, p); err != nil {
-		t.Logf("warning: patch relay endpoint to %s: %v", endpoint, err)
 	}
 }
