@@ -746,6 +746,8 @@ func TestRelayReconnect(t *testing.T) {
 	restoreMode := patchMeshRelayMode(ctx, t, "always")
 	defer restoreMode()
 	waitForRelayDataPlane(ctx, t, subject, remote, relayTimeout)
+	unblock := blockWireGuardUDP(t, subject)
+	defer unblock()
 
 	restoreEntrypoint := scaleRelayEntrypoint(ctx, t, 0)
 	defer restoreEntrypoint()

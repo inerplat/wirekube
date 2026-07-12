@@ -177,6 +177,36 @@ func TestForgetClearsEntry(t *testing.T) {
 	}
 }
 
+func TestForceRelayOverridesDirectWithoutDisablingFutureProbes(t *testing.T) {
+	pm, rx, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", true)
+	clk.advance(10 * time.Millisecond)
+	rx.last["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+		t.Fatalf("setup: want Direct, got %v", got)
+	}
+
+	if got := pm.ForceRelay("p1", "key1"); got != PathModeRelay {
+		t.Fatalf("ForceRelay from Direct = %v, want PathModeRelay", got)
+	}
+	if got := pm.ModeFor("p1"); got != PathModeRelay {
+		t.Fatalf("ModeFor after ForceRelay = %v, want PathModeRelay", got)
+	}
+
+	clk.advance(100 * time.Millisecond)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+		t.Fatalf("Evaluate before relay retry = %v, want PathModeRelay", got)
+	}
+	clk.advance(150 * time.Millisecond)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("Evaluate after relay retry = %v, want PathModeWarm", got)
+	}
+	clk.advance(10 * time.Millisecond)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("stale direct watermark after ForceRelay = %v, want PathModeWarm", got)
+	}
+}
+
 // TestStaleWatermarkIsNotFreshEvidence asserts that an RX watermark
 // captured before the peer entered Warm (e.g. from a previous Direct
 // session whose evidence the monitor already consumed) does not promote.

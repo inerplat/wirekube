@@ -1383,7 +1383,12 @@ func (a *Agent) driveTransportMode(
 		if peer == nil || peer.Spec.PublicKey == "" {
 			continue
 		}
-		mode := a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false)
+		var mode PathMode
+		if a.relayMode == relayModeAlways {
+			mode = a.pathMonitor.ForceRelay(name, peer.Spec.PublicKey)
+		} else {
+			mode = a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false)
+		}
 		directAddr := peer.Spec.Endpoint
 		if ep, ok := a.directEndpoints[name]; ok && ep != "" {
 			directAddr = ep
