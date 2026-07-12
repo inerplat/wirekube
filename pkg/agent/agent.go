@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -1591,21 +1592,26 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	}
 
 	var endpoint string
+	var probeAddr string
+	var relayTransport string
+	var tokenRequired bool
 	switch relay.Provider {
 	case "external":
-		if relay.External == nil || relay.External.Endpoint == "" {
-			return fmt.Errorf("external relay endpoint not configured")
+		config, err := externalRelayDialConfig(relay.External)
+		if err != nil {
+			return err
 		}
-		endpoint = relay.External.Endpoint
-		if relay.External.ControlEndpoint != "" {
-			endpoint = relay.External.ControlEndpoint
-		}
+		endpoint = config.endpoint
+		probeAddr = config.probeAddr
+		relayTransport = config.transport
+		tokenRequired = config.tokenRequired
 	case "managed":
 		port := int32(3478)
 		if relay.Managed != nil && relay.Managed.Port != 0 {
 			port = relay.Managed.Port
 		}
 		endpoint = managedRelayControlEndpoint(a.podNamespace, port)
+		relayTransport = "tcp"
 	default:
 		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
 	}
@@ -1619,9 +1625,17 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	wgPort := a.wgMgr.ListenPort()
 	a.relayPool = agentrelay.NewPool(endpoint, pubKey, wgPort)
+	a.relayPool.SetProbeAddr(probeAddr)
+	if tokenRequired {
+		tokenFile := os.Getenv("WIREKUBE_RELAY_TOKEN_FILE")
+		if tokenFile == "" {
+			tokenFile = "/var/run/secrets/wirekube-relay/token"
+		}
+		a.relayPool.SetTokenFile(tokenFile)
+	}
 	proxyMode := a.relayProxyMode(ctx)
 	a.relayPool.SetProxyMode(proxyMode)
-	a.log.Info("relay proxy configured", "wgPort", wgPort, "proxyMode", proxyMode)
+	a.log.Info("relay proxy configured", "wgPort", wgPort, "proxyMode", proxyMode, "transport", relayTransport)
 
 	// Inject relay transport into the WG engine BEFORE Connect so that even
 	// if the initial dial fails, the Bind is wired up and ready when the
@@ -1664,6 +1678,73 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 
 	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
 	return nil
+}
+
+type relayDialConfig struct {
+	endpoint      string
+	probeAddr     string
+	transport     string
+	tokenRequired bool
+}
+
+func externalRelayDialConfig(external *wirekubev1alpha1.ExternalRelaySpec) (relayDialConfig, error) {
+	if external == nil || strings.TrimSpace(external.Endpoint) == "" {
+		return relayDialConfig{}, fmt.Errorf("external relay endpoint not configured")
+	}
+
+	transport := strings.ToLower(strings.TrimSpace(external.Transport))
+	if transport == "" {
+		transport = "tcp"
+	}
+	config := relayDialConfig{probeAddr: external.Endpoint, transport: transport}
+
+	switch transport {
+	case "tcp":
+		config.endpoint = external.Endpoint
+		if external.ControlEndpoint != "" {
+			config.endpoint = external.ControlEndpoint
+		}
+		if websocketScheme(config.endpoint) != "" {
+			return relayDialConfig{}, fmt.Errorf("relay transport tcp cannot use WebSocket controlEndpoint %q", config.endpoint)
+		}
+		host, port, err := net.SplitHostPort(config.endpoint)
+		if err != nil {
+			return relayDialConfig{}, fmt.Errorf("relay transport tcp requires a host:port endpoint, got %q: %w", config.endpoint, err)
+		}
+		if host == "" {
+			return relayDialConfig{}, fmt.Errorf("relay transport tcp endpoint %q has no host", config.endpoint)
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return relayDialConfig{}, fmt.Errorf("relay transport tcp endpoint %q has an invalid port", config.endpoint)
+		}
+		return config, nil
+	case "ws", "wss":
+		if strings.TrimSpace(external.ControlEndpoint) == "" {
+			return relayDialConfig{}, fmt.Errorf("relay transport %s requires external.controlEndpoint", transport)
+		}
+		if scheme := websocketScheme(external.ControlEndpoint); scheme != transport {
+			return relayDialConfig{}, fmt.Errorf("relay transport %s requires a %s:// controlEndpoint, got %q", transport, transport, external.ControlEndpoint)
+		}
+		config.endpoint = external.ControlEndpoint
+		config.tokenRequired = true
+		return config, nil
+	default:
+		return relayDialConfig{}, fmt.Errorf("unsupported relay transport %q", external.Transport)
+	}
+}
+
+func websocketScheme(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "ws", "wss":
+		return strings.ToLower(parsed.Scheme)
+	default:
+		return ""
+	}
 }
 
 func (a *Agent) relayProxyMode(ctx context.Context) agentrelay.ProxyMode {

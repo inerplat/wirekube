@@ -16,10 +16,12 @@ Get WireKube running on your Kubernetes cluster in 5 minutes.
 kubectl apply -f config/crd/
 ```
 
-This creates two Custom Resource Definitions:
+This creates four Custom Resource Definitions:
 
 - **WireKubeMesh** — Global mesh configuration (listen port, STUN servers, relay settings)
 - **WireKubePeer** — Per-node peer state (auto-managed by the agent)
+- **WireKubeGateway** — Virtual gateway routes and failover configuration
+- **WireKubeExternalPeer** — Off-cluster WireGuard client authorization and status
 
 ## Step 2: Create a Mesh
 
@@ -64,19 +66,16 @@ spec:
 ## Step 3: Deploy the Agent
 
 ```bash
+kubectl create namespace wirekube-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f config/agent/rbac.yaml
 kubectl apply -f config/agent/daemonset.yaml
 ```
 
-The agent DaemonSet runs on every labeled node with `hostNetwork: true` and
-`dnsPolicy: ClusterFirstWithHostNet` (required for in-cluster DNS resolution).
+The default agent DaemonSet runs on every node except nodes labeled `wirekube.io/proxy-node=true`. It uses `hostNetwork: true`, `dnsPolicy: Default`, userspace WireGuard, and a privileged security context for TUN access.
 
-## Step 4: Label Nodes
+## Step 4: Choose Agent Placement
 
-Only nodes with the `wirekube.io/vpn-enabled=true` label participate in the mesh:
-
-```bash
-kubectl label node <node-name> wirekube.io/vpn-enabled=true
-```
+The current default manifest does not use `wirekube.io/vpn-enabled=true` as a scheduling gate. To restrict participation, add your own node affinity or node selector to `config/agent/daemonset.yaml` before applying it.
 
 ## Step 5: (Optional) Deploy the Relay
 
@@ -84,7 +83,10 @@ For managed relay (in-cluster):
 
 ```bash
 kubectl apply -f config/relay/deployment.yaml
+kubectl apply -f config/relay/example-managed.yaml
 ```
+
+The relay manifest currently contains an EKS-specific `eks.amazonaws.com/nodegroup: relay-ng` node selector. Remove or replace it before applying the manifest to another cluster.
 
 For external relay on a public server:
 
@@ -92,7 +94,7 @@ For external relay on a public server:
 wirekube-relay --addr :3478
 ```
 
-See [Relay Architecture](../architecture/relay.md) for details on relay modes and scaling.
+See [Relay Architecture](../architecture/relay.md) for details on relay modes and scaling. If your cluster cannot provision a public LoadBalancer, or some nodes use an HTTP CONNECT proxy, follow [Relay Entry Points](../guides/relay-entrypoints.md).
 
 ## Step 6: Set AllowedIPs
 
@@ -123,10 +125,10 @@ ping <other-node-ip>
 2. The agent registers itself as a `WireKubePeer` CRD
 3. STUN queries two servers to discover the public endpoint and detect NAT type
 4. If mapped ports differ between STUN servers → Symmetric NAT detected
-5. WireGuard handshakes are attempted with all discovered peers
-6. If handshake times out (or Symmetric NAT detected), relay fallback activates
-7. Routes are added: `<node-ip>/32 dev wire_kube metric 200`
-8. Periodically, the agent re-probes relayed peers for direct connectivity upgrade
+5. When relay is configured, new peers start with relay availability while direct probing runs
+6. Healthy direct receive evidence promotes a peer to direct; failed or stale paths remain on relay
+7. Connected AllowedIPs are installed in routing table `22347`, selected by an IP rule at priority `200`
+8. The agent periodically re-probes relayed peers for direct connectivity
 
 ## Next Steps
 

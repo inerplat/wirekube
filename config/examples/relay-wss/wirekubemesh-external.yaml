@@ -1,0 +1,12 @@
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: default
+spec:
+  relay:
+    mode: auto
+    provider: external
+    external:
+      endpoint: "REPLACE_WITH_RAW_UDP_RELAY:3478"
+      controlEndpoint: "wss://relay.example.com/relay"
+      transport: wss

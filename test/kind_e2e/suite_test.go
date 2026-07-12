@@ -35,6 +35,7 @@
 //	WIREKUBE_E2E_REUSE=1        skip teardown for faster re-runs
 //	WIREKUBE_E2E_SKIP_SETUP=1   skip cluster creation (assume running)
 //	WIREKUBE_E2E_CNI_MODE       "cilium-kube-proxy" (default), "cilium-no-kube-proxy", "flannel", or "calico"
+//	WIREKUBE_E2E_RELAY_TRANSPORT "tcp" (default) or "wss"
 package kind_e2e
 
 import (
@@ -74,6 +75,9 @@ const (
 	cniModeNoKubeProxyVxlan = "cilium-no-kube-proxy"
 	cniModeFlannel          = "flannel"
 	cniModeCalico           = "calico"
+
+	relayTransportTCP = "tcp"
+	relayTransportWSS = "wss"
 )
 
 type nodeConfig struct {
@@ -171,6 +175,13 @@ func cniMode() string {
 	return cniModeKubeProxyVxlan
 }
 
+func relayTransport() string {
+	if transport := os.Getenv("WIREKUBE_E2E_RELAY_TRANSPORT"); transport != "" {
+		return transport
+	}
+	return relayTransportTCP
+}
+
 func skipKubeProxy() bool {
 	return cniMode() == cniModeNoKubeProxyVxlan
 }
@@ -187,6 +198,12 @@ func TestMain(m *testing.M) {
 	ctx := context.Background()
 	code := 1
 	defer func() { os.Exit(code) }()
+
+	if transport := relayTransport(); transport != relayTransportTCP && transport != relayTransportWSS {
+		fmt.Fprintf(os.Stderr, "e2e: unsupported relay transport %q\n", transport)
+		return
+	}
+	fmt.Printf("e2e: relay transport=%s\n", relayTransport())
 
 	if err := os.Chdir(repoRoot()); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: chdir: %v\n", err)

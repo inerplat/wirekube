@@ -59,12 +59,14 @@ nav:
     - Configuration: getting-started/configuration.md
   - Guides:
     - Local Playground: guides/local-playground.md
+    - Relay Entry Points: guides/relay-entrypoints.md
     - EKS Hybrid Nodes: guides/eks-hybrid-nodes.md
     - WSL2 GPU Node: guides/wsl2-gpu-node.md
   - Architecture:
     - Overview: architecture/overview.md
     - NAT Traversal: architecture/nat-traversal.md
     - Relay System: architecture/relay.md
+    - WebSocket Relay: architecture/websocket-relay.md
     - Virtual Gateway: architecture/gateway.md
     - CNI Compatibility: architecture/cni-compatibility.md
   - Operations:

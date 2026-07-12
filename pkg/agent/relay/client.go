@@ -48,6 +48,7 @@ type Client struct {
 	wgPort    int
 	proxyMode ProxyMode
 	proxyURL  *url.URL
+	tokenFile string
 
 	mu      sync.RWMutex
 	conn    net.Conn
@@ -85,6 +86,12 @@ func (c *Client) SetProxyURL(proxyURL *url.URL) {
 	defer c.mu.Unlock()
 	c.proxyMode = ProxyExplicit
 	c.proxyURL = proxyURL
+}
+
+func (c *Client) SetTokenFile(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tokenFile = path
 }
 
 // IsConnected returns whether the relay TCP connection is alive.
@@ -125,8 +132,9 @@ func (c *Client) dial(ctx context.Context) error {
 	c.mu.RLock()
 	proxyMode := c.proxyMode
 	proxyURL := c.proxyURL
+	tokenFile := c.tokenFile
 	c.mu.RUnlock()
-	conn, err := dialRelay(ctx, &dialer, c.relayAddr, proxyMode, proxyURL)
+	conn, err := dialRelay(ctx, &dialer, c.relayAddr, proxyMode, proxyURL, tokenFile)
 	if err != nil {
 		return fmt.Errorf("connecting to relay %s: %w", c.relayAddr, err)
 	}
