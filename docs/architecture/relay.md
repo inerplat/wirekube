@@ -8,21 +8,17 @@ that cannot establish direct P2P connections (Symmetric NAT, restrictive firewal
 ```mermaid
 flowchart LR
     subgraph NodeA["Node A (Symmetric NAT)"]
-        WG1[WireGuard wire_kube]
-        P1[UDP Proxy 127.0.0.1:random]
-        WG1 <--> P1
+        WG1[wireguard-go + WireKubeBind]
     end
     subgraph RelayPool["Relay Pool"]
         R1[relay-0 :3478]
         R2[relay-1 :3478]
     end
     subgraph NodeB["Node B"]
-        P2[UDP Proxy 127.0.0.1:random]
-        WG2[WireGuard wire_kube]
-        P2 <--> WG2
+        WG2[wireguard-go + WireKubeBind]
     end
-    P1 <-->|TCP| RelayPool
-    RelayPool <-->|TCP| P2
+    WG1 <-->|Relay frames over TCP| RelayPool
+    RelayPool <-->|Relay frames over TCP| WG2
 ```
 
 ## Protocol
@@ -46,6 +42,12 @@ All messages are framed with a length prefix:
 | `MsgKeepalive` | `0x03` | (empty) | Keep TCP connection alive (30s interval) |
 | `MsgNATProbe` | `0x04` | 4-byte IPv4 + 2-byte port | Ask relay to send a UDP probe back to the agent — used for port-restriction detection |
 | `MsgBimodalHint` | `0x05` | 32-byte dest pubkey (server rewrites to sender pubkey on forward) | Disco-style asymmetric-failure signal; instructs the destination peer to dual-send on both direct and relay legs |
+| `MsgRelayProbe` | `0x06` | 8-byte token | Measure relay-to-agent responsiveness |
+| `MsgForwarderRegister` | `0x10` | UDP port + ingress key + external key | Legacy external-peer forwarder registration |
+| `MsgForwarderUnregister` | `0x11` | UDP port | Legacy external-peer forwarder removal |
+| `MsgForwarderStats` | `0x12` | UDP port and counters | Legacy forwarder statistics |
+| `MsgIngressProbe` | `0x13` | ingress key list or RTT result list | Probe candidate external-peer ingress agents |
+| `MsgExternalData` | `0x20` | source token + source address + WireGuard payload | Carry shared-listener external-peer traffic |
 | `MsgError` | `0xFF` | Error message string | Relay reports an error |
 
 !!! note "Why a separate hint frame"
@@ -56,7 +58,7 @@ All messages are framed with a length prefix:
     me" request to the peer through the already-warm relay, so failover
     converges within the trust window instead of waiting for the FSM to
     time out the path (~30s). The relay rewrites the body to the sender
-    pubkey so the receiver can authenticate who sent it.
+    pubkey so the receiver can associate the hint with a peer. This is relay-provided identity metadata, not cryptographic proof that the sender owns that WireGuard key.
 
 ### Connection Lifecycle
 
@@ -67,7 +69,6 @@ sequenceDiagram
     Agent->>Relay: TCP connect
     Agent->>Relay: MsgRegister(myPubKey)
     Note over Relay: maps pubkey → conn
-    Relay-->>Agent: ready
     Agent->>Relay: MsgData(destPubKey, payload)
     Note over Relay: lookup destPubKey → forward
     Relay->>Agent: MsgData(srcPubKey, payload)
@@ -86,64 +87,30 @@ The relay client implements automatic reconnection with exponential backoff:
 - **Trigger**: Any read/write error on the TCP connection, or connection close
 - **Behavior**: Sets `connected=false`, closes the old connection, signals reconnect
 - **Registration**: On reconnect, re-sends `MsgRegister` to re-associate the public key
-- **Proxy persistence**: Existing UDP proxies are preserved across reconnections
+- **Path persistence**: Bind relay path state remains configured while clients reconnect
 
 The `connected` state is tracked via `atomic.Bool` for lock-free access from
 the agent's main sync loop.
 
-## Local UDP Proxy
+## Userspace Bind Delivery
 
-Each relayed peer gets a dedicated UDP proxy running on localhost.
+The current agent uses wireguard-go with `WireKubeBind`. Relay packets do not need to be translated through a localhost UDP proxy in the default userspace path.
 
-### Why a Local Proxy?
+### Outbound Path
 
-WireGuard is a kernel-level interface that speaks UDP only. It cannot
-directly use a TCP connection. The proxy bridges this gap:
+`WireKubeBind.Send` selects direct, warm, or relay delivery per peer. On the relay leg it hands the already encrypted WireGuard packet to the relay pool, which writes a `MsgData` frame over TCP.
 
 ```mermaid
 flowchart LR
-    WG[WireGuard kernel] -->|UDP| P[Proxy 127.0.0.1:random]
-    P -->|TCP| R[Relay Pool]
+    WG[wireguard-go] --> B[WireKubeBind]
+    B -->|MsgData over TCP| R[Relay Pool]
 ```
 
-### Socket Strategy
+### Inbound Path
 
-The proxy uses `net.DialUDP` to create a **connected** UDP socket:
+The relay pool parses the incoming frame and invokes Bind delivery with the sender key and encrypted payload. Wireguard-go then authenticates and decrypts the inner WireGuard packet.
 
-```go
-localAddr  := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-remoteAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: wgPort}
-conn, _ := net.DialUDP("udp4", localAddr, remoteAddr)
-```
-
-This gives the proxy a stable local address (e.g., `127.0.0.1:54321`) that
-WireGuard uses as the peer's endpoint. Since the socket is **connected** to
-the WireGuard port, `conn.Write()` uses `write(2)` instead of `sendto(2)`,
-which is important for [Cilium compatibility](cni-compatibility.md).
-
-### Adaptive Write
-
-The proxy implements a two-tier write strategy:
-
-1. **Standard**: `conn.Write(payload)` — uses Go's `net.UDPConn`
-2. **Fallback**: `syscall.Write(dupFD, payload)` — raw syscall on a duplicated fd
-
-If `conn.Write()` returns `EPERM` (e.g., from Cilium BPF hooks), the proxy
-switches to `syscall.Write` mode for all subsequent writes. This is tracked
-via an `atomic.Bool` for lock-free access.
-
-### Sender Interface
-
-The proxy sends data through a `Sender` interface:
-
-```go
-type Sender interface {
-    SendToPeer(destPubKey [32]byte, payload []byte) error
-}
-```
-
-This abstraction allows the proxy to work with either a single `Client` or
-the `Pool`, making the relay layer pluggable.
+The legacy `UDPProxy` implementation remains in the codebase as a fallback for engines without direct Bind delivery, but it is not the normal path of the bundled userspace engine.
 
 ## Relay Pool
 
@@ -201,7 +168,7 @@ metadata:
 spec:
   clusterIP: None
   selector:
-    app: wirekube-relay
+    app.kubernetes.io/name: wirekube-relay
   ports:
     - port: 3478
       targetPort: 3478
@@ -216,22 +183,11 @@ local UDP proxy based on the source WireGuard public key:
 Relay → Pool.handleData(srcKey, payload) → proxies[srcKey].DeliverToWireGuard(payload)
 ```
 
-## Managed Relay Discovery
+## Managed Relay Endpoint
 
-For `provider: managed`, the agent needs to connect to the relay before the mesh
-tunnel is up (chicken-and-egg problem). The agent resolves this by querying the
-Kubernetes Service API for the relay's externally reachable address:
+For `provider: managed`, the agent connects to the headless `wirekube-relay-control.<namespace>.svc.cluster.local` Service. This is the simplest path for nodes with working cluster DNS and service routing.
 
-1. **ExternalIPs** — Manually configured public IPs on the Service
-2. **LoadBalancer Ingress** — Cloud-assigned external IP or hostname
-3. **NodePort** — Service NodePort via a cluster node's public IP (ExternalIP
-   or public InternalIP for cloud providers like OCI)
-
-ClusterIP DNS is intentionally **not** used as a fallback because CoreDNS
-resolution depends on a functioning CNI, which may not be available on
-hybrid/NAT'd nodes before the mesh tunnel is established. If no external address
-is found, the agent retries with exponential backoff until the Service becomes
-externally reachable (e.g., LoadBalancer IP is assigned).
+Nodes that cannot reach that Service during bootstrap must use `provider: external`. Set `external.endpoint` to the relay's public LoadBalancer address or a reachable node IP and NodePort. The relay process is the same; only the agent's entry point changes.
 
 ## Deployment Options
 
@@ -281,8 +237,16 @@ Internet ---- TCP LB :3478 ---- Relay Pod/Server :3478
 The relay's TCP transport was specifically designed to work with TCP-only
 load balancer offerings.
 
+HTTP application load balancers and Kubernetes Ingress controllers generally cannot carry this raw TCP protocol. See [Relay Entry Points](../guides/relay-entrypoints.md) for the recommended LoadBalancer path, the NodePort alternative, and HTTP CONNECT forward-proxy examples.
+
+The proposed [WebSocket Relay Endpoint](websocket-relay.md) adds `wss://.../relay` with Kubernetes-issued bearer-token authentication for ALB and Ingress environments.
+
 ## Capacity
 
-A single relay instance can handle thousands of concurrent connections.
-Each connection is a lightweight TCP socket with minimal CPU overhead —
-the relay only forwards opaque encrypted packets without any decryption.
+Each agent connection is a TCP socket and the relay does not decrypt the inner WireGuard payload. Capacity has not yet been published from a repeatable load-test benchmark, so operators should validate connection and bandwidth limits for their workload.
+
+## Security Boundary
+
+WireGuard payloads remain end-to-end encrypted, but the raw relay TCP stream exposes registered public keys, source/destination relationships, frame types, sizes, timing, NAT probe targets, and external-peer source metadata. The current `MsgRegister` flow does not prove ownership of the supplied WireGuard public key, so a public relay should not be treated as an authenticated control plane.
+
+The optional public HTTP endpoint uses WebSocket over TLS and a Kubernetes-issued bearer token. TLS protects the outer relay stream and server identity; the token authenticates and authorizes the connecting agent. See [WebSocket Relay Endpoint](websocket-relay.md).

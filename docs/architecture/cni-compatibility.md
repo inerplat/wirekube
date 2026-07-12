@@ -6,15 +6,14 @@ with Cilium.
 
 ## Route Isolation
 
-WireKube only adds `/32` routes for node IPs with metric 200:
+WireKube places peer and gateway AllowedIPs in routing table `22347`, selected by an IP rule at priority `200`:
 
 ```
-10.0.0.2/32 dev wire_kube metric 200   <- WireKube
+10.0.0.2/32 dev wire_kube table 22347  <- WireKube
 10.244.0.0/24 dev cilium_host           <- CNI (lower metric = higher priority)
 ```
 
-Pod CIDR routes are **never** inserted through `wire_kube`. This prevents
-conflicts with CNI-managed routing, especially Cilium's kube-proxy replacement.
+Operators should keep mesh and gateway AllowedIPs from overlapping CNI-managed routes unless that routing behavior is intentional.
 
 ## Cilium BPF cgroup Hooks
 
@@ -28,8 +27,7 @@ Cilium attaches eBPF programs to cgroup socket operations:
 | `BPF_CGROUP_UDP4_RECVMSG` | `cil_sock4_recvmsg` | `recvfrom()` / `recvmsg()` |
 
 These hooks implement Cilium's socket-level load balancing for services.
-However, they can intercept UDP packets from the WireKube agent's relay proxy,
-potentially returning `EPERM`.
+The current userspace Bind delivers relay packets directly and normally avoids the legacy localhost UDP proxy. The behavior in this section applies to the retained UDPProxy fallback path and older deployments.
 
 ### When Does This Happen?
 
@@ -44,9 +42,9 @@ The hook does **not** trigger when:
 1. Using `write(2)` on a **connected** UDP socket (no `msg_name`)
 2. The container runs in the host cgroup (some configurations)
 
-### WireKube's Solution
+### Legacy UDPProxy Solution
 
-The relay UDP proxy uses `net.DialUDP` to create a **connected** UDP socket:
+The fallback relay UDP proxy uses `net.DialUDP` to create a **connected** UDP socket:
 
 ```go
 conn, _ := net.DialUDP("udp4", localAddr, remoteAddr)
@@ -115,12 +113,10 @@ WireKube uses `fwmark` 0x574B to prevent WireGuard packet loops:
 # WireGuard marks its own UDP packets with fwmark 0x574B
 # This rule ensures marked packets use the main routing table
 # (bypassing the wire_kube interface)
-ip rule add fwmark 0x574B lookup main priority 100
+ip rule add fwmark 0x574B lookup main priority 110
 ```
 
-Without this, a WireGuard UDP packet destined for a peer's node IP would
-match the `/32` route through `wire_kube`, get encrypted again, creating
-an infinite loop.
+The exact fwmark priority is dynamic: WireKube chooses at least `110`, places it after the current local-table rule, and keeps it below the WireKube table rule at priority `200`. Without this rule, a WireGuard UDP packet destined for a peer AllowedIP could re-enter the tunnel recursively.
 
 ## Tested CNI Plugins
 

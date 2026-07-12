@@ -9,7 +9,7 @@ WireKube establishes a WireGuard mesh VPN across all nodes, enabling:
 - **Encrypted node-to-node connectivity** over WireGuard tunnels
 - **Cross-node pod networking** via Cilium VXLAN over WireGuard
 - **kubectl exec/logs/port-forward** on hybrid nodes (via Virtual Gateway)
-- **Automatic NAT traversal** with STUN + relay fallback
+- **Automatic NAT traversal** with STUN, relay-first availability, and direct-path promotion
 
 ---
 
@@ -59,10 +59,8 @@ graph TB
 
 ### Connection Strategy
 
-1. **Direct P2P** — STUN discovers NAT-mapped endpoints; nodes connect
-   directly when NAT allows it (Cone ↔ Cone, Cone ↔ Symmetric)
-2. **Relay fallback** — After 30s handshake timeout, traffic flows through
-   the TCP relay (WireGuard encryption preserved end-to-end)
+1. **Relay availability** — Agents connect to the TCP relay during startup so a safe path is ready immediately
+2. **Direct promotion** — STUN discovers NAT-mapped endpoints and compatible peers move to direct when receive evidence proves the path
 3. **Birthday attack** — Optional port-prediction for Symmetric ↔ Symmetric
    NAT pairs behind CGNAT
 4. **VGW gateway** — EC2 forwards VPC traffic to hybrid nodes through
@@ -463,10 +461,7 @@ kubectl exec <hybrid-pod-A> -- wget -qO- --timeout=5 http://<hybrid-pod-B-IP>
 
 ### fwmark Design
 
-WireGuard's kernel module marks its own encrypted UDP packets with
-`fwmark 0x574b`. The ip rule at priority 100 sends these to the main
-routing table, preventing them from re-entering the `wire_kube` interface
-(which would create an infinite encryption loop).
+The userspace WireGuard Bind marks encrypted UDP packets with `fwmark 0x574b`. The agent places a dynamic main-table rule after the local-table rule and before priority `200`, preventing marked packets from re-entering the `wire_kube` interface.
 
 ---
 

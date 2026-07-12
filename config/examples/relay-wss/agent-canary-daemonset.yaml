@@ -1,31 +1,25 @@
----
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: wirekube-agent
+  name: wirekube-agent-wss-canary
   namespace: wirekube-system
   labels:
-    app: wirekube-agent
-    app.kubernetes.io/name: wirekube-agent
+    app.kubernetes.io/name: wirekube-agent-wss-canary
     app.kubernetes.io/component: agent
 spec:
   selector:
     matchLabels:
-      app: wirekube-agent
-  updateStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
+      app: wirekube-agent-wss-canary
   template:
     metadata:
       labels:
-        app: wirekube-agent
-        app.kubernetes.io/name: wirekube-agent
+        app: wirekube-agent-wss-canary
+        app.kubernetes.io/name: wirekube-agent-wss-canary
         app.kubernetes.io/component: agent
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
-      dnsPolicy: Default
+      dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: system-node-critical
       tolerations:
         - operator: Exists
@@ -34,24 +28,20 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: wirekube.io/proxy-node
-                    operator: NotIn
+                  - key: wirekube.io/agent-canary
+                    operator: In
                     values:
                       - "true"
                   - key: kubernetes.io/os
                     operator: In
                     values:
                       - linux
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app: wirekube-agent-proxy
-              topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: ncloud-registry
       containers:
         - name: agent
-          image: inerplat/wirekube:v0.0.8-dev.15
+          image: inerplat/wirekube:v0.0.0-dev.14
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
@@ -69,28 +59,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: WIREKUBE_INTERFACE
-              value: "wire_kube"
+              value: wire_kube
             - name: WIREKUBE_RELAY_TOKEN_FILE
               value: /var/run/secrets/wirekube-relay/token
-            # Do not put HTTP_PROXY/HTTPS_PROXY here for clusters where only a
-            # subset of nodes needs egress proxying. Label those nodes with
-            # wirekube.io/proxy-node=true and deploy the dedicated proxy-node
-            # example manifest instead.
-            #
-            # Bootstrap-only Kubernetes API override for nodes that cannot reach
-            # the in-cluster Service IP before WireKube routes exist:
-            # - name: WIREKUBE_KUBE_APISERVER
-            #   value: "https://YOUR_KUBE_APISERVER_ENDPOINT"
           securityContext:
-            # privileged is required to open /dev/net/tun on Ubuntu 24.04+
-            # hosts where containerd's default device cgroup denies TUN
-            # write even with CAP_NET_ADMIN. Older distros with permissive
-            # device cgroups could get by with capabilities alone, but the
-            # userspace engine needs the TUN device on every node so we
-            # enable privileged here.
             privileged: true
-            # Unconfined AppArmor: the default containerd profile denies
-            # TUN-related operations on Ubuntu 24.04.
             appArmorProfile:
               type: Unconfined
             capabilities:
@@ -107,11 +80,11 @@ spec:
               readOnly: true
           resources:
             limits:
-              cpu: 200m
-              memory: 256Mi
+              cpu: "1"
+              memory: 1Gi
             requests:
-              cpu: 10m
-              memory: 64Mi
+              cpu: 50m
+              memory: 128Mi
       volumes:
         - name: wireguard-keys
           hostPath:

@@ -131,7 +131,11 @@ test:
 #   WIREKUBE_E2E_CNI_MODE=cilium-no-kube-proxy   # Cilium kube-proxy replacement + vxlan
 .PHONY: kind-e2e
 kind-e2e:
-	$(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+	WIREKUBE_E2E_RELAY_TRANSPORT=tcp $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
+
+.PHONY: kind-e2e-wss
+kind-e2e-wss:
+	WIREKUBE_E2E_RELAY_TRANSPORT=wss $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
 
 .PHONY: kind-e2e-flannel
 kind-e2e-flannel:
@@ -176,6 +180,7 @@ help:
 	@echo "  init-mesh          Create default WireKubeMesh"
 	@echo "  test               Run unit tests"
 	@echo "  kind-e2e           Run kind-based e2e tests (Cilium CNI, no kind CLI needed)"
+	@echo "  kind-e2e-wss       Run kind-based e2e tests through the WSS relay gateway"
 	@echo "  kind-e2e-flannel   Run kind-based e2e tests with Flannel CNI"
 	@echo "  kind-e2e-calico    Run kind-based e2e tests with Calico CNI"
 	@echo "  kind-e2e-all       Run e2e in all CNI modes (Cilium + Flannel + Calico)"

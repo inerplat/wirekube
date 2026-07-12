@@ -2,7 +2,7 @@
 
 **Connect Kubernetes nodes across any network — no VPN server required.**
 
-WireKube builds a WireGuard mesh between your Kubernetes nodes using only CRDs for coordination. It automatically handles NAT traversal, falls back to TCP relay when direct P2P isn't possible, and preserves WireGuard's end-to-end encryption throughout.
+WireKube builds a WireGuard mesh between your Kubernetes nodes using CRDs for coordination. It keeps a relay path available when configured, probes direct connectivity, and preserves WireGuard payload encryption across both paths.
 
 The NAT traversal design draws from [Tailscale's architecture](https://tailscale.com/blog/how-nat-traversal-works): relay-first for immediate connectivity, parallel direct path probing, and transparent upgrade when a better path is found.
 
@@ -43,10 +43,10 @@ flowchart LR
 | Feature | Description |
 |---------|-------------|
 | **No coordination server** | Kubernetes CRDs are the only control plane — no external dependencies |
-| **Automatic NAT traversal** | STUN discovery → direct P2P → TCP relay fallback, fully automatic |
+| **Automatic NAT traversal** | STUN discovery + relay-first availability + direct-path promotion |
 | **Direct path recovery** | Periodically re-probes relayed peers and upgrades to direct when possible |
 | **Virtual Gateway** | Cross-VPC routing with HA failover via `WireKubeGateway` CRD |
-| **CNI compatible** | Routes only node IPs (`/32`); never touches pod CIDRs |
+| **CNI aware** | Uses an isolated routing table; mesh and gateway AllowedIPs must not conflict with CNI routes |
 | **Relay pool scaling** | DNS-based multi-instance relay discovery with automatic failover |
 | **Prometheus metrics** | Peer latency, traffic, connection state, transport mode on `:9090/metrics` |
 | **Multi-arch** | `linux/amd64` and `linux/arm64` |

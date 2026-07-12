@@ -25,6 +25,8 @@ type Pool struct {
 	wgPort    int
 	proxyMode ProxyMode
 	proxyURL  *url.URL
+	tokenFile string
+	probeAddr string
 
 	mu      sync.RWMutex
 	clients map[string]*Client // keyed by resolved IP:port
@@ -89,6 +91,21 @@ func (p *Pool) SetProxyURL(proxyURL *url.URL) {
 	for _, c := range p.clients {
 		c.SetProxyURL(proxyURL)
 	}
+}
+
+func (p *Pool) SetTokenFile(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokenFile = path
+	for _, c := range p.clients {
+		c.SetTokenFile(path)
+	}
+}
+
+func (p *Pool) SetProbeAddr(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.probeAddr = addr
 }
 
 // Connect resolves the relay address and connects to all discovered endpoints.
@@ -241,6 +258,12 @@ func (p *Pool) SendNATProbe(ip net.IP, port int) error {
 func (p *Pool) RelayIP() string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.probeAddr != "" {
+		host, _, err := net.SplitHostPort(p.probeAddr)
+		if err == nil {
+			return host
+		}
+	}
 	for addr := range p.clients {
 		host, _, err := net.SplitHostPort(addr)
 		if err == nil {
@@ -411,6 +434,7 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 	p.mu.RLock()
 	proxyMode := p.proxyMode
 	proxyURL := p.proxyURL
+	tokenFile := p.tokenFile
 	p.mu.RUnlock()
 
 	c := NewClient(addr, p.myPubKey, p.wgPort)
@@ -419,6 +443,7 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 	} else {
 		c.SetProxyMode(proxyMode)
 	}
+	c.SetTokenFile(tokenFile)
 	c.onData = p.handleData
 	c.onExternal = p.handleExternalData
 	c.onHint = p.handleHint
@@ -445,6 +470,9 @@ func (p *Pool) connectOne(ctx context.Context, addr string) error {
 // only return private RFC-1918 IPs — if the resolved IPs are all public, the
 // caller falls back to the raw hostname (a single connection).
 func (p *Pool) resolve() []string {
+	if parsed, err := url.Parse(p.relayAddr); err == nil && (parsed.Scheme == "ws" || parsed.Scheme == "wss") {
+		return nil
+	}
 	host, port, err := net.SplitHostPort(p.relayAddr)
 	if err != nil {
 		return nil

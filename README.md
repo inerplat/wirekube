@@ -2,7 +2,7 @@
 
 **Connect Kubernetes nodes across any network — no VPN server required.**
 
-WireKube builds a WireGuard mesh between your Kubernetes nodes using only CRDs for coordination. It automatically handles NAT traversal, falls back to TCP relay when direct P2P isn't possible, and preserves WireGuard's end-to-end encryption throughout.
+WireKube builds a WireGuard mesh between your Kubernetes nodes using CRDs for coordination. It keeps a relay path available when configured, probes direct connectivity, and preserves WireGuard payload encryption across both paths.
 
 **[Documentation](https://inerplat.github.io/wirekube/)**
 
@@ -47,10 +47,12 @@ No coordination server, no external etcd, no control plane beyond the Kubernetes
 ```bash
 # 1. Install CRDs and create default mesh configuration
 kubectl apply -f config/crd/
-kubectl apply -f config/wirekubemesh-default.yaml
+kubectl apply -f config/examples/wirekubemesh-basic.yaml
 
-# 2. Deploy the agent DaemonSet
-kubectl apply -f config/agent/
+# 2. Create the namespace, RBAC, and agent DaemonSet
+kubectl create namespace wirekube-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f config/agent/rbac.yaml
+kubectl apply -f config/agent/daemonset.yaml
 
 # 3. Verify
 kubectl get wirekubepeers -o wide
@@ -87,9 +89,9 @@ See the [Quick Start guide](https://inerplat.github.io/wirekube/getting-started/
 | **Bimodal warm-relay datapath** | Direct + relay legs duplicated when the direct path is unproven; WireGuard replay window dedupes. Blackouts are bounded by a 3s trust window, not control-plane sync |
 | **Disco-style failover hints** | On stale receive, a `BimodalHint` is relayed to the peer so asymmetric UDP blackholes recover within one trust window instead of ~30s |
 | **NAT type detection** | `open` / `cone` / `port-restricted-cone` / `symmetric` — public-IP-on-NIC hosts skip traversal entirely |
-| **Automatic NAT traversal** | STUN discovery → direct P2P → TCP relay fallback, fully automatic |
+| **Automatic NAT traversal** | STUN discovery + relay-first availability + direct-path promotion |
 | **Virtual Gateway** | Cross-VPC routing with HA failover via `WireKubeGateway` CRD |
-| **CNI compatible** | Routes only node IPs (`/32`); never touches pod CIDRs |
+| **CNI aware** | Uses an isolated routing table; operators must keep mesh and gateway AllowedIPs from conflicting with CNI routes |
 | **Relay pool scaling** | DNS-based multi-instance relay discovery with automatic failover |
 | **Prometheus metrics** | Peer latency, traffic, connection state, transport mode on `:9090/metrics` |
 
@@ -98,9 +100,9 @@ See the [Quick Start guide](https://inerplat.github.io/wirekube/getting-started/
 | Component | Runs as | Purpose |
 |-----------|---------|---------|
 | **Agent** | DaemonSet (`hostNetwork: true`) | Manages WireGuard interface, discovers endpoints, syncs peers, handles relay failover |
-| **Operator** | Deployment | Reconciles `WireKubeMesh` and `WireKubePeer` CRDs, manages defaults |
 | **Relay** | Deployment + Service | Bridges WireGuard UDP over TCP when NAT blocks direct P2P |
 | **wirekubectl** | CLI | Status inspection and peer management |
+| **Admin web** | Relay sidecar | Manages external peers through the Kubernetes API |
 
 For details on NAT traversal, routing design, and the relay protocol, see the [Architecture documentation](https://inerplat.github.io/wirekube/architecture/overview/).
 
@@ -113,7 +115,7 @@ For details on NAT traversal, routing design, and the relay protocol, see the [A
 | **Fully open-source** | Yes | Client only | Yes | Yes |
 | **CNI dependency** | None (works with any CNI) | None | Requires specific CNI | Requires Cilium |
 | **Scope** | K8s node-to-node mesh | All devices, any OS | K8s multi-cluster | K8s multi-cluster |
-| **External infra** | None required | Tailscale account | Broker cluster | Shared etcd |
+| **External infra** | Kubernetes API; relay required for paths without direct reachability | Tailscale account | Broker cluster | Shared etcd |
 
 **WireKube** is a good fit when you want a lightweight, Kubernetes-native node mesh without external dependencies. **Tailscale** is better if you need to connect non-Kubernetes devices or want a managed service. **Submariner** and **Cilium ClusterMesh** are designed for full multi-cluster service discovery, which is a broader scope than WireKube's node-level connectivity.
 

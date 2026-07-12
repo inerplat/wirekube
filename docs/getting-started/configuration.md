@@ -45,19 +45,20 @@ spec:
 | `spec.stunServers` | []string | - | STUN servers for endpoint discovery. **Minimum 2 required** for Symmetric NAT detection (RFC 5780). |
 | `spec.relay.mode` | string | `auto` | `auto`, `always`, or `never` |
 | `spec.relay.provider` | string | - | `external` or `managed` |
-| `spec.relay.handshakeTimeoutSeconds` | int | `30` | Seconds to wait for direct handshake before relay fallback |
+| `spec.relay.handshakeTimeoutSeconds` | int | `30` | Retained API field. The current PathMonitor-based relay-first flow does not consume this value after initialization. |
 | `spec.relay.directRetryIntervalSeconds` | int | `120` | How often to retry direct connection after falling back to relay |
 | `spec.relay.external.endpoint` | string | - | External relay server address (`host:port`) |
-| `spec.relay.external.transport` | string | `tcp` | Relay transport protocol |
-| `spec.relay.managed.replicas` | int | `1` | Number of relay pods |
-| `spec.relay.managed.serviceType` | string | `LoadBalancer` | Kubernetes Service type for the relay |
+| `spec.relay.external.controlEndpoint` | string | - | Agent-facing endpoint. Required as a `ws://` or `wss://` URL when the selected transport is WebSocket. |
+| `spec.relay.external.transport` | string | `tcp` | Selects exactly one agent transport: `tcp`, `ws`, or `wss`. |
+| `spec.relay.managed.replicas` | int | `1` | Desired relay replicas in the API shape. The current agent does not provision or scale the Deployment from this field. |
+| `spec.relay.managed.serviceType` | string | `LoadBalancer` | Desired Service type in the API shape. The current agent does not create or mutate the Service from this field. |
 | `spec.relay.managed.port` | int | `3478` | Relay service port |
 
 ### Relay Modes
 
 | Mode | Behavior |
 |------|----------|
-| `auto` | Try direct P2P first; fall back to relay after `handshakeTimeoutSeconds`. Periodically re-probe direct. |
+| `auto` | Connect relay-first for immediate reachability, probe the direct path, and promote peers to direct when receive evidence is healthy. Periodically re-probe direct after demotion. |
 | `always` | Always use relay (useful for testing or highly restrictive networks) |
 | `never` | Never use relay; only direct P2P |
 
@@ -65,8 +66,8 @@ spec:
 
 | Provider | Description |
 |----------|-------------|
-| `external` | User-provided relay endpoint. Agent connects to the configured `external.endpoint`. |
-| `managed` | Relay deployed as Deployment + Service in the cluster. Agent auto-discovers the Service's external address (ExternalIP → LB Ingress → NodePort) so NAT'd nodes can connect without relying on CNI tunnels. Does **not** fall back to ClusterIP DNS. |
+| `external` | User-provided relay endpoint. The agent selects `external.endpoint` or `external.controlEndpoint` according to `external.transport`. |
+| `managed` | Relay deployed separately in the cluster. Agents connect through the cluster-local `wirekube-relay-control` Service; WireKube does not currently create the Deployment or Service from the CR. Use `external` with a public LB, NodePort, or WSS endpoint when cluster DNS/service routing is unavailable during bootstrap. |
 
 ## Node Labels and Annotations
 
@@ -74,7 +75,7 @@ spec:
 
 | Label | Description |
 |-------|-------------|
-| `wirekube.io/vpn-enabled=true` | Node participates in the mesh |
+| `wirekube.io/proxy-node=true` | Excludes the node from the standard DaemonSet and selects it for the dedicated HTTP-proxy DaemonSet example. |
 
 ### Annotations
 
@@ -85,7 +86,6 @@ spec:
 Example:
 
 ```bash
-kubectl label node my-node wirekube.io/vpn-enabled=true
 kubectl annotate node my-node wirekube.io/endpoint="203.0.113.5:51820"
 ```
 
@@ -99,10 +99,13 @@ kubectl annotate node my-node wirekube.io/endpoint="203.0.113.5:51820"
 
 ### Security Context
 
-The agent requires two capabilities:
+The bundled userspace-WireGuard DaemonSet uses the following security context:
 
 ```yaml
 securityContext:
+  privileged: true
+  appArmorProfile:
+    type: Unconfined
   capabilities:
     add: ["NET_ADMIN", "SYS_MODULE"]
 ```
@@ -110,22 +113,19 @@ securityContext:
 - **NET_ADMIN** — Create/delete WireGuard interfaces, manage routes and routing rules
 - **SYS_MODULE** — Load the `wireguard` kernel module if not already loaded
 
-`privileged: true` is **not required**.
+`privileged: true` is currently enabled because common Ubuntu 24.04 and containerd configurations deny `/dev/net/tun` access with capabilities alone.
 
 ### DNS Policy
 
-The DaemonSet uses `dnsPolicy: ClusterFirstWithHostNet`. Since the agent runs with
-`hostNetwork: true`, this setting ensures it can resolve cluster-internal DNS names
-for Kubernetes API and other services.
+The bundled DaemonSet currently uses `dnsPolicy: Default`. If `provider: managed` is used, the node resolver must be able to resolve `wirekube-relay-control.<namespace>.svc.cluster.local`; otherwise change the policy to `ClusterFirstWithHostNet` or use an externally reachable relay endpoint.
 
-### initContainer Cleanup
+### Cleanup and Reconciliation
 
-The DaemonSet includes an `initContainer` that cleans up stale state from previous
-agent runs (crashes, reboots):
+The default DaemonSet does not include an initContainer. During graceful shutdown the agent removes the relay clients, routes, routing rules, and TUN interface. During startup and periodic sync it recreates or repairs required interface and routing state.
 
-- Removes the `wire_kube` interface if it exists
-- Flushes the WireKube routing table (`22347` / `0x574B`)
-- Removes stale `ip rule` entries for the WireKube fwmark
+- Graceful shutdown removes the `wire_kube` interface and WireKube routes
+- Routing rule reconciliation repairs missing or stale rules
+- The separate cleanup Job is available for abandoned node state
 
 ### IPSec xfrm Bypass
 
