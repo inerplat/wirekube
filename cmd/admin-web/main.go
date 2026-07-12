@@ -35,9 +35,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/externalpeer"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/externalpeer"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 const (

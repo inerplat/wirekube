@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 func cleanupTestScheme(t *testing.T) *runtime.Scheme {

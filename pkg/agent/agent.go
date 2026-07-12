@@ -17,12 +17,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/wirekube/wirekube/pkg/agent/nat"
-	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/meship"
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	"github.com/inerplat/wirekube/pkg/agent/nat"
+	agentrelay "github.com/inerplat/wirekube/pkg/agent/relay"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/meship"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 // Agent is the per-node WireKube daemon.
@@ -1383,7 +1383,12 @@ func (a *Agent) driveTransportMode(
 		if peer == nil || peer.Spec.PublicKey == "" {
 			continue
 		}
-		mode := a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false)
+		var mode PathMode
+		if a.relayMode == relayModeAlways {
+			mode = a.pathMonitor.ForceRelay(name, peer.Spec.PublicKey)
+		} else {
+			mode = a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false)
+		}
 		directAddr := peer.Spec.Endpoint
 		if ep, ok := a.directEndpoints[name]; ok && ep != "" {
 			directAddr = ep

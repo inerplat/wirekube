@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 func TestFilterRoutesForConnectedPeersKeepsRelayBootstrapRoutes(t *testing.T) {

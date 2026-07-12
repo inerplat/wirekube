@@ -12,7 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/wirekube/wirekube/pkg/agent/nat"
+	"github.com/inerplat/wirekube/pkg/agent/nat"
 )
 
 // DiscoveryMethod records how an endpoint was found.

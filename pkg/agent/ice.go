@@ -12,9 +12,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/wirekube/wirekube/pkg/agent/nat"
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	"github.com/inerplat/wirekube/pkg/agent/nat"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 

@@ -12,8 +12,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 func TestRelayTransportConfigured(t *testing.T) {
@@ -48,6 +49,86 @@ func TestRelayTransportConfigured(t *testing.T) {
 		}
 		return deployment.Status.ReadyReplicas == 1
 	}, 2*time.Minute, pollInterval, "WSS relay gateway should be ready")
+
+	peers := waitForPeers(ctx, t, len(nodeConfigs))
+	restoreMode := patchMeshRelayMode(ctx, t, "always")
+	defer restoreMode()
+	waitForRelayDataPlane(ctx, t, peers[0], peers[1], relayTimeout)
+}
+
+func waitForRelayDataPlane(ctx context.Context, t *testing.T, subject, remote string, timeout time.Duration) {
+	t.Helper()
+	remoteIP := nodeIPForPeer(t, remote)
+
+	eventually(t, func() bool {
+		mode := connectionMode(ctx, t, subject, remote)
+		if mode != "relay" {
+			t.Logf("%s → %s = %q, waiting for relay", subject, remote, mode)
+			return false
+		}
+
+		pod := agentPodForNode(ctx, t, subject)
+		out, err := execInPod(ctx, t, pod, "agent", []string{"ping", "-c", "2", "-W", "2", remoteIP})
+		if err != nil {
+			t.Logf("relay ping %s→%s: %v (%s)", subject, remote, err, out)
+			return false
+		}
+		t.Logf("relay data plane %s→%s is healthy", subject, remote)
+		return true
+	}, timeout, pollInterval, subject+" → "+remote+" should pass traffic over relay")
+}
+
+func relayEntrypointDeployment() string {
+	if relayTransport() == relayTransportWSS {
+		return "wirekube-relay-ws"
+	}
+	return "wirekube-relay"
+}
+
+func scaleRelayEntrypoint(ctx context.Context, t *testing.T, replicas int32) func() {
+	t.Helper()
+	name := relayEntrypointDeployment()
+	key := types.NamespacedName{Namespace: agentNamespace, Name: name}
+
+	var deployment appsv1.Deployment
+	if err := k8sClient.Get(ctx, key, &deployment); err != nil {
+		t.Fatalf("get relay entrypoint deployment %s: %v", name, err)
+	}
+	originalReplicas := int32(1)
+	if deployment.Spec.Replicas != nil {
+		originalReplicas = *deployment.Spec.Replicas
+	}
+
+	setReplicas := func(value int32) error {
+		var current appsv1.Deployment
+		if err := k8sClient.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		patch := client.MergeFrom(current.DeepCopy())
+		current.Spec.Replicas = &value
+		return k8sClient.Patch(ctx, &current, patch)
+	}
+	if err := setReplicas(replicas); err != nil {
+		t.Fatalf("scale relay entrypoint deployment %s to %d: %v", name, replicas, err)
+	}
+
+	eventually(t, func() bool {
+		var current appsv1.Deployment
+		if err := k8sClient.Get(ctx, key, &current); err != nil {
+			t.Logf("get relay entrypoint deployment %s: %v", name, err)
+			return false
+		}
+		if replicas == 0 {
+			return current.Status.Replicas == 0
+		}
+		return current.Status.ReadyReplicas == replicas
+	}, 2*time.Minute, pollInterval, fmt.Sprintf("relay entrypoint deployment %s should have %d ready replicas", name, replicas))
+
+	return func() {
+		if err := setReplicas(originalReplicas); err != nil {
+			t.Logf("warning: restore relay entrypoint deployment %s to %d replicas: %v", name, originalReplicas, err)
+		}
+	}
 }
 
 func resetTransportState(ctx context.Context, t *testing.T) []string {
@@ -664,29 +745,27 @@ func TestRelayReconnect(t *testing.T) {
 
 	restoreMode := patchMeshRelayMode(ctx, t, "always")
 	defer restoreMode()
+	waitForRelayDataPlane(ctx, t, subject, remote, relayTimeout)
+	unblock := blockWireGuardUDP(t, subject)
+	defer unblock()
 
-	eventually(t, func() bool {
-		return connectionMode(ctx, t, subject, remote) == "relay"
-	}, relayTimeout, pollInterval, subject+" → "+remote+" should be relay")
-
-	original := relayEndpointFromMesh(ctx, t)
-	if original == "" {
-		t.Skip("no external relay endpoint")
-	}
-
-	setRelayEndpoint(ctx, t, "127.0.0.1:19999")
-	defer setRelayEndpoint(ctx, t, original)
+	restoreEntrypoint := scaleRelayEntrypoint(ctx, t, 0)
+	defer restoreEntrypoint()
 
 	t.Log("relay broken — waiting 15s…")
 	time.Sleep(15 * time.Second)
 
-	setRelayEndpoint(ctx, t, original)
-
+	restoreEntrypoint()
 	eventually(t, func() bool {
-		mode := connectionMode(ctx, t, subject, remote)
-		t.Logf("%s → %s = %q", subject, remote, mode)
-		return mode == "relay" || mode == "direct"
-	}, 3*time.Minute, pollInterval, "should recover after relay restore")
+		var deployment appsv1.Deployment
+		name := relayEntrypointDeployment()
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: agentNamespace, Name: name}, &deployment); err != nil {
+			t.Logf("get relay entrypoint deployment %s: %v", name, err)
+			return false
+		}
+		return deployment.Status.ReadyReplicas == 1
+	}, 2*time.Minute, pollInterval, "relay entrypoint should become ready after restore")
+	waitForRelayDataPlane(ctx, t, subject, remote, 3*time.Minute)
 	t.Log("relay reconnect recovery confirmed")
 
 	restoreMode()

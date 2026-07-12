@@ -9,7 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
+	agentrelay "github.com/inerplat/wirekube/pkg/agent/relay"
 )
 
 func TestRelayProxyModeFromNodeAnnotation(t *testing.T) {

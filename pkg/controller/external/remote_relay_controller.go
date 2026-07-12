@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wirekube/wirekube/pkg/relay"
+	"github.com/inerplat/wirekube/pkg/relay"
 )
 
 // RemoteRelayController is a RelayController that talks to a relay over

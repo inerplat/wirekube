@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wirekube/wirekube/pkg/relay/portalloc"
+	"github.com/inerplat/wirekube/pkg/relay/portalloc"
 )
 
 // recordingDispatcher captures every Dispatch call. Tests assert on the

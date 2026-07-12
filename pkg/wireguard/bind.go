@@ -700,8 +700,8 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 				dst = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
 			}
 			eps[0] = &WireKubeEndpoint{
-				dst:     dst,
-				peerKey: pkt.SrcKey,
+				dst:          dst,
+				relayPeerKey: relayPeerKey{peerKey: pkt.SrcKey},
 			}
 			return 1, nil
 		case <-b.relayClose:

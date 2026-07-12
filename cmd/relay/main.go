@@ -8,7 +8,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/wirekube/wirekube/pkg/relay"
+	"github.com/inerplat/wirekube/pkg/relay"
 )
 
 func main() {

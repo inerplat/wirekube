@@ -16,7 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/net/http/httpproxy"
 
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 var relayProxyFromEnvironment = proxyURLFromEnvironment

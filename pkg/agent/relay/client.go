@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 var clientDebug = os.Getenv("WIREKUBE_BIND_DEBUG") == "1"

@@ -201,8 +201,9 @@ spec:
                         type: string
                       endpoint:
                         description: |-
-                          Endpoint is the relay server address (host:port).
+                          Endpoint is the raw WireGuard UDP address advertised to external peers.
                           Example: "relay.example.com:3478" or "203.0.113.10:3478"
+                          Leave empty when no UDP entrypoint is available; external peers remain Pending.
                         type: string
                       transport:
                         default: tcp
@@ -214,8 +215,6 @@ spec:
                         - ws
                         - wss
                         type: string
-                    required:
-                    - endpoint
                     type: object
                   handshakeTimeoutSeconds:
                     default: 30
@@ -291,7 +290,7 @@ spec:
                     description: |-
                       Provider selects how the relay server is provisioned.
                       "external": user provides a pre-existing relay endpoint (public IP server, third-party).
-                      "managed": operator deploys and manages the relay as a Pod + LoadBalancer Service.
+                      "managed": the installation owner provisions the relay resources and agents use the cluster-local control Service.
                     enum:
                     - external
                     - managed
