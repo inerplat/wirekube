@@ -1,63 +1,202 @@
-name: Build and Push Image
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 env:
-  REGISTRY: docker.io
   IMAGE_NAME: inerplat/wirekube
+  E2E_IMAGE: inerplat/wirekube:release-${{ github.sha }}
 
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Check module files
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l .)
+          test -z "$files" || { echo "$files"; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1
+
+      - name: Unit tests
+        run: go test $(go list ./... | grep -v /test/e2e) -count=1
+
+      - name: Build commands
+        run: |
+          CGO_ENABLED=0 go build ./cmd/agent ./cmd/relay ./cmd/relay-ws ./cmd/wirekubectl
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -o /tmp/wirekubectl-$os-$arch ./cmd/wirekubectl
+          done
+
+  build-e2e-image:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build test image
+        run: docker build -t ${{ env.E2E_IMAGE }} .
+
+      - name: Save test image
+        run: docker save ${{ env.E2E_IMAGE }} -o /tmp/wirekube-release-e2e.tar
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wirekube-release-e2e-image
+          path: /tmp/wirekube-release-e2e.tar
+          retention-days: 1
+
+  e2e:
+    needs: build-e2e-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cni-mode: [cilium-kube-proxy, cilium-no-kube-proxy, flannel, calico]
+        relay-transport: [tcp, wss]
+        include:
+          - cni-mode: cilium-kube-proxy
+            need-helm: true
+          - cni-mode: cilium-no-kube-proxy
+            need-helm: true
+          - cni-mode: flannel
+            need-helm: false
+          - cni-mode: calico
+            need-helm: false
+    name: e2e (${{ matrix.cni-mode }}, ${{ matrix.relay-transport }})
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install helm
+        if: matrix.need-helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - run: docker pull kindest/node:v1.34.0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wirekube-release-e2e-image
+          path: /tmp
+
+      - run: docker load -i /tmp/wirekube-release-e2e.tar
+
+      - name: Run E2E
+        run: |
+          WIREKUBE_IMAGE=${{ env.E2E_IMAGE }} \
+          WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
+          WIREKUBE_E2E_RELAY_TRANSPORT=${{ matrix.relay-transport }} \
+          go test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m
+
+  publish-image:
+    needs: e2e
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract tag
-        id: meta
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
+      - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  test:
+  release-cli:
+    needs: publish-image
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - name: Vet
-        run: go vet ./...
+      - name: Build wirekubectl release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ needs.publish-image.outputs.digest }}
+        run: |
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ldflags="-s -w -X github.com/inerplat/wirekube/internal/version.Version=${VERSION} -X github.com/inerplat/wirekube/internal/version.Commit=${COMMIT} -X github.com/inerplat/wirekube/internal/version.BuildDate=${build_date} -X github.com/inerplat/wirekube/internal/version.DefaultImage=${IMAGE_NAME}@${IMAGE_DIGEST}"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$ldflags" -o dist/wirekubectl-darwin-arm64 ./cmd/wirekubectl
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-darwin-amd64 ./cmd/wirekubectl
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-linux-amd64 ./cmd/wirekubectl
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$ldflags" -o dist/wirekubectl-linux-arm64 ./cmd/wirekubectl
+          python3 - <<PY
+          import json
+          from pathlib import Path
+          Path("dist/wirekube-release.json").write_text(json.dumps({
+              "schemaVersion": "v1alpha1",
+              "version": "${VERSION}",
+              "commit": "${COMMIT}",
+              "buildDate": "${build_date}",
+              "image": "${IMAGE_NAME}@${IMAGE_DIGEST}",
+          }, indent=2) + "\n")
+          PY
+          cd dist
+          sha256sum wirekubectl-* wirekube-release.json > wirekubectl-checksums.txt
 
-      - name: Test
-        run: go test $(go list ./... | grep -v /test/e2e) -v
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/wirekubectl-darwin-arm64
+            dist/wirekubectl-darwin-amd64
+            dist/wirekubectl-linux-amd64
+            dist/wirekubectl-linux-arm64
+            dist/wirekubectl-checksums.txt
+            dist/wirekube-release.json

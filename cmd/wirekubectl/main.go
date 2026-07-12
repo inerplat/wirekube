@@ -14,35 +14,90 @@ import (
 
 	qrcode "github.com/skip2/go-qrcode"
 	"github.com/spf13/cobra"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/yaml"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/externalpeer"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	internalconfig "github.com/inerplat/wirekube/internal/kubeconfig"
+	internalversion "github.com/inerplat/wirekube/internal/version"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/externalpeer"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 var scheme = runtime.NewScheme()
 
+type globalOptions struct {
+	kubeconfig string
+	context    string
+	namespace  string
+	timeout    time.Duration
+	output     string
+	client     func() (client.Client, error)
+}
+
+var options = &globalOptions{}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	utilruntime.Must(wirekubev1alpha1.AddToScheme(scheme))
-	ctrl.SetLogger(zap.New(zap.WriteTo(os.Stderr)))
 }
 
 func main() {
-	root := &cobra.Command{
-		Use:   "wirekubectl",
-		Short: "WireKube CLI — manage your Kubernetes WireGuard mesh",
+	root := newRootCommand()
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		if options.output == "json" {
+			_ = writeJSON(os.Stderr, map[string]any{
+				"schemaVersion": "v1alpha1",
+				"error": map[string]string{
+					"code":    "command_failed",
+					"message": err.Error(),
+				},
+			})
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		os.Exit(1)
 	}
+}
+
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "wirekubectl",
+		Short:         "Manage and install WireKube",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			switch options.output {
+			case "text", "json":
+				return nil
+			default:
+				return fmt.Errorf("unsupported output format %q: use text or json", options.output)
+			}
+		},
+	}
+	root.PersistentFlags().StringVar(&options.kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
+	root.PersistentFlags().StringVar(&options.context, "context", "", "kubeconfig context to use")
+	root.PersistentFlags().StringVar(&options.namespace, "namespace", "wirekube-system", "namespace for WireKube workloads")
+	root.PersistentFlags().DurationVar(&options.timeout, "timeout", 5*time.Minute, "timeout for Kubernetes operations")
+	root.PersistentFlags().StringVar(&options.output, "output", "text", "output format: text or json")
 
 	root.AddCommand(
+		versionCmd(),
+		installCmd(),
+		statusCmd(),
+		doctorCmd(),
+		upgradeCmd(),
+		uninstallCmd(),
+		manifestCmd(),
 		meshCmd(),
 		peersCmd(),
 		exportCmd(),
@@ -52,19 +107,47 @@ func main() {
 		inviteCmd(),
 		revokeCmd(),
 	)
-
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return root
 }
 
 func k8sClient() (client.Client, error) {
-	return client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if options.client != nil {
+		return options.client()
+	}
+	factory := internalconfig.New(internalconfig.Options{
+		Kubeconfig: options.kubeconfig,
+		Context:    options.context,
+		Namespace:  options.namespace,
+		Timeout:    options.timeout,
+	}, scheme)
+	return factory.Client()
+}
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Show wirekubectl build information",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			info := internalversion.Current()
+			if options.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), info)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Version:       %s\n", info.Version)
+			fmt.Fprintf(cmd.OutOrStdout(), "Commit:        %s\n", info.Commit)
+			fmt.Fprintf(cmd.OutOrStdout(), "Build date:    %s\n", info.BuildDate)
+			fmt.Fprintf(cmd.OutOrStdout(), "Default image: %s\n", valueOrDash(info.DefaultImage))
+			return nil
+		},
+	}
 }
 
 // mesh
 func meshCmd() *cobra.Command {
-	var listenPort int32
+	var (
+		listenPort  int32
+		stunServers []string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "mesh",
@@ -73,7 +156,8 @@ func meshCmd() *cobra.Command {
 
 	initCmd := &cobra.Command{
 		Use:   "init",
-		Short: "Create or update the WireKubeMesh resource",
+		Short: "Create the default WireKubeMesh or patch explicitly supplied fields",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := k8sClient()
 			if err != nil {
@@ -82,33 +166,44 @@ func meshCmd() *cobra.Command {
 			mesh := &wirekubev1alpha1.WireKubeMesh{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: wirekubev1alpha1.WireKubeMeshSpec{
-					ListenPort: listenPort,
-					STUNServers: []string{
-						"stun:stun.l.google.com:19302",
-						"stun:stun1.l.google.com:19302",
-					},
+					ListenPort:  listenPort,
+					STUNServers: append([]string(nil), stunServers...),
 				},
 			}
-			ctx := context.Background()
+			ctx := cmd.Context()
 			existing := &wirekubev1alpha1.WireKubeMesh{}
 			err = c.Get(ctx, client.ObjectKey{Name: "default"}, existing)
-			if err != nil {
+			if apierrors.IsNotFound(err) {
 				if err := c.Create(ctx, mesh); err != nil {
-					return err
+					return fmt.Errorf("create WireKubeMesh: %w", err)
 				}
-				fmt.Println("WireKubeMesh 'default' created")
-			} else {
-				patch := client.MergeFrom(existing.DeepCopy())
-				existing.Spec = mesh.Spec
-				if err := c.Patch(ctx, existing, patch); err != nil {
-					return err
-				}
-				fmt.Println("WireKubeMesh 'default' updated")
+				return writeResult(cmd, map[string]any{"name": "default", "operation": "created"}, "WireKubeMesh 'default' created\n")
 			}
-			return nil
+			if err != nil {
+				return fmt.Errorf("get WireKubeMesh: %w", err)
+			}
+
+			patch := client.MergeFrom(existing.DeepCopy())
+			changed := false
+			if cmd.Flags().Changed("port") && existing.Spec.ListenPort != listenPort {
+				existing.Spec.ListenPort = listenPort
+				changed = true
+			}
+			if cmd.Flags().Changed("stun-server") && !stringSlicesEqual(existing.Spec.STUNServers, stunServers) {
+				existing.Spec.STUNServers = append([]string(nil), stunServers...)
+				changed = true
+			}
+			if changed {
+				if err := c.Patch(ctx, existing, patch); err != nil {
+					return fmt.Errorf("patch WireKubeMesh: %w", err)
+				}
+				return writeResult(cmd, map[string]any{"name": "default", "operation": "patched"}, "WireKubeMesh 'default' patched\n")
+			}
+			return writeResult(cmd, map[string]any{"name": "default", "operation": "unchanged"}, "WireKubeMesh 'default' already exists; no fields were changed\n")
 		},
 	}
 	initCmd.Flags().Int32Var(&listenPort, "port", 51820, "WireGuard listen port")
+	initCmd.Flags().StringSliceVar(&stunServers, "stun-server", []string{"stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"}, "STUN server; may be repeated")
 	cmd.AddCommand(initCmd)
 
 	statusCmd := &cobra.Command{
@@ -120,14 +215,17 @@ func meshCmd() *cobra.Command {
 				return err
 			}
 			mesh := &wirekubev1alpha1.WireKubeMesh{}
-			if err := c.Get(context.Background(), client.ObjectKey{Name: "default"}, mesh); err != nil {
-				return err
+			if err := c.Get(cmd.Context(), client.ObjectKey{Name: "default"}, mesh); err != nil {
+				return fmt.Errorf("get WireKubeMesh: %w", err)
 			}
-			fmt.Printf("Name:        %s\n", mesh.Name)
-			fmt.Printf("Listen Port: %d\n", mesh.Spec.ListenPort)
-			fmt.Printf("Interface:   %s\n", mesh.Spec.InterfaceName)
-			fmt.Printf("MTU:         %d\n", mesh.Spec.MTU)
-			fmt.Printf("Ready Peers: %d / %d\n", mesh.Status.ReadyPeers, mesh.Status.TotalPeers)
+			if options.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), mesh)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Name:        %s\n", mesh.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "Listen Port: %d\n", mesh.Spec.ListenPort)
+			fmt.Fprintf(cmd.OutOrStdout(), "Interface:   %s\n", mesh.Spec.InterfaceName)
+			fmt.Fprintf(cmd.OutOrStdout(), "MTU:         %d\n", mesh.Spec.MTU)
+			fmt.Fprintf(cmd.OutOrStdout(), "Ready Peers: %d / %d\n", mesh.Status.ReadyPeers, mesh.Status.TotalPeers)
 			return nil
 		},
 	}
@@ -147,11 +245,14 @@ func peersCmd() *cobra.Command {
 				return err
 			}
 			peerList := &wirekubev1alpha1.WireKubePeerList{}
-			if err := c.List(context.Background(), peerList); err != nil {
+			if err := c.List(cmd.Context(), peerList); err != nil {
 				return err
 			}
+			if options.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), peerList.Items)
+			}
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "NAME\tENDPOINT\tALLOWED-IPS\tCONNECTED\tLAST HANDSHAKE")
 			for _, p := range peerList.Items {
 				lastHS := "-"
@@ -186,8 +287,11 @@ func exportCmd() *cobra.Command {
 				return err
 			}
 			peerList := &wirekubev1alpha1.WireKubePeerList{}
-			if err := c.List(context.Background(), peerList); err != nil {
+			if err := c.List(cmd.Context(), peerList); err != nil {
 				return err
+			}
+			if options.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), peerList.Items)
 			}
 
 			for i, p := range peerList.Items {
@@ -211,9 +315,9 @@ func exportCmd() *cobra.Command {
 					return err
 				}
 				if i > 0 {
-					fmt.Println("---")
+					fmt.Fprintln(cmd.OutOrStdout(), "---")
 				}
-				fmt.Print(string(b))
+				fmt.Fprint(cmd.OutOrStdout(), string(b))
 			}
 			return nil
 		},
@@ -249,19 +353,19 @@ func importCmd() *cobra.Command {
 				}
 
 				existing := &wirekubev1alpha1.WireKubePeer{}
-				err := c.Get(context.Background(), client.ObjectKey{Name: peer.Name}, existing)
+				err := c.Get(cmd.Context(), client.ObjectKey{Name: peer.Name}, existing)
 				if err != nil {
-					if err := c.Create(context.Background(), peer); err != nil {
+					if err := c.Create(cmd.Context(), peer); err != nil {
 						return fmt.Errorf("creating peer %s: %w", peer.Name, err)
 					}
-					fmt.Printf("created peer %s\n", peer.Name)
+					fmt.Fprintf(cmd.OutOrStdout(), "created peer %s\n", peer.Name)
 				} else {
 					patch := client.MergeFrom(existing.DeepCopy())
 					existing.Spec = peer.Spec
-					if err := c.Patch(context.Background(), existing, patch); err != nil {
+					if err := c.Patch(cmd.Context(), existing, patch); err != nil {
 						return fmt.Errorf("updating peer %s: %w", peer.Name, err)
 					}
-					fmt.Printf("updated peer %s\n", peer.Name)
+					fmt.Fprintf(cmd.OutOrStdout(), "updated peer %s\n", peer.Name)
 				}
 			}
 			return nil
@@ -280,8 +384,8 @@ func tokenCmd() *cobra.Command {
 		Use:   "create",
 		Short: "Create a new bootstrap token for enrolling a node",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("# Bootstrap token creation not yet implemented.")
-			fmt.Println("# Use kubeadm token create or manually create a ServiceAccount for the agent.")
+			fmt.Fprintln(cmd.OutOrStdout(), "# Bootstrap token creation not yet implemented.")
+			fmt.Fprintln(cmd.OutOrStdout(), "# Use kubeadm token create or manually create a ServiceAccount for the agent.")
 			return nil
 		},
 	}
@@ -300,7 +404,7 @@ func externalCmd() *cobra.Command {
 		Short:   "Manage external WireGuard clients",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listExternalPeers(cmd.Context(), os.Stdout)
+			return listExternalPeers(cmd.Context(), cmd.OutOrStdout())
 		},
 	}
 	cmd.AddCommand(
@@ -319,7 +423,7 @@ func externalListCmd() *cobra.Command {
 		Short:   "List external WireGuard clients",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listExternalPeers(cmd.Context(), os.Stdout)
+			return listExternalPeers(cmd.Context(), cmd.OutOrStdout())
 		},
 	}
 }
@@ -339,7 +443,10 @@ func externalGetCmd() *cobra.Command {
 			if err := c.Get(cmd.Context(), client.ObjectKey{Name: args[0]}, cr); err != nil {
 				return fmt.Errorf("get external peer: %w", err)
 			}
-			writeExternalPeerDetail(os.Stdout, cr)
+			if options.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), cr)
+			}
+			writeExternalPeerDetail(cmd.OutOrStdout(), cr)
 			return nil
 		},
 	}
@@ -359,7 +466,7 @@ func externalRemoveCmd() *cobra.Command {
 			if err := removeExternalPeer(cmd.Context(), c, args[0]); err != nil {
 				return err
 			}
-			fmt.Printf("removed external peer %s\n", args[0])
+			fmt.Fprintf(cmd.OutOrStdout(), "removed external peer %s\n", args[0])
 			return nil
 		},
 	}
@@ -373,6 +480,9 @@ func listExternalPeers(ctx context.Context, out io.Writer) error {
 	peerList := &wirekubev1alpha1.WireKubeExternalPeerList{}
 	if err := c.List(ctx, peerList); err != nil {
 		return err
+	}
+	if options.output == "json" {
+		return writeJSON(out, peerList.Items)
 	}
 	return writeExternalPeerTable(out, peerList.Items, time.Now())
 }
@@ -485,7 +595,7 @@ cluster never sees it.`,
 				cr.Spec.MTU = mtu
 			}
 
-			ctx := context.Background()
+			ctx := cmd.Context()
 			if err := c.Create(ctx, cr); err != nil {
 				return fmt.Errorf("create WireKubeExternalPeer: %w", err)
 			}
@@ -500,17 +610,17 @@ cluster never sees it.`,
 				if err := os.WriteFile(outputFile, []byte(conf), 0o600); err != nil {
 					return fmt.Errorf("write conf: %w", err)
 				}
-				fmt.Fprintf(os.Stderr, "wrote conf to %s\n", outputFile)
+				fmt.Fprintf(cmd.ErrOrStderr(), "wrote conf to %s\n", outputFile)
 			} else {
-				fmt.Print(conf)
+				fmt.Fprint(cmd.OutOrStdout(), conf)
 			}
 			if printQR {
 				qr, err := qrcode.New(conf, qrcode.Low)
 				if err != nil {
 					return fmt.Errorf("encode QR: %w", err)
 				}
-				fmt.Println()
-				fmt.Println(qr.ToSmallString(false))
+				fmt.Fprintln(cmd.OutOrStdout())
+				fmt.Fprintln(cmd.OutOrStdout(), qr.ToSmallString(false))
 			}
 			return nil
 		},
@@ -521,7 +631,7 @@ cluster never sees it.`,
 	cmd.Flags().Int32Var(&mtu, "mtu", 0, "WireGuard interface MTU for the external client (default: controller-recommended 1248)")
 	cmd.Flags().DurationVar(&waitFor, "wait", 60*time.Second, "how long to wait for Phase=Active before failing")
 	cmd.Flags().BoolVar(&printQR, "qr", true, "print an ASCII QR code of the conf for mobile import")
-	cmd.Flags().StringVarP(&outputFile, "output", "o", "", "write the conf to this file instead of stdout (still prints QR if --qr)")
+	cmd.Flags().StringVarP(&outputFile, "output-file", "o", "", "write the conf to this file instead of stdout (still prints QR if --qr)")
 	return cmd
 }
 
@@ -540,7 +650,7 @@ func revokeCmd() *cobra.Command {
 			if err := removeExternalPeer(cmd.Context(), c, args[0]); err != nil {
 				return err
 			}
-			fmt.Printf("revoked %s\n", args[0])
+			fmt.Fprintf(cmd.OutOrStdout(), "revoked %s\n", args[0])
 			return nil
 		},
 	}
@@ -565,6 +675,32 @@ func valueOrDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func writeJSON(out io.Writer, value any) error {
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func writeResult(cmd *cobra.Command, value any, text string) error {
+	if options.output == "json" {
+		return writeJSON(cmd.OutOrStdout(), value)
+	}
+	_, err := fmt.Fprint(cmd.OutOrStdout(), text)
+	return err
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func marshalYAML(v any) ([]byte, error) {

@@ -12,8 +12,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 const serviceAccountUsernamePrefix = "system:serviceaccount:"

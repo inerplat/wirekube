@@ -62,9 +62,7 @@ docker push inerplat/wirekube:latest
 
 ### CI/CD
 
-Images are built and pushed automatically via GitHub Actions on tag push (`v*`).
-The workflow builds multi-arch images (amd64 + arm64) and pushes both the tagged
-version and `latest`.
+Tag builds run formatting, vet, lint, unit tests, and the TCP/WSS disposable-cluster E2E matrix before publishing anything. After those gates pass, the workflow publishes the multi-architecture image, builds four standalone `wirekubectl` binaries, injects the version, commit, build date, and immutable image digest, and creates a GitHub Release with SHA256 checksums.
 
 ## Dockerfile
 

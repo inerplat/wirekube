@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	relayproto "github.com/wirekube/wirekube/pkg/relay"
+	relayproto "github.com/inerplat/wirekube/pkg/relay"
 )
 
 // Sender can deliver a UDP payload to a remote peer via the relay network.

@@ -15,7 +15,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/wirekube/wirekube/pkg/relay/portalloc"
+	"github.com/inerplat/wirekube/pkg/relay/portalloc"
 )
 
 var relayDebug = os.Getenv("WIREKUBE_RELAY_DEBUG") == "1"

@@ -13,10 +13,10 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/wirekube/wirekube/pkg/agent/nat"
-	agentrelay "github.com/wirekube/wirekube/pkg/agent/relay"
-	wirekubev1alpha1 "github.com/wirekube/wirekube/pkg/api/v1alpha1"
-	"github.com/wirekube/wirekube/pkg/wireguard"
+	"github.com/inerplat/wirekube/pkg/agent/nat"
+	agentrelay "github.com/inerplat/wirekube/pkg/agent/relay"
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 type fakeWGEngine struct {

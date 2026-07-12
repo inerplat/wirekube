@@ -93,11 +93,18 @@ wirekube-relay --addr 10.0.0.1:3478
 
 ## wirekubectl
 
-CLI tool for inspecting mesh status.
+CLI tool for installing WireKube and managing mesh resources without requiring a source checkout.
 
 ### Usage
 
 ```bash
+wirekubectl version
+wirekubectl install [flags]
+wirekubectl manifest [flags]
+wirekubectl status
+wirekubectl doctor
+wirekubectl upgrade [flags]
+wirekubectl uninstall [--purge --confirm-purge]
 wirekubectl mesh status
 wirekubectl peers
 wirekubectl export
@@ -108,5 +115,17 @@ wirekubectl external get <name>
 wirekubectl external invite <display-name> [flags]
 wirekubectl external revoke <display-name>
 ```
+
+All commands accept `--kubeconfig`, `--context`, `--namespace`, `--timeout`, and `--output text|json`. `install --dry-run` performs cluster inspection and prints the installation plan without mutation. Non-interactive `install --yes` requires explicit `--relay` and `--mesh-cidr` selections and an image pinned as `IMAGE@sha256:DIGEST` unless the released CLI already contains its matching default image digest. `--exclude-cidr` records routes that best-effort automatic mesh CIDR selection must avoid.
+
+`--relay-endpoint` is the TCP control endpoint for NodePort or external relay modes. `--relay-udp-endpoint` is a separate raw WireGuard endpoint for external peer invites and is valid with `--relay external`; NodePort derives UDP port `30479` when `--relay-udp` is enabled. TCP-only relay installations leave external peers Pending instead of publishing an unusable UDP configuration.
+
+`status` reports component deployment readiness separately from mesh connectivity readiness, including CRD establishment, agent image and rollout state, ReadyPeers, relay readiness, and LoadBalancer or NodePort assignment. `doctor` adds API connectivity, installation-ID ownership, and relay TCP reachability checks, writes the complete text or JSON report, and exits non-zero when any check fails. JSON command failures use a stable `schemaVersion` and `error.code`/`error.message` envelope.
+
+WireKube supports one installation per cluster because the mesh, CRDs, and RBAC are cluster-scoped. `--namespace` selects the workload and inventory namespace; install refuses an inventory in another namespace, and upgrade or uninstall refuses resources whose installation ID does not match.
+
+`mesh init` creates the default mesh when it is absent. When the mesh already exists, it patches only flags explicitly provided on the command line and never replaces the complete spec.
+
+`uninstall` preserves CRDs and custom resources by default. `--purge` is rejected unless `--confirm-purge` is also present, and `--yes` alone never authorizes purge.
 
 `wirekubectl token create` is currently a placeholder that prints guidance and does not issue a token. The WSS relay uses Kubernetes `kubectl create token` and TokenReview instead.
