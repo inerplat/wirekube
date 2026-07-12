@@ -74,6 +74,7 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/agent/
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay-ws/
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/wirekubectl/
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/agent/
 
@@ -102,6 +103,9 @@ jobs:
           - cilium-no-kube-proxy
           - flannel
           - calico
+        relay-transport:
+          - tcp
+          - wss
         include:
           - cni-mode: cilium-kube-proxy
             need-helm: true
@@ -111,7 +115,7 @@ jobs:
             need-helm: false
           - cni-mode: calico
             need-helm: false
-    name: e2e (${{ matrix.cni-mode }})
+    name: e2e (${{ matrix.cni-mode }}, ${{ matrix.relay-transport }})
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -146,4 +150,5 @@ jobs:
         run: |
           WIREKUBE_IMAGE=inerplat/wirekube:ci-${{ github.sha }} \
           WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
+          WIREKUBE_E2E_RELAY_TRANSPORT=${{ matrix.relay-transport }} \
           go test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m

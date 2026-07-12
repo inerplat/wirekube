@@ -161,14 +161,16 @@ type ExternalRelaySpec struct {
 	// Example: "relay.example.com:3478" or "203.0.113.10:3478"
 	Endpoint string `json:"endpoint"`
 
-	// ControlEndpoint is reserved for legacy relay control operations. Shared
-	// external peers use Endpoint directly and do not require this field.
+	// ControlEndpoint is the agent-facing relay endpoint. It is required for
+	// ws/wss transport and may hold a separate raw TCP address for tcp transport.
+	// External WireGuard peers continue to use Endpoint.
 	// +optional
 	ControlEndpoint string `json:"controlEndpoint,omitempty"`
 
-	// Transport is the protocol used to connect to the relay.
+	// Transport selects the single protocol agents use to connect to the relay.
+	// Agents do not open tcp and WebSocket sessions at the same time.
 	// +kubebuilder:default=tcp
-	// +kubebuilder:validation:Enum=tcp;ws
+	// +kubebuilder:validation:Enum=tcp;ws;wss
 	Transport string `json:"transport,omitempty"`
 
 	// AuthSecretRef references a Kubernetes Secret containing the relay auth key.

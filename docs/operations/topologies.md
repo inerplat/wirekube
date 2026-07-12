@@ -106,11 +106,7 @@ flowchart LR
 | Home ↔ Home (same LAN) | Direct | Same network |
 | Cloud (Symmetric) ↔ Cloud (Symmetric, different VPC) | Relay | Both behind Symmetric NAT |
 
-Home routers typically use Cone NAT (Endpoint-Independent Mapping).
-In WireKube, Cone ↔ Symmetric pairs achieve direct P2P: the Symmetric
-side initiates a WireGuard handshake to the Cone peer's stable STUN
-endpoint. Relay is only needed when **both** peers are behind Symmetric
-NAT, which happens in cross-VPC cloud-to-cloud communication.
+Home routers typically use Cone NAT (Endpoint-Independent Mapping). Cone ↔ Symmetric pairs often achieve direct P2P, while Symmetric ↔ Symmetric and restrictive firewall or filtering combinations commonly remain on relay.
 
 ## Topology 5: Air-Gapped with Outbound TCP
 
@@ -139,9 +135,10 @@ ports need to be opened on the node's firewall.
 graph TD
     A[All nodes have<br/>public IPs?] -->|Yes| B[No relay needed<br/>mode: never]
     A -->|No| C[Any nodes behind<br/>Symmetric NAT?]
-    C -->|No| D[STUN P2P works<br/>mode: auto, relay unlikely]
+    C -->|No| D[Direct path likely<br/>mode: auto can promote direct]
     C -->|Yes| E[Deploy relay<br/>mode: auto]
     E --> F{Where to deploy relay?}
     F -->|Public server| G[External relay]
-    F -->|In-cluster| H[Managed relay<br/>+ LoadBalancer or NodePort]
+    F -->|In-cluster DNS reachable| H[Managed relay<br/>control Service]
+    F -->|HTTP-aware LB / Ingress| I[Planned WSS relay]
 ```

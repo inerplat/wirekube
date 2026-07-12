@@ -1,6 +1,6 @@
 ---
-# Example: WireKubeMesh with operator-managed relay.
-# Operator automatically deploys a relay Pod + LoadBalancer Service.
+# Example: WireKubeMesh using an in-cluster relay.
+# Deploy config/relay/deployment.yaml separately; the current agent does not create or scale relay workloads from this resource.
 apiVersion: wirekube.io/v1alpha1
 kind: WireKubeMesh
 metadata:

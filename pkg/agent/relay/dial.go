@@ -9,9 +9,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"golang.org/x/net/http/httpproxy"
+
+	relayproto "github.com/wirekube/wirekube/pkg/relay"
 )
 
 var relayProxyFromEnvironment = proxyURLFromEnvironment
@@ -35,7 +40,10 @@ func (m ProxyMode) normalized() ProxyMode {
 	}
 }
 
-func dialRelay(ctx context.Context, dialer *net.Dialer, relayAddr string, mode ProxyMode, explicitProxyURL *url.URL) (net.Conn, error) {
+func dialRelay(ctx context.Context, dialer *net.Dialer, relayAddr string, mode ProxyMode, explicitProxyURL *url.URL, tokenFile string) (net.Conn, error) {
+	if strings.HasPrefix(relayAddr, "ws://") || strings.HasPrefix(relayAddr, "wss://") {
+		return dialRelayWebSocket(ctx, dialer, relayAddr, mode, explicitProxyURL, tokenFile)
+	}
 	switch mode.normalized() {
 	case ProxyDisabled:
 		return dialer.DialContext(ctx, "tcp", relayAddr)
@@ -54,6 +62,42 @@ func dialRelay(ctx context.Context, dialer *net.Dialer, relayAddr string, mode P
 		}
 		return dialRelayViaHTTPProxy(ctx, dialer, relayAddr, proxyURL)
 	}
+}
+
+func dialRelayWebSocket(ctx context.Context, dialer *net.Dialer, relayURL string, mode ProxyMode, explicitProxyURL *url.URL, tokenFile string) (net.Conn, error) {
+	tokenBytes, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading relay token %q: %w", tokenFile, err)
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+	if token == "" {
+		return nil, fmt.Errorf("relay token %q is empty", tokenFile)
+	}
+
+	wsDialer := websocket.Dialer{
+		NetDialContext:   dialer.DialContext,
+		HandshakeTimeout: dialTimeout,
+		Subprotocols:     []string{"wirekube.relay.v1"},
+	}
+	switch mode.normalized() {
+	case ProxyFromEnvironment:
+		wsDialer.Proxy = http.ProxyFromEnvironment
+	case ProxyExplicit:
+		if explicitProxyURL == nil {
+			return nil, fmt.Errorf("explicit relay proxy mode requires a proxy URL")
+		}
+		wsDialer.Proxy = func(*http.Request) (*url.URL, error) { return explicitProxyURL, nil }
+	}
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+token)
+	conn, resp, err := wsDialer.DialContext(ctx, relayURL, header)
+	if err != nil {
+		if resp != nil {
+			return nil, fmt.Errorf("WebSocket relay %s: %s: %w", relayURL, resp.Status, err)
+		}
+		return nil, fmt.Errorf("WebSocket relay %s: %w", relayURL, err)
+	}
+	return relayproto.NewWebSocketConn(conn), nil
 }
 
 func proxyURLFromEnvironment(relayAddr string) (*url.URL, error) {

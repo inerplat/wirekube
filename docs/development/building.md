@@ -101,22 +101,23 @@ Generated files in `config/crd/` must be committed alongside type changes.
 wirekube/
 ├── cmd/
 │   ├── agent/           # Agent entrypoint
-│   ├── operator/        # Operator entrypoint
+│   ├── admin-web/       # External-peer management web UI
 │   ├── relay/           # Relay server entrypoint
+│   ├── stun-server/     # Development STUN server
 │   └── wirekubectl/     # CLI entrypoint
 ├── pkg/
 │   ├── agent/           # Agent logic (endpoint discovery, peer sync)
 │   │   ├── nat/         # STUN and UPnP endpoint discovery
-│   │   └── relay/       # Relay client, UDP proxy, relay pool
+│   │   └── relay/       # Relay client, Bind delivery fallback proxy, relay pool
 │   │       ├── client.go   # TCP client with auto-reconnect
-│   │       ├── proxy.go    # Per-peer UDP proxy (Sender interface)
+│   │       ├── proxy.go    # Legacy/fallback per-peer UDP proxy
 │   │       └── pool.go     # Multi-instance relay pool
-│   ├── api/v1alpha1/    # CRD types (WireKubeMesh, WireKubePeer)
-│   ├── controller/      # Kubernetes controller-runtime reconcilers
+│   ├── api/v1alpha1/    # Mesh, peer, gateway, and external-peer CRD types
+│   ├── controller/      # Embedded external-peer reconciler and stub legacy reconcilers
 │   ├── relay/           # Relay server and wire protocol
 │   └── wireguard/       # WireGuard interface, routing, xfrm bypass
 ├── config/
-│   ├── agent/           # DaemonSet manifest (includes RBAC)
+│   ├── agent/           # Separate RBAC, DaemonSet, and ServiceMonitor manifests
 │   ├── crd/             # CustomResourceDefinition YAMLs (generated)
 │   ├── relay/           # Relay deployment + service examples
 │   └── examples/         # WireKubeMesh and EKS Hybrid Node examples
