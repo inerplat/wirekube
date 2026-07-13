@@ -126,9 +126,17 @@ func sameInstallConfig(left, right Options) bool {
 		left.Relay == right.Relay &&
 		left.RelayEndpoint == right.RelayEndpoint &&
 		left.RelayUDPEndpoint == right.RelayUDPEndpoint &&
+		normalizedRelayTransport(left.RelayTransport) == normalizedRelayTransport(right.RelayTransport) &&
 		left.RelayUDP == right.RelayUDP &&
 		left.MeshCIDR == right.MeshCIDR &&
 		left.NodeAddresses == right.NodeAddresses
+}
+
+func normalizedRelayTransport(transport string) string {
+	if strings.TrimSpace(transport) == "" {
+		return RelayTransportTCP
+	}
+	return transport
 }
 
 type applyOutcome struct {
@@ -335,16 +343,27 @@ func (i Installer) waitReady(ctx context.Context, options Options) error {
 			if err := i.Client.Get(ctx, types.NamespacedName{Namespace: options.Namespace, Name: "wirekube-relay"}, deployment); err != nil {
 				return false, err
 			}
-			return deployment.Status.ObservedGeneration >= deployment.Generation &&
-				deployment.Status.UpdatedReplicas == 1 &&
-				deployment.Status.ReadyReplicas == 1 &&
-				deployment.Status.AvailableReplicas == 1, nil
+			return deploymentReady(deployment), nil
 		}); err != nil {
 			return fmt.Errorf("relay Deployment did not become ready; run wirekubectl doctor: %w", err)
 		}
+		if options.RelayTransport == RelayTransportWSS {
+			if err := poll(ctx, 2*time.Second, func() (bool, error) {
+				deployment := &appsv1.Deployment{}
+				if err := i.Client.Get(ctx, types.NamespacedName{Namespace: options.Namespace, Name: "wirekube-relay-ws"}, deployment); err != nil {
+					return false, err
+				}
+				return deploymentReady(deployment), nil
+			}); err != nil {
+				return fmt.Errorf("relay WebSocket Deployment did not become ready; run wirekubectl doctor: %w", err)
+			}
+		}
 	}
 	if options.Relay == RelayLoadBalancer {
-		serviceNames := []string{"wirekube-relay"}
+		serviceNames := []string{}
+		if options.RelayTransport == RelayTransportTCP {
+			serviceNames = append(serviceNames, "wirekube-relay")
+		}
 		if options.RelayUDP {
 			serviceNames = append(serviceNames, "wirekube-relay-udp")
 		}
@@ -361,7 +380,11 @@ func (i Installer) waitReady(ctx context.Context, options Options) error {
 		}
 	}
 	if options.Relay == RelayNodePort {
-		serviceNames := []string{"wirekube-relay"}
+		entrypointService := "wirekube-relay"
+		if options.RelayTransport == RelayTransportWSS {
+			entrypointService = "wirekube-relay-ws"
+		}
+		serviceNames := []string{entrypointService}
 		if options.RelayUDP {
 			serviceNames = append(serviceNames, "wirekube-relay-udp")
 		}
@@ -378,6 +401,18 @@ func (i Installer) waitReady(ctx context.Context, options Options) error {
 		}
 	}
 	return nil
+}
+
+func deploymentReady(deployment *appsv1.Deployment) bool {
+	desired := int32(1)
+	if deployment.Spec.Replicas != nil {
+		desired = *deployment.Spec.Replicas
+	}
+	return desired > 0 &&
+		deployment.Status.ObservedGeneration >= deployment.Generation &&
+		deployment.Status.UpdatedReplicas == desired &&
+		deployment.Status.ReadyReplicas == desired &&
+		deployment.Status.AvailableReplicas == desired
 }
 
 func (i Installer) saveInventory(ctx context.Context, namespace string, inventory Inventory, allowLegacyOwnership bool) (applyOutcome, error) {

@@ -58,7 +58,7 @@ spec:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `mode` | string | No | `auto` | `auto`: start with relay available and promote healthy peers to direct. `always`: always relay. `never`: direct only |
-| `provider` | string | No | - | `external`: connect to a user-provided endpoint. `managed`: connect to the separately deployed cluster-local relay control Service. |
+| `provider` | string | No | - | `external`: connect to a user-provided endpoint. `managed`: use the installed cluster-local TCP relay or its configured WSS gateway. |
 | `handshakeTimeoutSeconds` | int | No | `30` | Retained API field. The current PathMonitor relay-first flow stores this value but does not use it for path transitions. |
 | `directRetryIntervalSeconds` | int | No | `120` | Seconds between attempts to upgrade a relayed peer back to direct P2P |
 
@@ -66,7 +66,7 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `endpoint` | string | Yes (if external) | - | Raw relay address (`host:port`) used by TCP agents, NAT probing, and external WireGuard peers. |
+| `endpoint` | string | No | - | Raw UDP relay address (`host:port`) used for NAT probing and external WireGuard peers; it is also the TCP fallback when `controlEndpoint` is empty. |
 | `transport` | string | No | `tcp` | Selects exactly one agent transport: `tcp`, `ws`, or `wss`. |
 | `controlEndpoint` | string | Required for `ws`/`wss` | - | Agent-facing endpoint. It may be a separate raw address for `tcp` or a matching `ws://`/`wss://` URL. |
 | `authSecretRef` | SecretKeyRef | No | - | Reserved authentication configuration. The current relay client does not read this Secret or send a relay credential. |
@@ -79,12 +79,13 @@ spec:
 | `serviceType` | string | No | `LoadBalancer` | Desired Service type in the API shape; no controller currently reconciles this field. |
 | `port` | int | No | `3478` | Port used when constructing the cluster-local managed relay endpoint. |
 | `image` | string | No | - | Reserved deployment configuration; currently not reconciled. |
+| `controlEndpoint` | string | Required for `wss` | - | Public `wss://HOST/PATH` URL used by agents when managed transport is WSS. |
+| `transport` | string | No | `tcp` | Selects the managed agent transport: `tcp` or `wss`. |
 | `resources` | RelayResources | No | - | Reserved deployment configuration; currently not reconciled. |
 
-When `provider: managed`, agents connect to the cluster-local `wirekube-relay-control` Service. The relay Deployment and Services must be installed separately. Nodes that cannot use cluster DNS or service routing during bootstrap should use `provider: external` with a reachable LoadBalancer, NodePort, or future WSS endpoint.
+When `provider: managed`, TCP agents connect to the cluster-local `wirekube-relay-control` Service and WSS agents connect through `managed.controlEndpoint`. The agent does not reconcile Deployments or Services from this CR; `wirekubectl install` provisions the managed relay and WebSocket gateway resources. Nodes that cannot use cluster DNS or service routing during bootstrap can use `provider: external` with a reachable LoadBalancer, NodePort, or WSS endpoint.
 
-For multi-instance scaling, use a Headless Service. The relay pool re-resolves
-DNS every 30s to track replica changes.
+For multi-instance scaling, use a Headless Service. The relay pool re-resolves DNS every 30s to track replica changes.
 
 ---
 

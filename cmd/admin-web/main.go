@@ -1350,6 +1350,9 @@ func relaySummary(relay *wirekubev1alpha1.RelaySpec) string {
 		return fmt.Sprintf("%s/%s %s", provider, mode, relay.External.Endpoint)
 	}
 	if relay.Managed != nil {
+		if strings.EqualFold(relay.Managed.Transport, "wss") && relay.Managed.ControlEndpoint != "" {
+			return fmt.Sprintf("%s/%s %s", provider, mode, relay.Managed.ControlEndpoint)
+		}
 		port := relay.Managed.Port
 		if port == 0 {
 			port = 3478

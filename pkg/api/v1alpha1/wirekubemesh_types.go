@@ -205,6 +205,16 @@ type ManagedRelaySpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// ControlEndpoint is the public WSS URL agents use when Transport is wss.
+	// TLS is terminated by an Ingress or Gateway in front of the managed WebSocket Service.
+	// +optional
+	ControlEndpoint string `json:"controlEndpoint,omitempty"`
+
+	// Transport selects the single protocol agents use to connect to the managed relay.
+	// +kubebuilder:default=tcp
+	// +kubebuilder:validation:Enum=tcp;wss
+	Transport string `json:"transport,omitempty"`
+
 	// Resources sets resource requests/limits for the relay pod.
 	// +optional
 	Resources *RelayResources `json:"resources,omitempty"`

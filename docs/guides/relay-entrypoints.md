@@ -45,9 +45,9 @@ kubectl apply -f config/examples/relay-nodeport/service.yaml
 kubectl -n wirekube-system get service wirekube-relay
 ```
 
-The second apply updates the existing Service; it does not create a second relay entry point. A cloud provider may briefly start provisioning a load balancer between the two commands, then removes it after the Service type changes.
+The second apply updates the existing TCP Service and creates a separate UDP Service; both select the same relay Deployment. A cloud provider may briefly start provisioning the original load balancer between the two commands, then removes it after the TCP Service type changes.
 
-The example fixes both TCP and UDP to NodePort `30478`. TCP carries agent relay connections. UDP is used by external WireGuard peers; it can remain blocked if that feature is not used.
+The example fixes TCP to NodePort `30478` and UDP to NodePort `30479`. TCP carries agent relay connections. UDP is used by external WireGuard peers; it can remain blocked if that feature is not used.
 
 Choose a stable, reachable node address and configure it as an external relay:
 
@@ -103,6 +103,16 @@ This forward-proxy flow is distinct from the WSS relay endpoint. CONNECT tunnels
 
 ## Through an HTTPS/WSS entry point
 
+With easy install, create the trusted TLS Gateway or Ingress route to Service `wirekube-relay-ws` port `8081`, then select WSS explicitly:
+
+```bash
+wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.your-domain.example/relay --mesh-cidr 100.96.0.0/11 --yes
+```
+
+This installs the raw relay, the TokenReview-authenticated WebSocket gateway, and a separate UDP LoadBalancer for external WireGuard peers. The WebSocket Service remains ClusterIP because the existing HTTPS Gateway or Ingress owns the public hostname and certificate. `--relay-udp=false` disables the UDP LoadBalancer when external peers are not required.
+
+For a TLS terminator that forwards to node addresses instead of a ClusterIP Service, use `--relay node-port --relay-transport wss`; the installer exposes plain HTTP/WebSocket on NodePort `30478`. Add `--relay-udp --relay-udp-endpoint HOST:30479` only when external WireGuard peers also need the UDP NodePort.
+
 Deploy the WSS gateway separately from the raw relay, expose it through an HTTPS Gateway or Ingress, and keep at least two gateway replicas on different nodes:
 
 ```bash
@@ -122,7 +132,7 @@ relay:
     transport: wss
 ```
 
-`transport: tcp` uses the raw endpoint and does not open a WebSocket session. `transport: wss` uses only `controlEndpoint` and keeps `endpoint` for NAT probing and external WireGuard peers. Running both Services is safe because they are entry points to the same relay, but one agent public key must not connect through both transports simultaneously.
+`transport: tcp` uses the raw endpoint and does not open a WebSocket session. `transport: wss` uses only `controlEndpoint` for the agent session and keeps `endpoint` for NAT probing and external WireGuard peers when one is configured. Running both Services is safe because they are entry points to the same relay, but one agent public key must not connect through both transports simultaneously.
 
 ## Verify the selected path
 
