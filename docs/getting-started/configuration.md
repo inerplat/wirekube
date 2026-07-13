@@ -53,6 +53,8 @@ spec:
 | `spec.relay.managed.replicas` | int | `1` | Desired relay replicas in the API shape. The current agent does not provision or scale the Deployment from this field. |
 | `spec.relay.managed.serviceType` | string | `LoadBalancer` | Desired Service type in the API shape. The current agent does not create or mutate the Service from this field. |
 | `spec.relay.managed.port` | int | `3478` | Relay service port |
+| `spec.relay.managed.controlEndpoint` | string | - | Public `wss://HOST/PATH` URL used when the managed transport is WSS. |
+| `spec.relay.managed.transport` | string | `tcp` | Selects the managed agent transport: `tcp` or `wss`. |
 
 ### Relay Modes
 
@@ -67,7 +69,7 @@ spec:
 | Provider | Description |
 |----------|-------------|
 | `external` | User-provided relay endpoint. The agent selects `external.endpoint` or `external.controlEndpoint` according to `external.transport`. |
-| `managed` | Relay deployed separately in the cluster. Agents connect through the cluster-local `wirekube-relay-control` Service; WireKube does not currently create the Deployment or Service from the CR. Use `external` with a public LB, NodePort, or WSS endpoint when cluster DNS/service routing is unavailable during bootstrap. |
+| `managed` | Relay provisioned with the installation. TCP agents connect through the cluster-local `wirekube-relay-control` Service; WSS agents use `managed.controlEndpoint` through the installed WebSocket gateway. The agent does not create or scale resources from the CR itself; `wirekubectl install` owns those resources. |
 
 ## Node Labels and Annotations
 

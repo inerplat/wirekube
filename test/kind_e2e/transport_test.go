@@ -23,14 +23,14 @@ func TestRelayTransportConfigured(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: meshName}, &mesh); err != nil {
 		t.Fatalf("get WireKubeMesh: %v", err)
 	}
-	if mesh.Spec.Relay == nil || mesh.Spec.Relay.External == nil {
-		t.Fatal("external relay is not configured")
-	}
-	external := mesh.Spec.Relay.External
-	if external.Transport != relayTransport() {
-		t.Fatalf("relay transport=%q, want %q", external.Transport, relayTransport())
-	}
 	if relayTransport() == relayTransportTCP {
+		if mesh.Spec.Relay == nil || mesh.Spec.Relay.External == nil {
+			t.Fatal("external TCP relay is not configured")
+		}
+		external := mesh.Spec.Relay.External
+		if external.Transport != relayTransportTCP {
+			t.Fatalf("relay transport=%q, want %q", external.Transport, relayTransportTCP)
+		}
 		if external.ControlEndpoint != "" {
 			t.Fatalf("TCP control endpoint=%q, want empty", external.ControlEndpoint)
 		}
@@ -38,8 +38,12 @@ func TestRelayTransportConfigured(t *testing.T) {
 	}
 
 	expectedEndpoint := fmt.Sprintf("wss://%s:8443/relay", cpNode().ip)
-	if external.ControlEndpoint != expectedEndpoint {
-		t.Fatalf("WSS control endpoint=%q, want %q", external.ControlEndpoint, expectedEndpoint)
+	if mesh.Spec.Relay == nil || mesh.Spec.Relay.Managed == nil {
+		t.Fatal("managed WSS relay is not configured")
+	}
+	managed := mesh.Spec.Relay.Managed
+	if managed.Transport != relayTransportWSS || managed.ControlEndpoint != expectedEndpoint {
+		t.Fatalf("managed WSS relay=%+v, want endpoint %q", managed, expectedEndpoint)
 	}
 	eventually(t, func() bool {
 		var deployment appsv1.Deployment

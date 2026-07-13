@@ -1,9 +1,11 @@
 package install
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io/fs"
 	"net"
+	"net/url"
 	"sort"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -45,7 +47,18 @@ func Render(options Options) (*Bundle, error) {
 		meshObject(options),
 	}
 	if options.Relay == RelayLoadBalancer || options.Relay == RelayNodePort {
-		objects = append(objects, relayDeployment(options, labels), relayControlService(options, labels), relayTCPService(options, labels))
+		objects = append(objects, relayDeployment(options, labels), relayControlService(options, labels))
+		if options.RelayTransport == RelayTransportWSS {
+			objects = append(objects,
+				relayServiceAccount(options, labels),
+				relayClusterRole(labels),
+				relayClusterRoleBinding(options, labels),
+				relayWebSocketDeployment(options, labels),
+				relayWebSocketService(options, labels),
+			)
+		} else {
+			objects = append(objects, relayTCPService(options, labels))
+		}
 		if options.RelayUDP {
 			objects = append(objects, relayUDPService(options, labels))
 		}
@@ -151,7 +164,7 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 			Selector:       &metav1.LabelSelector{MatchLabels: selectorLabels},
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: map[string]string{"wirekube.io/relay-config-revision": relayConfigRevision(options)}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            "wirekube-agent",
 					HostNetwork:                   true,
@@ -202,6 +215,11 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 	}
 }
 
+func relayConfigRevision(options Options) string {
+	payload := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t", options.Relay, options.RelayTransport, options.RelayEndpoint, options.RelayUDPEndpoint, options.RelayUDP)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
+}
+
 func relayDeployment(options Options, labels map[string]string) *appsv1.Deployment {
 	replicas := int32(1)
 	componentLabels := copyLabels(labels)
@@ -210,6 +228,93 @@ func relayDeployment(options Options, labels map[string]string) *appsv1.Deployme
 		TypeMeta: typeMeta(appsv1.SchemeGroupVersion.String(), "Deployment"), ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Namespace: options.Namespace, Labels: componentLabels},
 		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-relay"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "wirekube-relay", "app.kubernetes.io/component": "relay", "app.kubernetes.io/part-of": "wirekube", "app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "relay", Image: options.Image, Command: []string{"wirekube-relay"}, Args: relayArgs(options), Ports: []corev1.ContainerPort{{Name: "relay-tcp", ContainerPort: 3478, Protocol: corev1.ProtocolTCP}, {Name: "relay-udp", ContainerPort: 3478, Protocol: corev1.ProtocolUDP}}}}}}},
 	}
+}
+
+func relayServiceAccount(options Options, labels map[string]string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{TypeMeta: typeMeta("v1", "ServiceAccount"), ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Namespace: options.Namespace, Labels: labels}}
+}
+
+func relayClusterRole(labels map[string]string) *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "ClusterRole"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Labels: labels},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}},
+			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubepeers"}, Verbs: []string{"get"}},
+		},
+	}
+}
+
+func relayClusterRoleBinding(options Options, labels map[string]string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "ClusterRoleBinding"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Labels: labels},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "wirekube-relay"},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: "wirekube-relay", Namespace: options.Namespace}},
+	}
+}
+
+func relayWebSocketDeployment(options Options, labels map[string]string) *appsv1.Deployment {
+	replicas := int32(2)
+	componentLabels := copyLabels(labels)
+	componentLabels["app.kubernetes.io/component"] = "relay"
+	selectorLabels := map[string]string{"app.kubernetes.io/name": "wirekube-relay-ws"}
+	podLabels := copyLabels(selectorLabels)
+	podLabels["app.kubernetes.io/component"] = "relay"
+	podLabels["app.kubernetes.io/part-of"] = "wirekube"
+	podLabels["app.kubernetes.io/managed-by"] = "wirekubectl"
+	return &appsv1.Deployment{
+		TypeMeta:   typeMeta(appsv1.SchemeGroupVersion.String(), "Deployment"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay-ws", Namespace: options.Namespace, Labels: componentLabels},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: selectorLabels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "wirekube-relay",
+					Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+						Weight:          100,
+						PodAffinityTerm: corev1.PodAffinityTerm{LabelSelector: &metav1.LabelSelector{MatchLabels: selectorLabels}, TopologyKey: "kubernetes.io/hostname"},
+					}}}},
+					Containers: []corev1.Container{{
+						Name:    "relay-ws",
+						Image:   options.Image,
+						Command: []string{"wirekube-relay-ws"},
+						Args: []string{
+							"--addr=:8081",
+							"--backend-addr=wirekube-relay-control." + options.Namespace + ".svc.cluster.local:3478",
+							"--path=" + relayWebSocketPath(options.RelayEndpoint),
+							"--audience=wirekube-relay",
+							"--agent-service-account=" + options.Namespace + "/wirekube-agent",
+						},
+						Ports:          []corev1.ContainerPort{{Name: "http-websocket", ContainerPort: 8081, Protocol: corev1.ProtocolTCP}},
+						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt32(8081)}}, InitialDelaySeconds: 2, PeriodSeconds: 10},
+						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt32(8081)}}, InitialDelaySeconds: 5, PeriodSeconds: 30, TimeoutSeconds: 3},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func relayWebSocketService(options Options, labels map[string]string) *corev1.Service {
+	port := corev1.ServicePort{Name: "http-websocket", Port: 8081, TargetPort: intstr.FromInt32(8081), Protocol: corev1.ProtocolTCP}
+	serviceType := corev1.ServiceTypeClusterIP
+	if options.Relay == RelayNodePort {
+		serviceType = corev1.ServiceTypeNodePort
+		port.NodePort = 30478
+	}
+	return &corev1.Service{TypeMeta: typeMeta("v1", "Service"), ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay-ws", Namespace: options.Namespace, Labels: labels}, Spec: corev1.ServiceSpec{Type: serviceType, Selector: map[string]string{"app.kubernetes.io/name": "wirekube-relay-ws"}, Ports: []corev1.ServicePort{port}}}
+}
+
+func relayWebSocketPath(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Path == "" {
+		return "/relay"
+	}
+	return parsed.Path
 }
 
 func relayArgs(options Options) []string {
@@ -253,16 +358,20 @@ func meshObject(options Options) *wirekubev1alpha1.WireKubeMesh {
 	case RelayNone:
 		mesh.Spec.Relay = nil
 	case RelayLoadBalancer:
-		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "managed", Managed: &wirekubev1alpha1.ManagedRelaySpec{Replicas: 1, ServiceType: string(corev1.ServiceTypeLoadBalancer), Port: 3478, Image: options.Image}}
+		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "managed", Managed: &wirekubev1alpha1.ManagedRelaySpec{Replicas: 1, ServiceType: string(corev1.ServiceTypeLoadBalancer), Port: 3478, Image: options.Image, ControlEndpoint: options.RelayEndpoint, Transport: options.RelayTransport}}
 	case RelayNodePort:
-		external := &wirekubev1alpha1.ExternalRelaySpec{ControlEndpoint: options.RelayEndpoint, Transport: "tcp"}
+		external := &wirekubev1alpha1.ExternalRelaySpec{ControlEndpoint: options.RelayEndpoint, Transport: options.RelayTransport}
 		if options.RelayUDP {
-			host, _, _ := net.SplitHostPort(options.RelayEndpoint)
-			external.Endpoint = net.JoinHostPort(host, "30479")
+			if options.RelayTransport == RelayTransportWSS {
+				external.Endpoint = options.RelayUDPEndpoint
+			} else {
+				host, _, _ := net.SplitHostPort(options.RelayEndpoint)
+				external.Endpoint = net.JoinHostPort(host, "30479")
+			}
 		}
 		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "external", External: external}
 	case RelayExternal:
-		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "external", External: &wirekubev1alpha1.ExternalRelaySpec{Endpoint: options.RelayUDPEndpoint, ControlEndpoint: options.RelayEndpoint, Transport: "tcp"}}
+		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "external", External: &wirekubev1alpha1.ExternalRelaySpec{Endpoint: options.RelayUDPEndpoint, ControlEndpoint: options.RelayEndpoint, Transport: options.RelayTransport}}
 	}
 	return mesh
 }

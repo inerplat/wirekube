@@ -234,12 +234,11 @@ spec:
 Internet ---- TCP LB :3478 ---- Relay Pod/Server :3478
 ```
 
-The relay's TCP transport was specifically designed to work with TCP-only
-load balancer offerings.
+The relay's TCP transport was specifically designed to work with TCP-only load balancer offerings.
 
 HTTP application load balancers and Kubernetes Ingress controllers generally cannot carry this raw TCP protocol. See [Relay Entry Points](../guides/relay-entrypoints.md) for the recommended LoadBalancer path, the NodePort alternative, and HTTP CONNECT forward-proxy examples.
 
-The proposed [WebSocket Relay Endpoint](websocket-relay.md) adds `wss://.../relay` with Kubernetes-issued bearer-token authentication for ALB and Ingress environments.
+The implemented [WebSocket Relay Endpoint](websocket-relay.md) adds `wss://.../relay` with Kubernetes-issued bearer-token authentication for ALB and Ingress environments. Easy install selects it with `--relay-transport wss --relay-endpoint wss://HOST/PATH`.
 
 ## Capacity
 

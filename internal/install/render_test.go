@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +39,35 @@ func TestOptionsRejectNonNumericRelayEndpointPort(t *testing.T) {
 	}
 }
 
+func TestLoadBalancerDefaultsToUDP(t *testing.T) {
+	options := Options{Image: testImage, Relay: RelayLoadBalancer}
+	if err := options.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !options.RelayUDP {
+		t.Fatal("load-balancer relay did not enable UDP by default")
+	}
+}
+
+func TestLoadBalancerAllowsExplicitUDPDisable(t *testing.T) {
+	options := Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDPConfigured: true}
+	if err := options.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if options.RelayUDP {
+		t.Fatal("explicit --relay-udp=false was overwritten")
+	}
+}
+
+func TestOptionsRequireWSSURLAndPath(t *testing.T) {
+	for _, endpoint := range []string{"", "https://relay.example.test/relay", "wss://relay.example.test"} {
+		options := Options{Image: testImage, Relay: RelayExternal, RelayTransport: RelayTransportWSS, RelayEndpoint: endpoint}
+		if err := options.Normalize(); err == nil {
+			t.Fatalf("endpoint %q was accepted", endpoint)
+		}
+	}
+}
+
 func TestRenderUsesPortableDefaultsAndSeparateRelayServices(t *testing.T) {
 	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
 	if err != nil {
@@ -67,6 +97,123 @@ func TestRenderUsesPortableDefaultsAndSeparateRelayServices(t *testing.T) {
 	}
 	if len(services["wirekube-relay-udp"]) != 1 || services["wirekube-relay-udp"][0].Protocol != corev1.ProtocolUDP {
 		t.Fatalf("UDP relay service=%v", services["wirekube-relay-udp"])
+	}
+}
+
+func TestRenderManagedWSSGatewayAndUDPLoadBalancer(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := map[string]*corev1.Service{}
+	deployments := map[string]*appsv1.Deployment{}
+	var mesh *wirekubev1alpha1.WireKubeMesh
+	var relayServiceAccount *corev1.ServiceAccount
+	var relayRole *rbacv1.ClusterRole
+	for _, object := range bundle.Objects {
+		switch typed := object.(type) {
+		case *corev1.Service:
+			services[typed.Name] = typed
+		case *appsv1.Deployment:
+			deployments[typed.Name] = typed
+		case *corev1.ServiceAccount:
+			if typed.Name == "wirekube-relay" {
+				relayServiceAccount = typed
+			}
+		case *rbacv1.ClusterRole:
+			if typed.Name == "wirekube-relay" {
+				relayRole = typed
+			}
+		case *wirekubev1alpha1.WireKubeMesh:
+			mesh = typed
+		}
+	}
+	if services["wirekube-relay"] != nil {
+		t.Fatal("managed WSS rendered an unused public TCP LoadBalancer")
+	}
+	if service := services["wirekube-relay-ws"]; service == nil || service.Spec.Type != corev1.ServiceTypeClusterIP || service.Spec.Ports[0].Port != 8081 {
+		t.Fatalf("WebSocket backend Service=%+v", service)
+	}
+	if service := services["wirekube-relay-udp"]; service == nil || service.Spec.Type != corev1.ServiceTypeLoadBalancer || service.Spec.Ports[0].Protocol != corev1.ProtocolUDP {
+		t.Fatalf("UDP LoadBalancer Service=%+v", service)
+	}
+	deployment := deployments["wirekube-relay-ws"]
+	if deployment == nil || deployment.Spec.Template.Spec.ServiceAccountName != "wirekube-relay" {
+		t.Fatalf("WebSocket Deployment=%+v", deployment)
+	}
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 2 {
+		t.Fatalf("WebSocket replicas=%v, want 2", deployment.Spec.Replicas)
+	}
+	if deployment.Spec.Template.Spec.Affinity == nil || deployment.Spec.Template.Spec.Affinity.PodAntiAffinity == nil || len(deployment.Spec.Template.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) == 0 {
+		t.Fatal("WebSocket Deployment does not prefer spreading replicas across nodes")
+	}
+	args := strings.Join(deployment.Spec.Template.Spec.Containers[0].Args, " ")
+	if !strings.Contains(args, "--path=/relay") || !strings.Contains(args, "--agent-service-account=wirekube-system/wirekube-agent") {
+		t.Fatalf("WebSocket gateway args=%q", args)
+	}
+	if relayServiceAccount == nil || relayRole == nil {
+		t.Fatalf("relay authentication RBAC missing: serviceAccount=%v role=%v", relayServiceAccount, relayRole)
+	}
+	if mesh == nil || mesh.Spec.Relay == nil || mesh.Spec.Relay.Managed == nil {
+		t.Fatal("managed relay configuration was not rendered")
+	}
+	if managed := mesh.Spec.Relay.Managed; managed.Transport != RelayTransportWSS || managed.ControlEndpoint != "wss://relay.example.test/relay" {
+		t.Fatalf("managed relay=%+v", managed)
+	}
+}
+
+func TestAgentRelayConfigRevisionChangesWithTransportAndEndpoint(t *testing.T) {
+	tcpBundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wssBundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wssEndpointBundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay-alt.example.test/relay", RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := func(bundle *Bundle) string {
+		for _, object := range bundle.Objects {
+			if daemonSet, ok := object.(*appsv1.DaemonSet); ok && daemonSet.Name == "wirekube-agent" {
+				return daemonSet.Spec.Template.Annotations["wirekube.io/relay-config-revision"]
+			}
+		}
+		return ""
+	}
+	tcpRevision, wssRevision, wssEndpointRevision := revision(tcpBundle), revision(wssBundle), revision(wssEndpointBundle)
+	if tcpRevision == "" || wssRevision == "" || wssEndpointRevision == "" || tcpRevision == wssRevision || wssRevision == wssEndpointRevision {
+		t.Fatalf("relay config revisions: tcp=%q wss=%q wssEndpoint=%q", tcpRevision, wssRevision, wssEndpointRevision)
+	}
+}
+
+func TestRenderNodePortWSSUsesSeparateUDPAddress(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayNodePort, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", RelayUDP: true, RelayUDPEndpoint: "203.0.113.10:30479", MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mesh *wirekubev1alpha1.WireKubeMesh
+	var wsService *corev1.Service
+	for _, object := range bundle.Objects {
+		switch typed := object.(type) {
+		case *wirekubev1alpha1.WireKubeMesh:
+			mesh = typed
+		case *corev1.Service:
+			if typed.Name == "wirekube-relay-ws" {
+				wsService = typed
+			}
+		}
+	}
+	if wsService == nil || wsService.Spec.Type != corev1.ServiceTypeNodePort || wsService.Spec.Ports[0].NodePort != 30478 {
+		t.Fatalf("WebSocket NodePort Service=%+v", wsService)
+	}
+	if mesh == nil || mesh.Spec.Relay == nil || mesh.Spec.Relay.External == nil {
+		t.Fatal("external relay configuration was not rendered")
+	}
+	if external := mesh.Spec.Relay.External; external.Transport != RelayTransportWSS || external.ControlEndpoint != "wss://relay.example.test/relay" || external.Endpoint != "203.0.113.10:30479" {
+		t.Fatalf("external relay=%+v", external)
 	}
 }
 
@@ -272,13 +419,76 @@ func TestPlannerFailsWhenAccessPreflightIsDenied(t *testing.T) {
 	}
 }
 
+func TestPlannerIncludesCreatePermissionsForWSSResources(t *testing.T) {
+	previous, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "203.0.113.0/24", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reviewer := &testAccessReviewer{}
+	_, _, err = (Planner{Client: c, AccessReviewer: reviewer}).Build(context.Background(), Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", PreviousResources: previous.Resources, MeshCIDR: "203.0.113.0/24", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []AccessRequirement{
+		{Group: "apps", Resource: "deployments", Verb: "create", Namespace: "wirekube-system"},
+		{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Verb: "create"},
+		{Resource: "serviceaccounts", Verb: "create", Namespace: "wirekube-system"},
+	} {
+		if !containsAccessRequirement(reviewer.requirements, want) {
+			t.Fatalf("missing access requirement %+v in %v", want, reviewer.requirements)
+		}
+	}
+}
+
+func TestPlannerIncludesDeletePermissionsForPreviousWSSResources(t *testing.T) {
+	previous, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "203.0.113.0/24", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reviewer := &testAccessReviewer{}
+	_, _, err = (Planner{Client: c, AccessReviewer: reviewer}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, PreviousResources: previous.Resources, MeshCIDR: "203.0.113.0/24", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []AccessRequirement{
+		{Group: "apps", Resource: "deployments", Verb: "delete", Namespace: "wirekube-system", Name: "wirekube-relay-ws"},
+		{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Verb: "delete", Name: "wirekube-relay"},
+		{Resource: "serviceaccounts", Verb: "delete", Namespace: "wirekube-system", Name: "wirekube-relay"},
+	} {
+		if !containsAccessRequirement(reviewer.requirements, want) {
+			t.Fatalf("missing access requirement %+v in %v", want, reviewer.requirements)
+		}
+	}
+}
+
+func containsAccessRequirement(requirements []AccessRequirement, want AccessRequirement) bool {
+	for _, requirement := range requirements {
+		if requirement == want {
+			return true
+		}
+	}
+	return false
+}
+
 type testAccessReviewer struct {
-	called bool
-	err    error
+	called       bool
+	err          error
+	requirements []AccessRequirement
 }
 
 func (r *testAccessReviewer) Review(_ context.Context, requirements []AccessRequirement) error {
 	r.called = true
+	r.requirements = append([]AccessRequirement(nil), requirements...)
 	if len(requirements) == 0 {
 		return fmt.Errorf("no access requirements were provided")
 	}

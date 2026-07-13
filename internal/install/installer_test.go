@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -172,7 +173,6 @@ func TestUpgradeInventoryFailureRestoresPreviousObjects(t *testing.T) {
 	if _, err := (Installer{Client: c}).Apply(ctx, Plan{}, oldOptions, "install"); err != nil {
 		t.Fatal(err)
 	}
-
 	newOptions := oldOptions
 	newOptions.Image = "registry.example.test/wirekube@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	c.failPatchName = InventoryName
@@ -228,6 +228,55 @@ func TestUpgradeStaleDeleteFailureRestoresInventoryAndDeletedResources(t *testin
 	}
 	if inventory.Options.Relay != RelayLoadBalancer || !inventory.Options.RelayUDP {
 		t.Fatalf("inventory options were not rolled back: %+v", inventory.Options)
+	}
+}
+
+func TestUpgradeFromTCPLoadBalancerToWSSReplacesEntrypoint(t *testing.T) {
+	scheme := installTestScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := &applyTestClient{Client: base, ready: true}
+	oldOptions := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only", WireKubeVersion: "v1.0.0"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := (Installer{Client: c}).Apply(ctx, Plan{}, oldOptions, "install"); err != nil {
+		t.Fatal(err)
+	}
+	oldDaemonSet := &appsv1.DaemonSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: oldOptions.Namespace, Name: "wirekube-agent"}, oldDaemonSet); err != nil {
+		t.Fatal(err)
+	}
+	oldRevision := oldDaemonSet.Spec.Template.Annotations["wirekube.io/relay-config-revision"]
+
+	newOptions := oldOptions
+	newOptions.RelayTransport = RelayTransportWSS
+	newOptions.RelayEndpoint = "wss://relay.example.test/relay"
+	if _, err := (Installer{Client: c}).Apply(ctx, Plan{}, newOptions, "upgrade"); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: oldOptions.Namespace, Name: "wirekube-relay"}, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("raw TCP LoadBalancer was not removed: %v", err)
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: oldOptions.Namespace, Name: "wirekube-relay-ws"}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("WebSocket gateway Deployment missing: %v", err)
+	}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: oldOptions.Namespace, Name: "wirekube-relay-udp"}, &corev1.Service{}); err != nil {
+		t.Fatalf("UDP LoadBalancer missing: %v", err)
+	}
+	newDaemonSet := &appsv1.DaemonSet{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: oldOptions.Namespace, Name: "wirekube-agent"}, newDaemonSet); err != nil {
+		t.Fatal(err)
+	}
+	newRevision := newDaemonSet.Spec.Template.Annotations["wirekube.io/relay-config-revision"]
+	if oldRevision == "" || newRevision == "" || oldRevision == newRevision {
+		t.Fatalf("agent relay config revision did not change: old=%q new=%q", oldRevision, newRevision)
+	}
+	inventory, err := (Installer{Client: base}).LoadInventory(ctx, oldOptions.Namespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.Options.RelayTransport != RelayTransportWSS || inventory.Options.RelayEndpoint != newOptions.RelayEndpoint || !inventory.Options.RelayUDP {
+		t.Fatalf("inventory options=%+v", inventory.Options)
 	}
 }
 
@@ -292,6 +341,19 @@ func TestSameInstallConfigIgnoresTransientFlags(t *testing.T) {
 	right.Image = "registry.example.test/wirekube@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if sameInstallConfig(left, right) {
 		t.Fatal("different images were treated as the same installation")
+	}
+}
+
+func TestSameInstallConfigTreatsLegacyEmptyTransportAsTCP(t *testing.T) {
+	legacy := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only"}
+	current := legacy
+	current.RelayTransport = RelayTransportTCP
+	if !sameInstallConfig(legacy, current) {
+		t.Fatal("legacy empty relay transport was not treated as tcp")
+	}
+	current.RelayTransport = RelayTransportWSS
+	if sameInstallConfig(legacy, current) {
+		t.Fatal("wss transport was treated as the legacy tcp transport")
 	}
 }
 
@@ -475,9 +537,13 @@ func (c *applyTestClient) setStatus(object client.Object) {
 		typed.Status.NumberReady = 1
 		typed.Status.NumberAvailable = 1
 	case *appsv1.Deployment:
-		typed.Status.UpdatedReplicas = 1
-		typed.Status.ReadyReplicas = 1
-		typed.Status.AvailableReplicas = 1
+		desired := int32(1)
+		if typed.Spec.Replicas != nil {
+			desired = *typed.Spec.Replicas
+		}
+		typed.Status.UpdatedReplicas = desired
+		typed.Status.ReadyReplicas = desired
+		typed.Status.AvailableReplicas = desired
 	case *wirekubev1alpha1.WireKubeMesh:
 		typed.Status.TotalPeers = 1
 		typed.Status.ReadyPeers = 1

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -242,6 +243,10 @@ func relayControlAddrFromMesh(mesh *wirekubev1alpha1.WireKubeMesh, _ string) str
 		return ""
 	}
 	if mesh.Spec.Relay.External != nil {
+		transport := strings.ToLower(strings.TrimSpace(mesh.Spec.Relay.External.Transport))
+		if transport == "ws" || transport == "wss" {
+			return ""
+		}
 		return mesh.Spec.Relay.External.ControlEndpoint
 	}
 	return ""

@@ -10,6 +10,8 @@ import (
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -76,11 +78,6 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 	if err := options.Normalize(); err != nil {
 		return Plan{}, options, err
 	}
-	if p.AccessReviewer != nil {
-		if err := p.AccessReviewer.Review(ctx, installationAccessRequirements(options)); err != nil {
-			return Plan{}, options, err
-		}
-	}
 	autoMeshCIDR := options.MeshCIDR == "auto"
 	if autoMeshCIDR && options.Yes && !options.DryRun {
 		return Plan{}, options, fmt.Errorf("--mesh-cidr must be explicit for non-interactive installation; automatic selection cannot inspect every VPC, corporate, or node route (use --exclude-cidr during dry-run to evaluate candidates)")
@@ -109,6 +106,20 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 	if err != nil {
 		return Plan{}, options, err
 	}
+	if p.AccessReviewer != nil {
+		requirements := installationAccessRequirements(options)
+		createResources := bundle.Resources
+		if len(options.PreviousResources) > 0 {
+			createResources = addedResources(options.PreviousResources, bundle.Resources)
+		} else {
+			requirements = append(requirements, AccessRequirement{Resource: "configmaps", Verb: "create", Namespace: options.Namespace})
+		}
+		requirements = append(requirements, resourceAccessRequirements(createResources, "create")...)
+		requirements = append(requirements, resourceAccessRequirements(staleResources(options.PreviousResources, bundle.Resources), "delete")...)
+		if err := p.AccessReviewer.Review(ctx, dedupeAccessRequirements(requirements)); err != nil {
+			return Plan{}, options, err
+		}
+	}
 	detection, err := p.detect(ctx)
 	if err != nil {
 		return Plan{}, options, err
@@ -124,6 +135,7 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 		Relay:            options.Relay,
 		RelayEndpoint:    options.RelayEndpoint,
 		RelayUDPEndpoint: options.RelayUDPEndpoint,
+		RelayTransport:   options.RelayTransport,
 		RelayUDP:         options.RelayUDP,
 		MeshCIDR:         options.MeshCIDR,
 		NodeAddresses:    options.NodeAddresses,
@@ -138,15 +150,29 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 	}
 	switch options.Relay {
 	case RelayLoadBalancer:
-		plan.Impact = append(plan.Impact, "one public TCP LoadBalancer")
-		plan.Warnings = append(plan.Warnings, "the selected relay creates a public LoadBalancer and may incur provider charges")
+		if options.RelayTransport == RelayTransportWSS {
+			plan.Impact = append(plan.Impact, "one internal HTTP WebSocket Service for TLS termination by an existing Gateway or Ingress")
+			plan.Warnings = append(plan.Warnings, "the WSS hostname, certificate, and public Gateway or Ingress are not provisioned by this installation")
+		} else {
+			plan.Impact = append(plan.Impact, "one public TCP LoadBalancer")
+		}
 		if options.RelayUDP {
 			plan.Impact = append(plan.Impact, "one separate public UDP LoadBalancer")
 		}
+		if options.RelayTransport == RelayTransportTCP || options.RelayUDP {
+			plan.Warnings = append(plan.Warnings, "the selected relay creates a public LoadBalancer and may incur provider charges")
+		}
 	case RelayNodePort:
-		plan.Impact = append(plan.Impact, "TCP NodePort 30478 on cluster nodes")
+		if options.RelayTransport == RelayTransportWSS {
+			plan.Impact = append(plan.Impact, "HTTP WebSocket NodePort 30478 for an upstream TLS terminator")
+			plan.Warnings = append(plan.Warnings, "the WSS hostname, certificate, and TLS terminator are not provisioned by this installation")
+		} else {
+			plan.Impact = append(plan.Impact, "TCP NodePort 30478 on cluster nodes")
+		}
 		if options.RelayUDP {
 			plan.Impact = append(plan.Impact, "UDP NodePort 30479 on cluster nodes")
+		} else {
+			plan.Warnings = append(plan.Warnings, "external peer invites remain Pending until the UDP NodePort is enabled")
 		}
 	case RelayExternal:
 		plan.Warnings = append(plan.Warnings, "the external relay endpoint is not provisioned or owned by this installation")
@@ -197,15 +223,76 @@ func installationAccessRequirements(options Options) []AccessRequirement {
 			AccessRequirement{Group: "apps", Resource: "deployments", Verb: "patch", Namespace: options.Namespace, Name: "wirekube-relay"},
 			AccessRequirement{Group: "apps", Resource: "deployments", Verb: "delete", Namespace: options.Namespace, Name: "wirekube-relay"},
 		)
-		for _, name := range []string{"wirekube-relay-control", "wirekube-relay", "wirekube-relay-udp"} {
+		serviceNames := []string{"wirekube-relay-control", "wirekube-relay", "wirekube-relay-udp", "wirekube-relay-ws"}
+		for _, name := range serviceNames {
 			requirements = append(requirements,
 				AccessRequirement{Resource: "services", Verb: "get", Namespace: options.Namespace, Name: name},
 				AccessRequirement{Resource: "services", Verb: "patch", Namespace: options.Namespace, Name: name},
 				AccessRequirement{Resource: "services", Verb: "delete", Namespace: options.Namespace, Name: name},
 			)
 		}
+		if options.RelayTransport == RelayTransportWSS {
+			requirements = append(requirements,
+				AccessRequirement{Resource: "serviceaccounts", Verb: "get", Namespace: options.Namespace, Name: "wirekube-relay"},
+				AccessRequirement{Resource: "serviceaccounts", Verb: "patch", Namespace: options.Namespace, Name: "wirekube-relay"},
+				AccessRequirement{Resource: "serviceaccounts", Verb: "delete", Namespace: options.Namespace, Name: "wirekube-relay"},
+				AccessRequirement{Group: "apps", Resource: "deployments", Verb: "get", Namespace: options.Namespace, Name: "wirekube-relay-ws"},
+				AccessRequirement{Group: "apps", Resource: "deployments", Verb: "patch", Namespace: options.Namespace, Name: "wirekube-relay-ws"},
+				AccessRequirement{Group: "apps", Resource: "deployments", Verb: "delete", Namespace: options.Namespace, Name: "wirekube-relay-ws"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Verb: "get", Name: "wirekube-relay"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Verb: "patch", Name: "wirekube-relay"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Verb: "delete", Name: "wirekube-relay"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings", Verb: "get", Name: "wirekube-relay"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings", Verb: "patch", Name: "wirekube-relay"},
+				AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings", Verb: "delete", Name: "wirekube-relay"},
+			)
+		}
 	}
 	return requirements
+}
+
+func resourceAccessRequirements(resources []Resource, verb string) []AccessRequirement {
+	requirements := make([]AccessRequirement, 0, len(resources))
+	for _, resource := range resources {
+		groupVersion, err := schema.ParseGroupVersion(resource.APIVersion)
+		if err != nil {
+			continue
+		}
+		groupResource, _ := meta.UnsafeGuessKindToResource(groupVersion.WithKind(resource.Kind))
+		name := resource.Name
+		if verb == "create" {
+			name = ""
+		}
+		requirements = append(requirements, AccessRequirement{Group: groupResource.Group, Resource: groupResource.Resource, Verb: verb, Namespace: resource.Namespace, Name: name})
+	}
+	return requirements
+}
+
+func addedResources(previous, current []Resource) []Resource {
+	previousKeys := make(map[string]struct{}, len(previous))
+	for _, resource := range previous {
+		previousKeys[resourceIdentity(resource)] = struct{}{}
+	}
+	added := make([]Resource, 0)
+	for _, resource := range current {
+		if _, exists := previousKeys[resourceIdentity(resource)]; !exists {
+			added = append(added, resource)
+		}
+	}
+	return added
+}
+
+func dedupeAccessRequirements(requirements []AccessRequirement) []AccessRequirement {
+	seen := make(map[AccessRequirement]struct{}, len(requirements))
+	result := make([]AccessRequirement, 0, len(requirements))
+	for _, requirement := range requirements {
+		if _, exists := seen[requirement]; exists {
+			continue
+		}
+		seen[requirement] = struct{}{}
+		result = append(result, requirement)
+	}
+	return result
 }
 
 func (p Planner) detect(ctx context.Context) (Detection, error) {
