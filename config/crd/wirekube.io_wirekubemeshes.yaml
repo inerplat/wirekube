@@ -230,6 +230,11 @@ spec:
                       Managed configures the operator-managed relay (Pod + LB).
                       Required when provider is "managed".
                     properties:
+                      controlEndpoint:
+                        description: |-
+                          ControlEndpoint is the public WSS URL agents use when Transport is wss.
+                          TLS is terminated by an Ingress or Gateway in front of the managed WebSocket Service.
+                        type: string
                       image:
                         description: Image overrides the relay container image.
                         type: string
@@ -272,6 +277,14 @@ spec:
                         enum:
                         - LoadBalancer
                         - NodePort
+                        type: string
+                      transport:
+                        default: tcp
+                        description: Transport selects the single protocol agents
+                          use to connect to the managed relay.
+                        enum:
+                        - tcp
+                        - wss
                         type: string
                     type: object
                   mode:

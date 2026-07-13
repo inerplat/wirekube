@@ -1,6 +1,6 @@
 ---
 # Use this shape when an agent cannot use the managed relay's cluster-local control Service.
-# Replace the endpoint with a reachable cluster node address.
+# Replace both endpoints with a reachable cluster node address.
 apiVersion: wirekube.io/v1alpha1
 kind: WireKubeMesh
 metadata:
@@ -16,7 +16,8 @@ spec:
     mode: auto
     provider: external
     external:
-      endpoint: "REPLACE_WITH_PUBLIC_NODE_IP:30478"
+      endpoint: "REPLACE_WITH_PUBLIC_NODE_IP:30479"
+      controlEndpoint: "REPLACE_WITH_PUBLIC_NODE_IP:30478"
       transport: tcp
     handshakeTimeoutSeconds: 30
     directRetryIntervalSeconds: 120

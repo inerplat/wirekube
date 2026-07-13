@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -179,6 +181,53 @@ func TestWriteDoctorResultReturnsFailureAfterWritingJSON(t *testing.T) {
 	}
 }
 
+func TestCheckRelayReachabilityRequiresWireKubeBearerChallenge(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		challenge  string
+		want       bool
+	}{
+		{name: "wirekube challenge", statusCode: http.StatusUnauthorized, challenge: "Bearer", want: true},
+		{name: "generic forbidden", statusCode: http.StatusForbidden, want: false},
+		{name: "unrelated unauthorized", statusCode: http.StatusUnauthorized, challenge: "Basic realm=login", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.challenge != "" {
+					w.Header().Set("WWW-Authenticate", tt.challenge)
+				}
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer server.Close()
+			previousClient := relayReachabilityHTTPClient
+			relayReachabilityHTTPClient = server.Client()
+			t.Cleanup(func() { relayReachabilityHTTPClient = previousClient })
+			inventory := &internalinstall.Inventory{Options: internalinstall.Options{Relay: internalinstall.RelayExternal, RelayTransport: internalinstall.RelayTransportWSS, RelayEndpoint: "wss" + strings.TrimPrefix(server.URL, "https") + "/relay"}}
+			got, _ := checkRelayReachability(context.Background(), nil, inventory)
+			if got != tt.want {
+				t.Fatalf("reachable=%t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeploymentStatusReadyUsesDesiredReplicas(t *testing.T) {
+	replicas := int32(2)
+	deployment := &appsv1.Deployment{
+		Spec:   appsv1.DeploymentSpec{Replicas: &replicas},
+		Status: appsv1.DeploymentStatus{UpdatedReplicas: 2, ReadyReplicas: 2, AvailableReplicas: 2},
+	}
+	if !deploymentStatusReady(deployment) {
+		t.Fatal("two-replica Deployment was not ready")
+	}
+	deployment.Status.ReadyReplicas = 1
+	if deploymentStatusReady(deployment) {
+		t.Fatal("partially ready Deployment was accepted")
+	}
+}
+
 func TestUpgradeUsesReleasedDefaultImageInsteadOfStoredImage(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.Flags().String("image", "", "")
@@ -194,6 +243,25 @@ func TestUpgradeUsesReleasedDefaultImageInsteadOfStoredImage(t *testing.T) {
 	applyStoredLifecycleDefaults(cmd, flags, stored)
 	if flags.image != stored.Image {
 		t.Fatalf("image=%q, want stored fallback %q", flags.image, stored.Image)
+	}
+}
+
+func TestUpgradePreservesStoredRelayTransportAndExplicitUDPDisable(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("relay-transport", internalinstall.RelayTransportTCP, "")
+	cmd.Flags().Bool("relay-udp", false, "")
+	cmd.Flags().String("relay", "", "")
+	cmd.Flags().String("relay-endpoint", "", "")
+	cmd.Flags().String("relay-udp-endpoint", "", "")
+	cmd.Flags().String("mesh-cidr", "auto", "")
+	cmd.Flags().String("node-addresses", "mesh-only", "")
+	cmd.Flags().String("image", lifecycleTestImage, "")
+	flags := &lifecycleFlags{relayTransport: internalinstall.RelayTransportTCP, image: lifecycleTestImage}
+	stored := internalinstall.Options{Relay: internalinstall.RelayLoadBalancer, RelayEndpoint: "wss://relay.example.test/relay", RelayTransport: internalinstall.RelayTransportWSS, RelayUDP: false}
+
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if flags.relayTransport != internalinstall.RelayTransportWSS || flags.relayUDP || !flags.relayUDPConfigured {
+		t.Fatalf("stored relay defaults were not preserved: %+v", flags)
 	}
 }
 
