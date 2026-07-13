@@ -47,6 +47,24 @@ func TestRelayControlAddrFromMeshDoesNotUsePublicEndpoint(t *testing.T) {
 	}
 }
 
+func TestRelayControlAddrFromMeshDoesNotTreatWSSAsLegacyTCPControl(t *testing.T) {
+	mesh := &wirekubev1alpha1.WireKubeMesh{
+		Spec: wirekubev1alpha1.WireKubeMeshSpec{
+			Relay: &wirekubev1alpha1.RelaySpec{
+				External: &wirekubev1alpha1.ExternalRelaySpec{
+					Endpoint:        "relay.example.com:3478",
+					ControlEndpoint: "wss://relay.example.com/relay",
+					Transport:       "wss",
+				},
+			},
+		},
+	}
+
+	if got := relayControlAddrFromMesh(mesh, "wirekube-system"); got != "" {
+		t.Fatalf("relayControlAddrFromMesh = %q, want empty for WSS", got)
+	}
+}
+
 func TestRelayEndpointFromMeshExternalKeepsPort(t *testing.T) {
 	mesh := &wirekubev1alpha1.WireKubeMesh{
 		Spec: wirekubev1alpha1.WireKubeMeshSpec{

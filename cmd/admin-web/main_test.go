@@ -751,6 +751,20 @@ func TestDeletePeerRejectsMissingCSRF(t *testing.T) {
 	}
 }
 
+func TestRelaySummaryShowsManagedWSSControlEndpoint(t *testing.T) {
+	relay := &wirekubev1alpha1.RelaySpec{
+		Provider: "managed",
+		Mode:     "auto",
+		Managed: &wirekubev1alpha1.ManagedRelaySpec{
+			ControlEndpoint: "wss://relay.example.test/relay",
+			Transport:       "wss",
+		},
+	}
+	if got := relaySummary(relay); got != "managed/auto wss://relay.example.test/relay" {
+		t.Fatalf("relaySummary=%q", got)
+	}
+}
+
 func activePeer(ctx context.Context, c client.Client, name string, _ time.Duration) (*wirekubev1alpha1.WireKubeExternalPeer, error) {
 	active := &wirekubev1alpha1.WireKubeExternalPeer{
 		ObjectMeta: metav1.ObjectMeta{

@@ -1436,18 +1436,13 @@ func applyWireKubeMeshCR(ctx context.Context, stunServers []string, relayEndpoin
 	mesh.Name = meshName
 	mesh.Spec.ListenPort = wgPort
 	mesh.Spec.STUNServers = stunServers
-	mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{
-		Mode:     "auto",
-		Provider: "external",
-		External: &wirekubev1alpha1.ExternalRelaySpec{
-			Endpoint:  relayEndpoint,
-			Transport: relayTransport(),
-		},
-		HandshakeTimeoutSeconds:    15,
-		DirectRetryIntervalSeconds: 30,
-	}
+	mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", HandshakeTimeoutSeconds: 15, DirectRetryIntervalSeconds: 30}
 	if relayTransport() == relayTransportWSS {
-		mesh.Spec.Relay.External.ControlEndpoint = fmt.Sprintf("wss://%s:8443/relay", cpNode().ip)
+		mesh.Spec.Relay.Provider = "managed"
+		mesh.Spec.Relay.Managed = &wirekubev1alpha1.ManagedRelaySpec{Port: 3478, Transport: relayTransportWSS, ControlEndpoint: fmt.Sprintf("wss://%s:8443/relay", cpNode().ip)}
+	} else {
+		mesh.Spec.Relay.Provider = "external"
+		mesh.Spec.Relay.External = &wirekubev1alpha1.ExternalRelaySpec{Endpoint: relayEndpoint, Transport: relayTransportTCP}
 	}
 	mesh.Spec.NATTraversal = &wirekubev1alpha1.NATTraversalSpec{
 		HandshakeValidWindowSeconds:  10,

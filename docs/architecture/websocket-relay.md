@@ -81,7 +81,7 @@ Reject normal HTTP bodies, unauthenticated upgrades, unsupported origins when br
 
 ## Configuration Shape
 
-The agent selects exactly one relay transport from `external.transport`. `tcp` uses the raw endpoint, while `ws` and `wss` require `external.controlEndpoint`. The raw `external.endpoint` remains separate because external WireGuard peers still need the UDP relay address.
+The agent selects exactly one relay transport from the `WireKubeMesh`. External relays use `external.transport`; installer-managed relays use `managed.transport`. `tcp` uses a raw control endpoint, while `ws` and `wss` use `controlEndpoint`. The raw external `endpoint` remains separate because NAT probing and external WireGuard peers may still need the UDP relay address.
 
 ```yaml
 relay:
@@ -92,11 +92,19 @@ relay:
     transport: wss
 ```
 
+```yaml
+relay:
+  provider: managed
+  managed:
+    controlEndpoint: "wss://relay.example.com/relay"
+    transport: wss
+```
+
 For projected ServiceAccount tokens, `authSecretRef` is not required; the agent reads the rotated projected token from `/var/run/secrets/wirekube-relay/token`. `authSecretRef` remains reserved for manually issued tokens and non-DaemonSet clients.
 
-Do not override the selected endpoint with a DaemonSet environment variable. Upgrade every agent while the mesh remains on `transport: tcp`, verify the new version, then change the WireKubeMesh to `transport: wss` and restart agents in a controlled rollout. An old agent treats `controlEndpoint` as raw TCP and cannot safely consume a WSS URL.
+Do not override the selected endpoint with a DaemonSet environment variable. When upgrading from a version that predates WSS support, upgrade every agent while the mesh remains on `transport: tcp`, verify the new version, then change the WireKubeMesh to `transport: wss` and restart agents in a controlled rollout. Easy install records the relay topology in the agent Pod template so transport or endpoint changes trigger the required rolling restart even when the image does not change.
 
-The WSS gateway should run with at least two replicas on different nodes. A single gateway replica turns one Pod or node failure into loss of every WSS relay session even though the raw TCP relay is still healthy.
+For production, scale the WSS gateway to at least two replicas on different nodes. A single gateway replica turns one Pod or node failure into loss of every WSS relay session even though the raw TCP relay is still healthy.
 
 ## Compatibility
 

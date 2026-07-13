@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -26,17 +27,20 @@ import (
 )
 
 type lifecycleFlags struct {
-	relay            string
-	relayEndpoint    string
-	relayUDPEndpoint string
-	relayUDP         bool
-	meshCIDR         string
-	nodeAddresses    string
-	image            string
-	excludeCIDRs     []string
-	yes              bool
-	dryRun           bool
-	adopt            bool
+	relay              string
+	relayEndpoint      string
+	relayUDPEndpoint   string
+	relayTransport     string
+	relayUDP           bool
+	relayUDPConfigured bool
+	previousResources  []internalinstall.Resource
+	meshCIDR           string
+	nodeAddresses      string
+	image              string
+	excludeCIDRs       []string
+	yes                bool
+	dryRun             bool
+	adopt              bool
 }
 
 type componentStatus struct {
@@ -72,6 +76,8 @@ type doctorOutput struct {
 	Checks        []doctorCheck       `json:"checks"`
 	Installation  *installationStatus `json:"installation,omitempty"`
 }
+
+var relayReachabilityHTTPClient = http.DefaultClient
 
 func installCmd() *cobra.Command {
 	flags := &lifecycleFlags{}
@@ -135,6 +141,7 @@ func upgradeCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load existing installation: %w", err)
 			}
+			flags.previousResources = inventory.Resources
 			applyStoredLifecycleDefaults(cmd, flags, inventory.Options)
 			plan, normalized, _, err := buildInstallationPlanWithClient(cmd, flags, c, factory, installer)
 			if err != nil {
@@ -360,10 +367,10 @@ func inspectInstallation(ctx context.Context, c client.Client, inventory *intern
 		deploymentErr := c.Get(ctx, types.NamespacedName{Namespace: inventory.Options.Namespace, Name: "wirekube-relay"}, deployment)
 		relay := componentStatus{Name: "relay", Kind: "Deployment", Message: messageForError(deploymentErr, "")}
 		if deploymentErr == nil {
-			relay.Desired = 1
+			relay.Desired = desiredDeploymentReplicas(deployment)
 			relay.Available = deployment.Status.ReadyReplicas
-			relay.Ready = deployment.Status.ObservedGeneration >= deployment.Generation && deployment.Status.UpdatedReplicas == 1 && deployment.Status.ReadyReplicas == 1 && deployment.Status.AvailableReplicas == 1
-			relay.Message = fmt.Sprintf("%d/1 ready, %d updated", deployment.Status.ReadyReplicas, deployment.Status.UpdatedReplicas)
+			relay.Ready = deploymentStatusReady(deployment)
+			relay.Message = fmt.Sprintf("%d/%d ready, %d updated", deployment.Status.ReadyReplicas, relay.Desired, deployment.Status.UpdatedReplicas)
 			if len(deployment.Spec.Template.Spec.Containers) == 0 || deployment.Spec.Template.Spec.Containers[0].Image != inventory.Image {
 				relay.Ready = false
 				actual := "missing"
@@ -375,7 +382,35 @@ func inspectInstallation(ctx context.Context, c client.Client, inventory *intern
 		}
 		addComponent(relay)
 
-		addComponent(inspectRelayService(ctx, c, inventory.Options.Namespace, "wirekube-relay", "relay-entrypoint", inventory.Options.Relay, corev1.ProtocolTCP))
+		if relayTransport(inventory.Options) == internalinstall.RelayTransportWSS {
+			deployment := &appsv1.Deployment{}
+			deploymentErr := c.Get(ctx, types.NamespacedName{Namespace: inventory.Options.Namespace, Name: "wirekube-relay-ws"}, deployment)
+			gateway := componentStatus{Name: "relay-websocket", Kind: "Deployment", Message: messageForError(deploymentErr, "")}
+			if deploymentErr == nil {
+				gateway.Desired = desiredDeploymentReplicas(deployment)
+				gateway.Available = deployment.Status.ReadyReplicas
+				gateway.Ready = deploymentStatusReady(deployment)
+				gateway.Message = fmt.Sprintf("%d/%d ready, %d updated", deployment.Status.ReadyReplicas, gateway.Desired, deployment.Status.UpdatedReplicas)
+				if len(deployment.Spec.Template.Spec.Containers) == 0 || deployment.Spec.Template.Spec.Containers[0].Image != inventory.Image {
+					gateway.Ready = false
+					actual := "missing"
+					if len(deployment.Spec.Template.Spec.Containers) > 0 {
+						actual = deployment.Spec.Template.Spec.Containers[0].Image
+					}
+					gateway.Message += fmt.Sprintf("; image=%s, inventory=%s", actual, inventory.Image)
+				}
+			}
+			addComponent(gateway)
+			if inventory.Options.Relay == internalinstall.RelayNodePort {
+				addComponent(inspectRelayService(ctx, c, inventory.Options.Namespace, "wirekube-relay-ws", "relay-websocket-backend", inventory.Options.Relay, corev1.ProtocolTCP))
+			} else {
+				addComponent(inspectClusterIPService(ctx, c, inventory.Options.Namespace, "wirekube-relay-ws", "relay-websocket-backend"))
+			}
+			endpoint := strings.TrimSpace(inventory.Options.RelayEndpoint)
+			addComponent(componentStatus{Name: "relay-entrypoint", Kind: "External", Ready: endpoint != "", Message: "WSS control endpoint " + endpoint})
+		} else {
+			addComponent(inspectRelayService(ctx, c, inventory.Options.Namespace, "wirekube-relay", "relay-entrypoint", inventory.Options.Relay, corev1.ProtocolTCP))
+		}
 		if inventory.Options.RelayUDP {
 			addComponent(inspectRelayService(ctx, c, inventory.Options.Namespace, "wirekube-relay-udp", "relay-udp-entrypoint", inventory.Options.Relay, corev1.ProtocolUDP))
 		}
@@ -390,6 +425,32 @@ func inspectInstallation(ctx context.Context, c client.Client, inventory *intern
 
 func checkRelayReachability(ctx context.Context, c client.Client, inventory *internalinstall.Inventory) (bool, string) {
 	endpoint := strings.TrimSpace(inventory.Options.RelayEndpoint)
+	if relayTransport(inventory.Options) == internalinstall.RelayTransportWSS {
+		if endpoint == "" {
+			return false, "WSS control endpoint is not configured"
+		}
+		httpsEndpoint := "https://" + strings.TrimPrefix(endpoint, "wss://")
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, httpsEndpoint, nil)
+		if err != nil {
+			return false, fmt.Sprintf("invalid WSS endpoint %s: %v", endpoint, err)
+		}
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		request.Header.Set("Sec-WebSocket-Version", "13")
+		request.Header.Set("Sec-WebSocket-Key", "d2lyZWt1YmUtZG9jdG9yIQ==")
+		probeCtx, cancel := context.WithTimeout(request.Context(), 3*time.Second)
+		defer cancel()
+		request = request.WithContext(probeCtx)
+		response, err := relayReachabilityHTTPClient.Do(request)
+		if err != nil {
+			return false, fmt.Sprintf("WSS connect to %s failed: %v", endpoint, err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized || !strings.EqualFold(strings.TrimSpace(response.Header.Get("WWW-Authenticate")), "Bearer") {
+			return false, fmt.Sprintf("WSS endpoint %s did not return the WireKube bearer authentication challenge (HTTP %d)", endpoint, response.StatusCode)
+		}
+		return true, fmt.Sprintf("WSS TLS connection to %s reached the authenticated relay gateway", endpoint)
+	}
 	if inventory.Options.Relay == internalinstall.RelayLoadBalancer {
 		service := &corev1.Service{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: inventory.Options.Namespace, Name: "wirekube-relay"}, service); err != nil {
@@ -431,6 +492,25 @@ func checkRelayReachability(ctx context.Context, c client.Client, inventory *int
 	return true, "TCP connect to " + endpoint + " succeeded"
 }
 
+func relayTransport(options internalinstall.Options) string {
+	if strings.TrimSpace(options.RelayTransport) == "" {
+		return internalinstall.RelayTransportTCP
+	}
+	return options.RelayTransport
+}
+
+func desiredDeploymentReplicas(deployment *appsv1.Deployment) int32 {
+	if deployment.Spec.Replicas == nil {
+		return 1
+	}
+	return *deployment.Spec.Replicas
+}
+
+func deploymentStatusReady(deployment *appsv1.Deployment) bool {
+	desired := desiredDeploymentReplicas(deployment)
+	return desired > 0 && deployment.Status.ObservedGeneration >= deployment.Generation && deployment.Status.UpdatedReplicas == desired && deployment.Status.ReadyReplicas == desired && deployment.Status.AvailableReplicas == desired
+}
+
 func inspectRelayService(ctx context.Context, c client.Client, namespace, serviceName, componentName, relayMode string, protocol corev1.Protocol) componentStatus {
 	service := &corev1.Service{}
 	err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: serviceName}, service)
@@ -463,6 +543,22 @@ func inspectRelayService(ctx context.Context, c client.Client, namespace, servic
 	}
 	entrypoint.Message = fmt.Sprintf("%s NodePort is not assigned", protocol)
 	return entrypoint
+}
+
+func inspectClusterIPService(ctx context.Context, c client.Client, namespace, serviceName, componentName string) componentStatus {
+	service := &corev1.Service{}
+	err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: serviceName}, service)
+	component := componentStatus{Name: componentName, Kind: "Service", Message: messageForError(err, "")}
+	if err != nil {
+		return component
+	}
+	component.Ready = service.Spec.ClusterIP != "" && service.Spec.ClusterIP != corev1.ClusterIPNone && len(service.Spec.Ports) == 1 && service.Spec.Ports[0].Port == 8081
+	if component.Ready {
+		component.Message = "HTTP WebSocket backend " + service.Spec.ClusterIP + ":8081"
+	} else {
+		component.Message = "HTTP WebSocket backend Service is not assigned"
+	}
+	return component
 }
 
 func checkInventoryOwnership(ctx context.Context, c client.Client, inventory *internalinstall.Inventory) (bool, string) {
@@ -570,9 +666,10 @@ func uninstallCmd() *cobra.Command {
 
 func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().StringVar(&flags.relay, "relay", "", "relay mode: none, load-balancer, node-port, or external")
-	cmd.Flags().StringVar(&flags.relayEndpoint, "relay-endpoint", "", "external or NodePort relay endpoint as HOST:PORT")
+	cmd.Flags().StringVar(&flags.relayEndpoint, "relay-endpoint", "", "relay control endpoint as HOST:PORT for TCP or wss://HOST/PATH for WSS")
 	cmd.Flags().StringVar(&flags.relayUDPEndpoint, "relay-udp-endpoint", "", "raw WireGuard UDP endpoint for external peer invites as HOST:PORT")
-	cmd.Flags().BoolVar(&flags.relayUDP, "relay-udp", false, "create a separate UDP relay Service")
+	cmd.Flags().StringVar(&flags.relayTransport, "relay-transport", internalinstall.RelayTransportTCP, "agent relay transport: tcp or wss")
+	cmd.Flags().BoolVar(&flags.relayUDP, "relay-udp", false, "create a separate UDP relay Service (defaults to true with load-balancer)")
 	cmd.Flags().StringVar(&flags.meshCIDR, "mesh-cidr", "auto", "mesh CIDR or auto")
 	cmd.Flags().StringVar(&flags.nodeAddresses, "node-addresses", "mesh-only", "node address exposure: mesh-only or internal-ip")
 	cmd.Flags().StringVar(&flags.image, "image", internalversion.DefaultImage, "immutable WireKube image reference (IMAGE@sha256:DIGEST)")
@@ -601,7 +698,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 		return internalinstall.Plan{}, internalinstall.Options{}, installer, err
 	}
 	installOptions := internalinstall.Options{
-		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayUDP: flags.relayUDP, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, WireKubeVersion: internalversion.Version,
+		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, WireKubeVersion: internalversion.Version,
 	}
 	plan, normalized, err := (internalinstall.Planner{Client: c, Discovery: discovery, AccessReviewer: internalinstall.SelfSubjectAccessReviewer{Client: c}}).Build(cmd.Context(), installOptions)
 	return plan, normalized, installer, err
@@ -641,8 +738,12 @@ func applyStoredLifecycleDefaults(cmd *cobra.Command, flags *lifecycleFlags, sto
 	if !cmd.Flags().Changed("relay-udp-endpoint") {
 		flags.relayUDPEndpoint = stored.RelayUDPEndpoint
 	}
+	if !cmd.Flags().Changed("relay-transport") {
+		flags.relayTransport = stored.RelayTransport
+	}
 	if !cmd.Flags().Changed("relay-udp") {
 		flags.relayUDP = stored.RelayUDP
+		flags.relayUDPConfigured = true
 	}
 	if !cmd.Flags().Changed("mesh-cidr") {
 		flags.meshCIDR = stored.MeshCIDR
@@ -666,7 +767,7 @@ func writePlan(out io.Writer, plan internalinstall.Plan) error {
 func writePlanText(out io.Writer, plan internalinstall.Plan) {
 	fmt.Fprintln(out, "WireKube installation plan")
 	fmt.Fprintf(out, "\nCluster\n  Context:       %s\n  Kubernetes:    %s\n  Provider:      %s\n  CNI:           %s\n", plan.Context, plan.Detection.KubernetesVersion, plan.Detection.Provider, plan.Detection.CNI)
-	fmt.Fprintf(out, "\nComponents\n  Resources:     %d\n  Agent:         privileged DaemonSet\n  Relay:         %s\n  Mesh CIDR:     %s\n  Image:         %s\n", len(plan.Resources), plan.Relay, plan.MeshCIDR, plan.Image)
+	fmt.Fprintf(out, "\nComponents\n  Resources:     %d\n  Agent:         privileged DaemonSet\n  Relay:         %s\n  Transport:     %s\n  Mesh CIDR:     %s\n  Image:         %s\n", len(plan.Resources), plan.Relay, plan.RelayTransport, plan.MeshCIDR, plan.Image)
 	fmt.Fprintln(out, "\nInfrastructure impact")
 	for _, impact := range plan.Impact {
 		fmt.Fprintf(out, "  - %s\n", impact)

@@ -51,7 +51,7 @@ wirekubectl install --kubeconfig ~/.kube/config --context my-cluster
 wirekubectl status
 ```
 
-The installer inspects the cluster and shows the exact CRDs, privileged workloads, relay infrastructure, image digest, and mesh CIDR before mutation. Automation must select the relay topology and mesh CIDR explicitly, for example `wirekubectl install --relay load-balancer --mesh-cidr 100.96.0.0/11 --yes --output json`.
+The installer inspects the cluster and shows the exact CRDs, privileged workloads, relay infrastructure, image digest, and mesh CIDR before mutation. Automation must select the relay topology and mesh CIDR explicitly, for example `wirekubectl install --relay load-balancer --mesh-cidr 100.96.0.0/11 --yes --output json`. LoadBalancer installs create separate TCP and UDP entry points by default; use `--relay-transport wss --relay-endpoint wss://relay.example.com/relay` when an existing HTTPS Gateway or Ingress must front the authenticated WebSocket relay backend.
 
 Each agent auto-discovers its endpoint and registers as a WireKubePeer. Every peer receives a deterministic `/32` overlay IP from the selected mesh CIDR:
 

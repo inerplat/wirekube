@@ -1611,12 +1611,14 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		relayTransport = config.transport
 		tokenRequired = config.tokenRequired
 	case "managed":
-		port := int32(3478)
-		if relay.Managed != nil && relay.Managed.Port != 0 {
-			port = relay.Managed.Port
+		config, err := managedRelayDialConfig(relay.Managed, a.podNamespace)
+		if err != nil {
+			return err
 		}
-		endpoint = managedRelayControlEndpoint(a.podNamespace, port)
-		relayTransport = "tcp"
+		endpoint = config.endpoint
+		probeAddr = config.probeAddr
+		relayTransport = config.transport
+		tokenRequired = config.tokenRequired
 	default:
 		return fmt.Errorf("unknown relay provider: %s", relay.Provider)
 	}
@@ -1692,9 +1694,14 @@ type relayDialConfig struct {
 	tokenRequired bool
 }
 
+const (
+	relayTransportTCP = "tcp"
+	relayTransportWSS = "wss"
+)
+
 func externalRelayDialConfig(external *wirekubev1alpha1.ExternalRelaySpec) (relayDialConfig, error) {
-	if external == nil || strings.TrimSpace(external.Endpoint) == "" {
-		return relayDialConfig{}, fmt.Errorf("external relay endpoint not configured")
+	if external == nil {
+		return relayDialConfig{}, fmt.Errorf("external relay not configured")
 	}
 
 	transport := strings.ToLower(strings.TrimSpace(external.Transport))
@@ -1708,6 +1715,9 @@ func externalRelayDialConfig(external *wirekubev1alpha1.ExternalRelaySpec) (rela
 		config.endpoint = external.Endpoint
 		if external.ControlEndpoint != "" {
 			config.endpoint = external.ControlEndpoint
+		}
+		if strings.TrimSpace(config.endpoint) == "" {
+			return relayDialConfig{}, fmt.Errorf("external relay TCP endpoint not configured")
 		}
 		if websocketScheme(config.endpoint) != "" {
 			return relayDialConfig{}, fmt.Errorf("relay transport tcp cannot use WebSocket controlEndpoint %q", config.endpoint)
@@ -1736,6 +1746,37 @@ func externalRelayDialConfig(external *wirekubev1alpha1.ExternalRelaySpec) (rela
 		return config, nil
 	default:
 		return relayDialConfig{}, fmt.Errorf("unsupported relay transport %q", external.Transport)
+	}
+}
+
+func managedRelayDialConfig(managed *wirekubev1alpha1.ManagedRelaySpec, namespace string) (relayDialConfig, error) {
+	port := int32(3478)
+	transport := relayTransportTCP
+	if managed != nil {
+		if managed.Port != 0 {
+			port = managed.Port
+		}
+		if strings.TrimSpace(managed.Transport) != "" {
+			transport = strings.ToLower(strings.TrimSpace(managed.Transport))
+		}
+	}
+	config := relayDialConfig{transport: transport}
+	switch transport {
+	case relayTransportTCP:
+		config.endpoint = managedRelayControlEndpoint(namespace, port)
+		return config, nil
+	case relayTransportWSS:
+		if managed == nil || strings.TrimSpace(managed.ControlEndpoint) == "" {
+			return relayDialConfig{}, fmt.Errorf("managed relay transport wss requires managed.controlEndpoint")
+		}
+		if scheme := websocketScheme(managed.ControlEndpoint); scheme != relayTransportWSS {
+			return relayDialConfig{}, fmt.Errorf("managed relay transport wss requires a wss:// controlEndpoint, got %q", managed.ControlEndpoint)
+		}
+		config.endpoint = managed.ControlEndpoint
+		config.tokenRequired = true
+		return config, nil
+	default:
+		return relayDialConfig{}, fmt.Errorf("unsupported managed relay transport %q", transport)
 	}
 }
 

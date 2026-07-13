@@ -140,5 +140,5 @@ graph TD
     E --> F{Where to deploy relay?}
     F -->|Public server| G[External relay]
     F -->|In-cluster DNS reachable| H[Managed relay<br/>control Service]
-    F -->|HTTP-aware LB / Ingress| I[Planned WSS relay]
+    F -->|HTTP-aware LB / Ingress| I[WSS relay]
 ```

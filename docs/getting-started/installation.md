@@ -27,7 +27,17 @@ wirekubectl install --kubeconfig ~/.kube/config --context my-cluster --relay loa
 
 Use `--dry-run` to inspect the same plan without creating the Namespace, CRDs, or any workloads. Automatic mesh CIDR selection is best effort because the CLI cannot inspect every VPC, corporate, or node route; add known routes with `--exclude-cidr`, review the selected candidate, and provide an explicit `--mesh-cidr` for non-interactive installation. Use `wirekubectl manifest` to render the exact resources selected by the plan.
 
-`--relay-udp` creates a separate UDP Service instead of requiring a mixed-protocol LoadBalancer. With `--relay node-port`, agents use TCP NodePort `30478` while external WireGuard traffic uses UDP NodePort `30479`; supply the reachable node address as `--relay-endpoint HOST:30478`. A TCP-only relay does not provide a raw WireGuard endpoint, so external peer invites remain Pending until UDP is enabled. For `--relay external`, use `--relay-endpoint HOST:PORT` for the agent control connection and optionally use `--relay-udp-endpoint HOST:PORT` for raw WireGuard external peers.
+`--relay load-balancer` creates separate TCP and UDP LoadBalancer Services by default so raw TCP relay clients and external WireGuard peers both have a usable entry point without relying on mixed-protocol LoadBalancer support. Use `--relay-udp=false` only when the installation must remain TCP-only. With `--relay node-port --relay-transport tcp`, agents use TCP NodePort `30478` while optional external WireGuard traffic uses UDP NodePort `30479`; supply the reachable node address as `--relay-endpoint HOST:30478` and enable the UDP Service with `--relay-udp`.
+
+Use `--relay-transport wss` when agents must enter through an HTTPS-aware load balancer, Gateway, or Ingress. The installer deploys the authenticated `wirekube-relay-ws` HTTP backend and configures agents to use the supplied public WSS URL; it does not create the hostname, certificate, Gateway, Ingress, or HTTPRoute. Pre-create the selected namespace if necessary, then create the TLS route to Service `wirekube-relay-ws` port `8081` before installation so the readiness wait can complete; `wirekubectl` preserves an existing Namespace.
+
+```bash
+wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.example.com/relay --mesh-cidr 100.96.0.0/11 --yes
+```
+
+In WSS load-balancer mode, the installer creates the UDP LoadBalancer by default and keeps the WebSocket backend as ClusterIP for the existing TLS Gateway or Ingress; it does not create an unused raw TCP LoadBalancer. In WSS NodePort mode, Service `wirekube-relay-ws` exposes plain HTTP/WebSocket on NodePort `30478` for an upstream TLS terminator. If external WireGuard peers also need the UDP NodePort, add `--relay-udp --relay-udp-endpoint HOST:30479` because the WSS hostname and the reachable UDP node address may differ.
+
+For `--relay external`, use `--relay-endpoint HOST:PORT` with TCP or `--relay-endpoint wss://HOST/PATH --relay-transport wss` with WSS. `--relay-udp-endpoint HOST:PORT` remains an independent raw WireGuard endpoint for external peer invites and is optional; without it, external peer invites remain Pending.
 
 WireKube is a cluster-wide singleton because its CRDs, mesh, and RBAC are cluster-scoped. `--namespace` chooses where workloads and inventory run; it does not permit a second installation in another namespace. Every managed resource is stamped with the inventory installation ID, and upgrade or uninstall refuses resources owned by a different installation.
 
