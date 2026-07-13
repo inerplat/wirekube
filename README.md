@@ -132,4 +132,4 @@ Contributions are welcome! Please see the [issues](https://github.com/inerplat/w
 
 ## License
 
-Apache 2.0
+Licensed under the [Apache License 2.0](LICENSE) (`Apache-2.0`).
