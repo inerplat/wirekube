@@ -175,6 +175,7 @@ jobs:
           CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-darwin-amd64 ./cmd/wirekubectl
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-linux-amd64 ./cmd/wirekubectl
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$ldflags" -o dist/wirekubectl-linux-arm64 ./cmd/wirekubectl
+          cp LICENSE dist/LICENSE
           python3 - <<PY
           import json
           from pathlib import Path
@@ -187,7 +188,7 @@ jobs:
           }, indent=2) + "\n")
           PY
           cd dist
-          sha256sum wirekubectl-* wirekube-release.json > wirekubectl-checksums.txt
+          sha256sum wirekubectl-* wirekube-release.json LICENSE > wirekubectl-checksums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -200,3 +201,4 @@ jobs:
             dist/wirekubectl-linux-arm64
             dist/wirekubectl-checksums.txt
             dist/wirekube-release.json
+            dist/LICENSE
