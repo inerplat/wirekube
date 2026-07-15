@@ -64,6 +64,26 @@ docker push inerplat/wirekube:latest
 
 Tag builds run formatting, vet, lint, unit tests, and the TCP/WSS disposable-cluster E2E matrix before publishing anything. After those gates pass, the workflow publishes the multi-architecture image, builds four standalone `wirekubectl` binaries, injects the version, commit, build date, and immutable image digest, and creates a GitHub Release with SHA256 checksums.
 
+### Homebrew tap
+
+The public formula lives in
+[`inerplat/homebrew-tap`](https://github.com/inerplat/homebrew-tap) as
+`Formula/wirekube.rb`. After publishing a WireKube release, update the formula's
+version, four platform URLs, and four SHA-256 values from
+`wirekubectl-checksums.txt`, then verify it on a clean tap checkout:
+
+```bash
+brew style inerplat/tap/wirekube
+brew audit --strict inerplat/tap/wirekube
+brew install inerplat/tap/wirekube
+brew test inerplat/tap/wirekube
+wirekubectl version
+```
+
+Do not point the formula at `latest`, a mutable container tag, or an unverified
+binary. The released CLI embeds the matching immutable WireKube container image
+digest used by `wirekubectl install` and `wirekubectl upgrade`.
+
 ## Dockerfile
 
 The multi-stage Dockerfile:

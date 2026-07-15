@@ -1,6 +1,37 @@
 # Installation
 
-## Install with wirekubectl
+## Install with Homebrew
+
+The public tap installs `wirekubectl` on macOS or Linux, on ARM64 or AMD64:
+
+```bash
+brew install inerplat/tap/wirekube
+wirekubectl version
+```
+
+The formula installs only the client. It does not modify a Kubernetes cluster.
+Run a dry run before approving the cluster-wide CRDs, privileged agent, and
+relay topology:
+
+```bash
+wirekubectl install --dry-run \
+  --kubeconfig ~/.kube/config \
+  --context my-cluster
+
+wirekubectl install \
+  --kubeconfig ~/.kube/config \
+  --context my-cluster
+```
+
+Upgrade the CLI independently from the installed cluster resources, then run
+the explicit WireKube upgrade command:
+
+```bash
+brew upgrade inerplat/tap/wirekube
+wirekubectl upgrade --kubeconfig ~/.kube/config --context my-cluster
+```
+
+## Install from a GitHub Release
 
 Release assets contain standalone `wirekubectl` binaries for macOS and Linux on AMD64 and ARM64. Download the binary and checksum file for the version you want from the [GitHub Releases](https://github.com/inerplat/wirekube/releases) page, verify the checksum, and place the binary on your `PATH`. Each release also includes `wirekube-release.json` with the immutable container image digest embedded in that CLI.
 

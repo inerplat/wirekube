@@ -1,138 +1,138 @@
 # Quick Start
 
-Get WireKube running on your Kubernetes cluster in 5 minutes.
+This path installs WireKube from a released `wirekubectl` binary without a
+source checkout. It does not assume a specific cloud provider or CNI.
 
 ## Prerequisites
 
 | Requirement | Minimum |
-|-------------|---------|
+| --- | --- |
 | Kubernetes | 1.26+ |
-| Linux Kernel | 5.6+ (built-in WireGuard) |
-| `kubectl` access | Cluster admin |
+| Linux kernel on participating nodes | 5.6+ |
+| Cluster access | Permission to create cluster-scoped CRDs and RBAC |
+| Local tools | Homebrew and a reachable kubeconfig |
 
-## Step 1: Install CRDs
-
-```bash
-kubectl apply -f config/crd/
-```
-
-This creates four Custom Resource Definitions:
-
-- **WireKubeMesh** — Global mesh configuration (listen port, STUN servers, relay settings)
-- **WireKubePeer** — Per-node peer state (auto-managed by the agent)
-- **WireKubeGateway** — Virtual gateway routes and failover configuration
-- **WireKubeExternalPeer** — Off-cluster WireGuard client authorization and status
-
-## Step 2: Create a Mesh
+## Install the CLI
 
 ```bash
-kubectl apply -f config/examples/wirekubemesh-basic.yaml
+brew install inerplat/tap/wirekube
+wirekubectl version
 ```
 
-Or create a custom mesh configuration:
+Homebrew supports macOS and Linux on ARM64 and AMD64. Use the checksum-verified
+GitHub Release path in the [installation guide](installation.md) when Homebrew
+is unavailable.
 
-```yaml
-apiVersion: wirekube.io/v1alpha1
-kind: WireKubeMesh
-metadata:
-  name: default
-spec:
-  listenPort: 51820
-  interfaceName: wire_kube
-  mtu: 1420
-  stunServers:
-    - stun.cloudflare.com:3478
-    - stun.l.google.com:19302
-  relay:
-    mode: auto
-    provider: managed
-    handshakeTimeoutSeconds: 30
-    directRetryIntervalSeconds: 120
-    managed:
-      replicas: 1
-      serviceType: LoadBalancer
-      port: 3478
-```
+## Inspect the cluster
 
-!!! note "STUN Servers"
-    At least two STUN servers are required. The agent compares mapped ports
-    from multiple servers to detect Symmetric NAT (RFC 5780).
-
-!!! note "Relay"
-    If all nodes have public IPs or are in the same VPC, set `relay.mode: never`.
-    For cross-VPC or multi-cloud deployments, `auto` with a managed or external
-    relay is recommended.
-
-## Step 3: Deploy the Agent
+Set the kubeconfig and context once for the remaining commands:
 
 ```bash
-kubectl create namespace wirekube-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f config/agent/rbac.yaml
-kubectl apply -f config/agent/daemonset.yaml
+export WIREKUBE_KUBECONFIG="${HOME}/.kube/config"
+export WIREKUBE_CONTEXT=my-cluster
+
+kubectl --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}" \
+  get nodes -o wide
 ```
 
-The default agent DaemonSet runs on every node except nodes labeled `wirekube.io/proxy-node=true`. It uses `hostNetwork: true`, `dnsPolicy: Default`, userspace WireGuard, and a privileged security context for TUN access.
+Replace `my-cluster` before continuing.
 
-## Step 4: Choose Agent Placement
+## Choose a relay entry point
 
-The current default manifest does not use `wirekube.io/vpn-enabled=true` as a scheduling gate. To restrict participation, add your own node affinity or node selector to `config/agent/daemonset.yaml` before applying it.
+| Environment | Recommended choice |
+| --- | --- |
+| Cloud cluster with a reachable LoadBalancer | `--relay load-balancer` |
+| Reachable node address, no LoadBalancer | `--relay node-port` |
+| Existing HTTPS Gateway or Ingress | `--relay-transport wss` |
+| Existing separately operated relay | `--relay external` |
 
-## Step 5: (Optional) Deploy the Relay
+The managed LoadBalancer path is the simplest default, but it can create public
+TCP and UDP Services. Read the [relay entry point guide](../guides/relay-entrypoints.md)
+before selecting NodePort, WSS, or an external relay.
 
-For managed relay (in-cluster):
+## Preview the installation
+
+Interactive dry run performs discovery and prints the exact plan without
+creating resources:
 
 ```bash
-kubectl apply -f config/relay/deployment.yaml
-kubectl apply -f config/relay/example-managed.yaml
+wirekubectl install \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}" \
+  --dry-run
 ```
 
-The relay manifest currently contains an EKS-specific `eks.amazonaws.com/nodegroup: relay-ng` node selector. Remove or replace it before applying the manifest to another cluster.
+Review the selected mesh CIDR, immutable image digest, agent placement, relay
+Services, and any public entry points. Automatic CIDR selection is best effort;
+provide `--mesh-cidr` when the CLI cannot know every routed network.
 
-For external relay on a public server:
+## Install WireKube
+
+Run the same command without `--dry-run`. The interactive prompt is the final
+approval boundary:
 
 ```bash
-wirekube-relay --addr :3478
+wirekubectl install \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}"
 ```
 
-See [Relay Architecture](../architecture/relay.md) for details on relay modes and scaling. If your cluster cannot provision a public LoadBalancer, or some nodes use an HTTP CONNECT proxy, follow [Relay Entry Points](../guides/relay-entrypoints.md).
-
-## Step 6: Set AllowedIPs
-
-AllowedIPs are intentionally user-managed. Set each peer's node IP to enable routing:
+Automation must make infrastructure choices explicit:
 
 ```bash
-kubectl patch wirekubepeer <peer-name> --type=merge \
-  -p '{"spec":{"allowedIPs":["<node-ip>/32"]}}'
+wirekubectl install \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}" \
+  --relay load-balancer \
+  --mesh-cidr 100.96.0.0/11 \
+  --node-addresses internal-ip \
+  --yes \
+  --output json
 ```
 
-Without `allowedIPs`, the agent enters passive mode — no routes are added and
-no WireGuard traffic flows for that peer.
+Choose a private mesh CIDR that does not overlap node, Pod, Service, VPC, VPN,
+or corporate routes.
 
-## Step 7: Verify
+## Verify the mesh
 
 ```bash
-kubectl get wirekubepeers -o wide
-kubectl get wirekubemesh default -o yaml
+wirekubectl status \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}"
 
-# On any node
-wg show wire_kube
-ping <other-node-ip>
+wirekubectl doctor \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}"
+
+kubectl --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}" \
+  get wirekubemeshes,wirekubepeers -o wide
 ```
 
-## What Happens
+New peers may need time to publish endpoints and complete their first
+handshake. `wirekubectl doctor` distinguishes agent, relay, route, and readiness
+failures.
 
-1. Each agent creates a WireGuard interface (`wire_kube`) and generates a key pair
-2. The agent registers itself as a `WireKubePeer` CRD
-3. STUN queries two servers to discover the public endpoint and detect NAT type
-4. If mapped ports differ between STUN servers → Symmetric NAT detected
-5. When relay is configured, new peers start with relay availability while direct probing runs
-6. Healthy direct receive evidence promotes a peer to direct; failed or stale paths remain on relay
-7. Connected AllowedIPs are installed in routing table `22347`, selected by an IP rule at priority `200`
-8. The agent periodically re-probes relayed peers for direct connectivity
+## Lifecycle
 
-## Next Steps
+```bash
+wirekubectl upgrade \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}"
 
-- [Installation Guide](installation.md) — Detailed installation and build options
-- [Configuration](configuration.md) — All configuration fields explained
-- [NAT Traversal](../architecture/nat-traversal.md) — How WireKube handles NAT
-- [Relay Design](../architecture/relay.md) — Protocol, failover, and scaling
+wirekubectl uninstall \
+  --kubeconfig "${WIREKUBE_KUBECONFIG}" \
+  --context "${WIREKUBE_CONTEXT}"
+```
+
+Ordinary uninstall preserves CRDs and custom resources. Destructive removal
+requires both `--purge` and `--confirm-purge`; use it only after proving that no
+remaining node or external peer depends on WireKube.
+
+## Next steps
+
+- [Installation](installation.md): release binaries, topology details, and source builds
+- [Configuration](configuration.md): mesh and agent settings
+- [Relay entry points](../guides/relay-entrypoints.md): LoadBalancer, NodePort, WSS, and external relay
+- [Troubleshooting](../operations/troubleshooting.md): readiness and connectivity failures
