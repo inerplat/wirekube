@@ -333,7 +333,12 @@ func (i Installer) waitReady(ctx context.Context, options Options) error {
 		if err := i.Client.Get(ctx, client.ObjectKey{Name: "default"}, mesh); err != nil {
 			return false, err
 		}
-		return mesh.Status.TotalPeers >= desiredAgents && mesh.Status.ReadyPeers >= desiredAgents, nil
+		if mesh.Status.TotalPeers < desiredAgents {
+			return false, nil
+		}
+		// A single agent has no remote peers, so it never reports
+		// Connected; require only that its peer registered.
+		return desiredAgents == 1 || mesh.Status.ReadyPeers >= desiredAgents, nil
 	}); err != nil {
 		return fmt.Errorf("WireKubeMesh did not establish connectivity for all %d agent peers; run wirekubectl doctor: %w", desiredAgents, err)
 	}

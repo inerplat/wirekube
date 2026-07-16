@@ -165,6 +165,39 @@ func TestInspectInstallationIncludesCRDAgentAndMeshReadiness(t *testing.T) {
 	}
 }
 
+func TestInspectInstallationSingleNodeMeshReadyWithoutRemotePeers(t *testing.T) {
+	crd := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekubemeshes.wirekube.io", Labels: map[string]string{"app.kubernetes.io/managed-by": "wirekubectl"}},
+		Status:     apiextensionsv1.CustomResourceDefinitionStatus{Conditions: []apiextensionsv1.CustomResourceDefinitionCondition{{Type: apiextensionsv1.Established, Status: apiextensionsv1.ConditionTrue}}},
+	}
+	daemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent", Namespace: "wirekube-system", Labels: map[string]string{"app.kubernetes.io/managed-by": "wirekubectl"}},
+		Spec:       appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: lifecycleTestImage}}}}},
+		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberReady: 1, NumberAvailable: 1},
+	}
+	mesh := &wirekubev1alpha1.WireKubeMesh{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: map[string]string{"app.kubernetes.io/managed-by": "wirekubectl"}},
+		Status:     wirekubev1alpha1.WireKubeMeshStatus{TotalPeers: 1, ReadyPeers: 0},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(crd, daemonSet, mesh).Build()
+	inventory := &internalinstall.Inventory{
+		InstallationID:  "installation-1",
+		WireKubeVersion: "v1.0.0",
+		Image:           lifecycleTestImage,
+		Options:         internalinstall.Options{Namespace: "wirekube-system", Relay: internalinstall.RelayNone},
+		Resources: []internalinstall.Resource{
+			{APIVersion: apiextensionsv1.SchemeGroupVersion.String(), Kind: "CustomResourceDefinition", Name: crd.Name, Preserve: true},
+			{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "DaemonSet", Namespace: daemonSet.Namespace, Name: daemonSet.Name},
+			{APIVersion: wirekubev1alpha1.GroupVersion.String(), Kind: "WireKubeMesh", Name: mesh.Name, Preserve: true},
+		},
+	}
+
+	status := inspectInstallation(context.Background(), c, inventory)
+	if !status.Ready || !status.ComponentsReady || !status.ConnectivityReady {
+		t.Fatalf("single-node mesh with zero remote peers should be ready: %+v", status)
+	}
+}
+
 func TestWriteDoctorResultReturnsFailureAfterWritingJSON(t *testing.T) {
 	oldOutput := options.output
 	options.output = "json"
