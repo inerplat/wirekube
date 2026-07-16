@@ -545,8 +545,10 @@ func (c *applyTestClient) setStatus(object client.Object) {
 		typed.Status.ReadyReplicas = desired
 		typed.Status.AvailableReplicas = desired
 	case *wirekubev1alpha1.WireKubeMesh:
+		// A real single-agent mesh reports ReadyPeers=0 because the agent
+		// has no remote peers; install must succeed regardless.
 		typed.Status.TotalPeers = 1
-		typed.Status.ReadyPeers = 1
+		typed.Status.ReadyPeers = 0
 	case *corev1.Service:
 		if typed.Spec.Type == corev1.ServiceTypeLoadBalancer {
 			typed.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}

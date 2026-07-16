@@ -351,8 +351,11 @@ func inspectInstallation(ctx context.Context, c client.Client, inventory *intern
 	if meshErr == nil {
 		meshStatus.Desired = desiredAgents
 		meshStatus.Available = mesh.Status.TotalPeers
-		meshStatus.Ready = desiredAgents > 0 && mesh.Status.TotalPeers >= desiredAgents && mesh.Status.ReadyPeers >= desiredAgents
+		meshStatus.Ready = desiredAgents > 0 && mesh.Status.TotalPeers >= desiredAgents && (desiredAgents == 1 || mesh.Status.ReadyPeers >= desiredAgents)
 		meshStatus.Message = fmt.Sprintf("%d peers observed, %d ready", mesh.Status.TotalPeers, mesh.Status.ReadyPeers)
+		if desiredAgents == 1 {
+			meshStatus.Message += "; single-node mesh has no remote peers to connect"
+		}
 		for _, condition := range mesh.Status.Conditions {
 			if condition.Status != metav1.ConditionTrue && condition.Message != "" {
 				meshStatus.Message += "; " + condition.Type + ": " + condition.Message
