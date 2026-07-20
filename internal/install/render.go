@@ -168,7 +168,7 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            "wirekube-agent",
 					HostNetwork:                   true,
-					DNSPolicy:                     corev1.DNSDefault,
+					DNSPolicy:                     corev1.DNSClusterFirstWithHostNet,
 					PriorityClassName:             "system-node-critical",
 					TerminationGracePeriodSeconds: int64Ptr(30),
 					Tolerations:                   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
