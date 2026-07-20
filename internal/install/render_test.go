@@ -162,6 +162,32 @@ func TestRenderManagedWSSGatewayAndUDPLoadBalancer(t *testing.T) {
 	}
 }
 
+func TestAgentUsesClusterDNSOverHostNetwork(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agent *appsv1.DaemonSet
+	for _, object := range bundle.Objects {
+		if daemonSet, ok := object.(*appsv1.DaemonSet); ok && daemonSet.Name == "wirekube-agent" {
+			agent = daemonSet
+		}
+	}
+	if agent == nil {
+		t.Fatal("wirekube-agent DaemonSet was not rendered")
+	}
+	// The agent runs on the host network but dials the relay control plane through
+	// the in-cluster headless Service (wirekube-relay-control.<ns>.svc.cluster.local),
+	// so it must use ClusterFirstWithHostNet; DNSDefault resolves only host names and
+	// leaves every peer unable to reach the relay.
+	if !agent.Spec.Template.Spec.HostNetwork {
+		t.Fatal("agent must run on the host network")
+	}
+	if agent.Spec.Template.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Fatalf("agent dnsPolicy=%q, want ClusterFirstWithHostNet so host-network pods resolve cluster Services", agent.Spec.Template.Spec.DNSPolicy)
+	}
+}
+
 func TestAgentRelayConfigRevisionChangesWithTransportAndEndpoint(t *testing.T) {
 	tcpBundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
 	if err != nil {
