@@ -39,6 +39,84 @@ func TestOptionsRejectNonNumericRelayEndpointPort(t *testing.T) {
 	}
 }
 
+func TestOptionsRejectUnusableExplicitAgentAPIServer(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"bare host and port", "10.0.0.5:6443", "is not a valid URL"},
+		{"wrong scheme", "ftp://api.example.test:6443", "must be an https:// or http:// URL"},
+		{"in-cluster service", "https://kubernetes.default.svc:443", "nodes cannot reach"},
+		{"loopback", "https://127.0.0.1:6443", "loopback address"},
+		{"no host", "https://", "must include a host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			options := Options{Image: testImage, Relay: RelayNone, AgentAPIServer: tc.value}
+			err := options.Normalize()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Normalize(%q) error=%v, want it to mention %q", tc.value, err, tc.want)
+			}
+			if !strings.Contains(err.Error(), "--agent-apiserver") {
+				t.Fatalf("error %q does not name the flag", err)
+			}
+		})
+	}
+}
+
+func TestAgentAPIServerInClusterSentinelSkipsInjection(t *testing.T) {
+	for _, sentinel := range []string{AgentAPIServerInCluster, "none", "In-Cluster"} {
+		options := Options{Image: testImage, Relay: RelayNone, AgentAPIServer: sentinel, ClusterServer: "https://api.example.test:6443"}
+		if err := options.Normalize(); err != nil {
+			t.Fatalf("sentinel %q rejected: %v", sentinel, err)
+		}
+		if got := agentAPIServerURL(options); got != "" {
+			t.Fatalf("sentinel %q resolved to %q, want no injection", sentinel, got)
+		}
+	}
+}
+
+func TestSameInstallConfigComparesResolvedAgentAPIServer(t *testing.T) {
+	base := Options{Image: testImage, Relay: RelayNone, ClusterServer: "https://api.example.test:6443"}
+	if !sameInstallConfig(base, base) {
+		t.Fatal("identical options compared unequal")
+	}
+	// A different kubeconfig entry changes the rendered agent env, so it must not
+	// silently pass the install identity check.
+	movedServer := base
+	movedServer.ClusterServer = "https://bastion.example.test:6443"
+	if sameInstallConfig(base, movedServer) {
+		t.Fatal("a changed kubeconfig server must be detected as a config change")
+	}
+	explicit := base
+	explicit.AgentAPIServer = "https://direct.example.test:6443"
+	if sameInstallConfig(base, explicit) {
+		t.Fatal("an explicit --agent-apiserver must be detected as a config change")
+	}
+	// Both resolve to no injection, so they are the same effective config.
+	skipped := Options{Image: testImage, Relay: RelayNone, ClusterServer: "https://127.0.0.1:6443"}
+	sentinel := Options{Image: testImage, Relay: RelayNone, AgentAPIServer: AgentAPIServerInCluster, ClusterServer: "https://api.example.test:6443"}
+	if !sameInstallConfig(skipped, sentinel) {
+		t.Fatal("options that both skip injection compared unequal")
+	}
+}
+
+func TestOptionsAcceptReachableAgentAPIServerAndSkipUndetectedServer(t *testing.T) {
+	options := Options{Image: testImage, Relay: RelayNone, AgentAPIServer: "https://api.example.test:6443"}
+	if err := options.Normalize(); err != nil {
+		t.Fatalf("reachable --agent-apiserver rejected: %v", err)
+	}
+	// An undetected or in-cluster kubeconfig server must stay a silent skip, not an error.
+	skipped := Options{Image: testImage, Relay: RelayNone, ClusterServer: "https://kubernetes.default.svc:443"}
+	if err := skipped.Normalize(); err != nil {
+		t.Fatalf("unusable kubeconfig server must not fail Normalize: %v", err)
+	}
+	if got := agentAPIServerURL(skipped); got != "" {
+		t.Fatalf("agentAPIServerURL=%q, want empty for an in-cluster server", got)
+	}
+}
+
 func TestLoadBalancerDefaultsToUDP(t *testing.T) {
 	options := Options{Image: testImage, Relay: RelayLoadBalancer}
 	if err := options.Normalize(); err != nil {
@@ -186,6 +264,91 @@ func TestAgentUsesClusterDNSOverHostNetwork(t *testing.T) {
 	if agent.Spec.Template.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
 		t.Fatalf("agent dnsPolicy=%q, want ClusterFirstWithHostNet so host-network pods resolve cluster Services", agent.Spec.Template.Spec.DNSPolicy)
 	}
+}
+
+func TestAgentReceivesDirectAPIServerFromKubeconfigServer(t *testing.T) {
+	// Peer self-registration happens before the node's CNI is ready, so the agent needs a
+	// reachable apiserver URL instead of the in-cluster kubernetes Service ClusterIP.
+	agent := renderAgentDaemonSet(t, Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0", ClusterServer: "https://api.example.test:6443"})
+	if value, ok := agentEnvValue(agent, "WIREKUBE_KUBE_APISERVER"); !ok || value != "https://api.example.test:6443" {
+		t.Fatalf("WIREKUBE_KUBE_APISERVER=%q present=%t, want the kubeconfig server", value, ok)
+	}
+}
+
+func TestAgentAPIServerOverrideWinsOverKubeconfigServer(t *testing.T) {
+	agent := renderAgentDaemonSet(t, Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0", ClusterServer: "https://api.example.test:6443", AgentAPIServer: "https://10.0.0.5:6443"})
+	if value, ok := agentEnvValue(agent, "WIREKUBE_KUBE_APISERVER"); !ok || value != "https://10.0.0.5:6443" {
+		t.Fatalf("WIREKUBE_KUBE_APISERVER=%q present=%t, want the --agent-apiserver override", value, ok)
+	}
+}
+
+func TestAgentOmitsAPIServerWhenUnresolvedOrInCluster(t *testing.T) {
+	for name, options := range map[string]Options{
+		"unset":      {Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"},
+		"service":    {Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0", ClusterServer: "https://kubernetes.default.svc:443"},
+		"short name": {Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0", ClusterServer: "https://kubernetes:443"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := renderAgentDaemonSet(t, options)
+			if value, ok := agentEnvValue(agent, "WIREKUBE_KUBE_APISERVER"); ok {
+				t.Fatalf("WIREKUBE_KUBE_APISERVER=%q, want the env var to be absent", value)
+			}
+		})
+	}
+}
+
+func TestAgentAPIServerURLSkipsUnusableTargets(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		options Options
+		want    string
+	}{
+		"kubeconfig server":  {options: Options{ClusterServer: "https://api.example.test:6443"}, want: "https://api.example.test:6443"},
+		"plain http":         {options: Options{ClusterServer: "http://api.example.test:8080"}, want: "http://api.example.test:8080"},
+		"override":           {options: Options{ClusterServer: "https://api.example.test:6443", AgentAPIServer: "https://direct.example.test:6443"}, want: "https://direct.example.test:6443"},
+		"empty":              {options: Options{}, want: ""},
+		"whitespace only":    {options: Options{ClusterServer: "   "}, want: ""},
+		"in-cluster service": {options: Options{ClusterServer: "https://kubernetes.default.svc:443"}, want: ""},
+		"in-cluster short":   {options: Options{ClusterServer: "https://kubernetes:443"}, want: ""},
+		"in-cluster mixed":   {options: Options{ClusterServer: "https://KUBERNETES.default.svc:443"}, want: ""},
+		"loopback v4":        {options: Options{ClusterServer: "https://127.0.0.1:6443"}, want: ""},
+		"loopback v6":        {options: Options{ClusterServer: "https://[::1]:6443"}, want: ""},
+		"unspecified":        {options: Options{ClusterServer: "https://0.0.0.0:6443"}, want: ""},
+		"localhost":          {options: Options{ClusterServer: "https://localhost:6443"}, want: ""},
+		"credentials":        {options: Options{ClusterServer: "https://admin:secret@api.example.test:6443"}, want: ""},
+		"no scheme":          {options: Options{ClusterServer: "api.example.test:6443"}, want: ""},
+		"no host":            {options: Options{ClusterServer: "https://"}, want: ""},
+		"malformed":          {options: Options{ClusterServer: "https://api.example.test:64 43/"}, want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := agentAPIServerURL(testCase.options); got != testCase.want {
+				t.Fatalf("agentAPIServerURL()=%q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func renderAgentDaemonSet(t *testing.T, options Options) *appsv1.DaemonSet {
+	t.Helper()
+	bundle, err := Render(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range bundle.Objects {
+		if daemonSet, ok := object.(*appsv1.DaemonSet); ok && daemonSet.Name == "wirekube-agent" {
+			return daemonSet
+		}
+	}
+	t.Fatal("wirekube-agent DaemonSet was not rendered")
+	return nil
+}
+
+func agentEnvValue(agent *appsv1.DaemonSet, name string) (string, bool) {
+	for _, env := range agent.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == name {
+			return env.Value, true
+		}
+	}
+	return "", false
 }
 
 func TestAgentRelayConfigRevisionChangesWithTransportAndEndpoint(t *testing.T) {

@@ -298,6 +298,28 @@ func TestUpgradePreservesStoredRelayTransportAndExplicitUDPDisable(t *testing.T)
 	}
 }
 
+func TestUpgradePreservesStoredAgentAPIServer(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("agent-apiserver", "", "")
+	cmd.Flags().String("image", lifecycleTestImage, "")
+	flags := &lifecycleFlags{image: lifecycleTestImage}
+	stored := internalinstall.Options{AgentAPIServer: "https://direct.example.test:6443"}
+
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if flags.agentAPIServer != stored.AgentAPIServer {
+		t.Fatalf("agentAPIServer=%q, want stored %q", flags.agentAPIServer, stored.AgentAPIServer)
+	}
+
+	if err := cmd.Flags().Set("agent-apiserver", "https://override.example.test:6443"); err != nil {
+		t.Fatal(err)
+	}
+	flags.agentAPIServer = "https://override.example.test:6443"
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if flags.agentAPIServer != "https://override.example.test:6443" {
+		t.Fatalf("agentAPIServer=%q, want the explicit upgrade override", flags.agentAPIServer)
+	}
+}
+
 func runMeshInit(t *testing.T, c client.Client, args ...string) {
 	t.Helper()
 	oldClient, oldOutput := options.client, options.output

@@ -282,6 +282,10 @@ kubectl apply -f config/examples/eks-hybrid/daemonset.yaml
     is ready. The agent needs API access at startup to create its
     WireKubePeer CRD. The EKS public endpoint bypasses this dependency.
 
+    `wirekubectl install` injects this variable automatically, from
+    `--agent-apiserver` or the kubeconfig server, so the manual step above is
+    only required when applying the example manifest directly.
+
 ### WireKubeMesh
 
 ```bash

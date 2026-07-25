@@ -46,6 +46,7 @@ type Options struct {
 	Timeout            time.Duration
 	Context            string
 	ClusterServer      string
+	AgentAPIServer     string
 	WireKubeVersion    string
 }
 
@@ -118,6 +119,11 @@ func (o *Options) Normalize() error {
 			return fmt.Errorf("--relay must be specified when --yes is used")
 		}
 		o.Relay = RelayLoadBalancer
+	}
+	if o.AgentAPIServer = strings.TrimSpace(o.AgentAPIServer); o.AgentAPIServer != "" && !isInClusterAgentAPIServer(o.AgentAPIServer) {
+		if _, err := usableAgentAPIServer(o.AgentAPIServer); err != nil {
+			return fmt.Errorf("invalid --agent-apiserver %q: it %w", o.AgentAPIServer, err)
+		}
 	}
 	if o.RelayTransport == "" {
 		o.RelayTransport = RelayTransportTCP

@@ -36,6 +36,7 @@ type lifecycleFlags struct {
 	previousResources  []internalinstall.Resource
 	meshCIDR           string
 	nodeAddresses      string
+	agentAPIServer     string
 	image              string
 	excludeCIDRs       []string
 	yes                bool
@@ -675,6 +676,7 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().BoolVar(&flags.relayUDP, "relay-udp", false, "create a separate UDP relay Service (defaults to true with load-balancer)")
 	cmd.Flags().StringVar(&flags.meshCIDR, "mesh-cidr", "auto", "mesh CIDR or auto")
 	cmd.Flags().StringVar(&flags.nodeAddresses, "node-addresses", "mesh-only", "node address exposure: mesh-only or internal-ip")
+	cmd.Flags().StringVar(&flags.agentAPIServer, "agent-apiserver", "", "apiserver URL the node agents dial, or in-cluster to keep in-cluster discovery (defaults to the kubeconfig server; must be reachable from nodes before CNI is ready)")
 	cmd.Flags().StringVar(&flags.image, "image", internalversion.DefaultImage, "immutable WireKube image reference (IMAGE@sha256:DIGEST)")
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")
 	cmd.Flags().BoolVar(&flags.yes, "yes", false, "apply the displayed plan without prompting")
@@ -701,7 +703,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 		return internalinstall.Plan{}, internalinstall.Options{}, installer, err
 	}
 	installOptions := internalinstall.Options{
-		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, WireKubeVersion: internalversion.Version,
+		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
 	}
 	plan, normalized, err := (internalinstall.Planner{Client: c, Discovery: discovery, AccessReviewer: internalinstall.SelfSubjectAccessReviewer{Client: c}}).Build(cmd.Context(), installOptions)
 	return plan, normalized, installer, err
@@ -753,6 +755,9 @@ func applyStoredLifecycleDefaults(cmd *cobra.Command, flags *lifecycleFlags, sto
 	}
 	if !cmd.Flags().Changed("node-addresses") {
 		flags.nodeAddresses = stored.NodeAddresses
+	}
+	if !cmd.Flags().Changed("agent-apiserver") {
+		flags.agentAPIServer = stored.AgentAPIServer
 	}
 	if !cmd.Flags().Changed("image") && strings.TrimSpace(flags.image) == "" {
 		flags.image = stored.Image

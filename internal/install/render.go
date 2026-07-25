@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -157,6 +158,20 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 	podLabels["app.kubernetes.io/component"] = "agent"
 	podLabels["app.kubernetes.io/part-of"] = "wirekube"
 	podLabels["app.kubernetes.io/managed-by"] = "wirekubectl"
+	env := []corev1.EnvVar{
+		{Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "WIREKUBE_INTERFACE", Value: "wire_kube"},
+		{Name: "WIREKUBE_RELAY_TOKEN_FILE", Value: "/var/run/secrets/wirekube-relay/token"},
+	}
+	// The agent self-registers its own WireKubePeer before the node's CNI is up, so it
+	// cannot reach the in-cluster kubernetes Service ClusterIP: that route only exists
+	// once the mesh carries pod traffic, and the mesh only forms after registration.
+	// Point the agent at the apiserver URL the operator already dials instead.
+	if apiServer := agentAPIServerURL(options); apiServer != "" {
+		env = append(env, corev1.EnvVar{Name: "WIREKUBE_KUBE_APISERVER", Value: apiServer})
+	}
 	return &appsv1.DaemonSet{
 		TypeMeta:   typeMeta(appsv1.SchemeGroupVersion.String(), "DaemonSet"),
 		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent", Namespace: options.Namespace, Labels: componentLabels},
@@ -184,13 +199,7 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Command:         []string{"wirekube-agent"},
 						Args:            []string{"--node-name=$(NODE_NAME)"},
-						Env: []corev1.EnvVar{
-							{Name: "NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
-							{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
-							{Name: "WIREKUBE_INTERFACE", Value: "wire_kube"},
-							{Name: "WIREKUBE_RELAY_TOKEN_FILE", Value: "/var/run/secrets/wirekube-relay/token"},
-						},
+						Env:             env,
 						SecurityContext: &corev1.SecurityContext{
 							Privileged:      boolPtr(true),
 							AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined},
@@ -213,6 +222,85 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 			},
 		},
 	}
+}
+
+// agentAPIServerURL resolves the apiserver URL node agents dial directly, preferring the
+// explicit --agent-apiserver override over the kubeconfig server. It returns "" when the
+// candidate is unusable from a node that has no pod network yet: an unparsable URL, a
+// non-HTTP scheme, embedded credentials, a missing host, an in-cluster kubernetes Service
+// name, or a loopback address that resolves to the node itself instead of the apiserver
+// (kind, k3d, and SSH-tunnelled kubeconfigs all report https://127.0.0.1:PORT). Detecting a
+// ClusterIP by address is out of scope; --agent-apiserver covers those clusters.
+// AgentAPIServerInCluster opts out of the injection entirely so agents fall back to
+// in-cluster discovery. Without it there would be no way to request the pre-injection
+// behaviour: an empty --agent-apiserver means "use the kubeconfig server".
+const AgentAPIServerInCluster = "in-cluster"
+
+func agentAPIServerURL(options Options) string {
+	candidate := strings.TrimSpace(options.AgentAPIServer)
+	if isInClusterAgentAPIServer(candidate) {
+		return ""
+	}
+	if candidate == "" {
+		candidate = strings.TrimSpace(options.ClusterServer)
+	}
+	usable, err := usableAgentAPIServer(candidate)
+	if err != nil {
+		return ""
+	}
+	return usable
+}
+
+func isInClusterAgentAPIServer(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case AgentAPIServerInCluster, "none":
+		return true
+	default:
+		return false
+	}
+}
+
+// usableAgentAPIServer applies the rules documented on agentAPIServerURL and
+// explains why a candidate was rejected. An empty candidate is not an error so an
+// undetected kubeconfig server is simply skipped; Normalize surfaces the reason for
+// a value the operator asked for explicitly.
+func usableAgentAPIServer(candidate string) (string, error) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return "", fmt.Errorf("is not a valid URL: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", fmt.Errorf("must be an https:// or http:// URL")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("must not embed credentials")
+	}
+	// A root-dotted FQDN ("kubernetes.") names the same host as its dotless form, so
+	// normalize it away before matching or the in-cluster check below is bypassed.
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if hostname == "" {
+		return "", fmt.Errorf("must include a host")
+	}
+	switch hostname {
+	case "kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local":
+		return "", fmt.Errorf("is the in-cluster Service address, which nodes cannot reach before their CNI is ready")
+	}
+	if hostname == "localhost" || strings.HasSuffix(hostname, ".localhost") {
+		return "", fmt.Errorf("is a loopback address, which resolves to each node itself")
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() {
+			return "", fmt.Errorf("is a loopback address, which resolves to each node itself")
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+			return "", fmt.Errorf("is a link-local address, which never routes to an apiserver")
+		}
+	}
+	return candidate, nil
 }
 
 func relayConfigRevision(options Options) string {

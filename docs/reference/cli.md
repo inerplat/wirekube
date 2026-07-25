@@ -32,7 +32,7 @@ wirekube-agent --node-name <name> [flags]
 | `POD_NAME` | Alternative to `--pod-name` | - |
 | `POD_NAMESPACE` | Alternative to `--pod-namespace` | - |
 | `WIREKUBE_INTERFACE` | Override WireGuard interface name | From WireKubeMesh |
-| `WIREKUBE_KUBE_APISERVER` | Bootstrap Kubernetes API server URL | In-cluster configuration |
+| `WIREKUBE_KUBE_APISERVER` | Bootstrap Kubernetes API server URL | Set by `install` from `--agent-apiserver` or the kubeconfig server; in-cluster configuration when neither is usable |
 | `WIREKUBE_RELAY_PROXY` | Relay proxy policy (`environment` or `disabled`) | `disabled` |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | Standard proxy environment used when relay proxy mode is enabled | - |
 | `KUBECONFIG` | Path to kubeconfig file | In-cluster config |
@@ -119,6 +119,8 @@ wirekubectl external revoke <display-name>
 All commands accept `--kubeconfig`, `--context`, `--namespace`, `--timeout`, and `--output text|json`. `install --dry-run` performs cluster inspection and prints the installation plan without mutation. Non-interactive `install --yes` requires explicit `--relay` and `--mesh-cidr` selections and an image pinned as `IMAGE@sha256:DIGEST` unless the released CLI already contains its matching default image digest. `--exclude-cidr` records routes that best-effort automatic mesh CIDR selection must avoid.
 
 `--relay-transport` selects `tcp` or `wss` and defaults to `tcp`. `--relay-endpoint` is `HOST:PORT` for TCP NodePort/external relays and `wss://HOST/PATH` for WSS. Managed WSS installs deploy Service `wirekube-relay-ws` as the HTTP backend, while the user supplies the trusted TLS Gateway or Ingress represented by the WSS URL. `--relay-udp-endpoint` is the independent raw WireGuard endpoint for external peer invites; TCP NodePort derives `HOST:30479`, WSS NodePort requires an explicit `HOST:30479`, and external relay mode accepts any valid UDP `HOST:PORT`.
+
+`--agent-apiserver` sets the apiserver URL the node agents dial, and defaults to the kubeconfig server. Agents self-register their own `WireKubePeer` before the node's CNI is ready, so they cannot reach the in-cluster `kubernetes` Service ClusterIP: that route only exists once the mesh carries pod traffic, and the mesh only forms after registration. `install` therefore injects `WIREKUBE_KUBE_APISERVER` into the agent DaemonSet. A kubeconfig server that nodes cannot dial — an in-cluster Service name, `localhost`, a loopback or link-local address — is skipped instead, leaving in-cluster discovery in place. Pass `--agent-apiserver in-cluster` to skip the injection deliberately. `upgrade` preserves the stored value unless the flag is supplied.
 
 `--relay load-balancer` enables the separate UDP LoadBalancer by default; pass `--relay-udp=false` to explicitly keep it disabled. Existing installations preserve their stored UDP choice during `upgrade` unless the flag is supplied. With WSS, load-balancer mode creates the UDP LoadBalancer plus a ClusterIP WebSocket backend and omits the unused public raw TCP LoadBalancer.
 
