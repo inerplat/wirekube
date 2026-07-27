@@ -181,9 +181,15 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: map[string]string{"wirekube.io/relay-config-revision": relayConfigRevision(options)}},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:            "wirekube-agent",
-					HostNetwork:                   true,
-					DNSPolicy:                     corev1.DNSClusterFirstWithHostNet,
+					ServiceAccountName: "wirekube-agent",
+					HostNetwork:        true,
+					// Default (node resolver) instead of ClusterFirstWithHostNet: no agent
+					// dial path needs cluster DNS anymore (the relay endpoint comes from
+					// spec/status, the apiserver from the injected WIREKUBE_KUBE_APISERVER
+					// env or the IP-literal in-cluster KUBERNETES_SERVICE_HOST), and cluster
+					// DNS is unreachable on bootstrap nodes without a CNI — the exact nodes
+					// this agent must come up on.
+					DNSPolicy:                     corev1.DNSDefault,
 					PriorityClassName:             "system-node-critical",
 					TerminationGracePeriodSeconds: int64Ptr(30),
 					Tolerations:                   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},

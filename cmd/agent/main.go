@@ -28,6 +28,7 @@ import (
 	agentpkg "github.com/inerplat/wirekube/pkg/agent"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	externalctrl "github.com/inerplat/wirekube/pkg/controller/external"
+	relayendpointctrl "github.com/inerplat/wirekube/pkg/controller/relayendpoint"
 	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
@@ -278,9 +279,9 @@ func loadBalancerHost(svc *corev1.Service) string {
 }
 
 // startExternalPeerReconciler spins up a controller-runtime manager
-// running the WireKubeExternalPeer reconciler. The manager runs in a
-// background goroutine; its lifetime is bound to ctx (the agent's
-// signal-aware context).
+// running the WireKubeExternalPeer reconciler and the relay-endpoint
+// reconciler. The manager runs in a background goroutine; its lifetime is
+// bound to ctx (the agent's signal-aware context).
 func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfig *rest.Config, scheme *runtime.Scheme, relayNamespace string) error {
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                  scheme,
@@ -304,6 +305,17 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup external-peer reconciler: %w", err)
+	}
+
+	// The relay-endpoint reconciler shares this manager's leader election
+	// (lease wirekube-external-peer.wirekube.io), so exactly one agent syncs
+	// the relay Service's LoadBalancer ingress into mesh status.relayEndpoint.
+	endpointSync := &relayendpointctrl.Reconciler{
+		Client:         mgr.GetClient(),
+		RelayNamespace: relayNamespace,
+	}
+	if err := endpointSync.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup relay-endpoint reconciler: %w", err)
 	}
 
 	go func() {

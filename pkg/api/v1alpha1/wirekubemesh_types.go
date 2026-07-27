@@ -205,8 +205,11 @@ type ManagedRelaySpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// ControlEndpoint is the public WSS URL agents use when Transport is wss.
-	// TLS is terminated by an Ingress or Gateway in front of the managed WebSocket Service.
+	// ControlEndpoint is the agent-facing relay endpoint. For wss transport it
+	// is the public WSS URL (TLS terminated by an Ingress or Gateway in front
+	// of the managed WebSocket Service). For tcp transport it may hold an
+	// explicit raw host:port address; when empty, agents fall back to
+	// status.relayEndpoint and then the cluster-local control Service DNS name.
 	// +optional
 	ControlEndpoint string `json:"controlEndpoint,omitempty"`
 
@@ -256,6 +259,12 @@ type WireKubeMeshStatus struct {
 	// Conditions reflect the current state of the WireKubeMesh.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// RelayEndpoint is the auto-discovered public endpoint (HOST:PORT) of the
+	// managed relay, synced from the relay Service LoadBalancer ingress by the
+	// leader agent. Agents dial it when spec.relay.managed.controlEndpoint is empty.
+	// +optional
+	RelayEndpoint string `json:"relayEndpoint,omitempty"`
 }
 
 // +kubebuilder:object:root=true

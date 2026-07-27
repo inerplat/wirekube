@@ -25,7 +25,11 @@ spec:
     spec:
       serviceAccountName: wirekube-agent
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Default (node resolver): no agent dial path needs cluster DNS (relay
+      # endpoint comes from mesh spec/status, apiserver from the injected env
+      # or the in-cluster IP literal), and cluster DNS is unreachable on
+      # bootstrap nodes without a CNI.
+      dnsPolicy: Default
       priorityClassName: system-node-critical
       tolerations:
         - operator: Exists

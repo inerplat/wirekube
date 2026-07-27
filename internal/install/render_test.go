@@ -240,7 +240,7 @@ func TestRenderManagedWSSGatewayAndUDPLoadBalancer(t *testing.T) {
 	}
 }
 
-func TestAgentUsesClusterDNSOverHostNetwork(t *testing.T) {
+func TestAgentUsesNodeDNSOverHostNetwork(t *testing.T) {
 	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayUDP: true, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
 	if err != nil {
 		t.Fatal(err)
@@ -254,15 +254,17 @@ func TestAgentUsesClusterDNSOverHostNetwork(t *testing.T) {
 	if agent == nil {
 		t.Fatal("wirekube-agent DaemonSet was not rendered")
 	}
-	// The agent runs on the host network but dials the relay control plane through
-	// the in-cluster headless Service (wirekube-relay-control.<ns>.svc.cluster.local),
-	// so it must use ClusterFirstWithHostNet; DNSDefault resolves only host names and
-	// leaves every peer unable to reach the relay.
+	// The agent runs on the host network and must use the node resolver
+	// (Default): no agent dial path needs cluster DNS anymore — the relay
+	// endpoint comes from mesh spec/status and the apiserver from the
+	// injected WIREKUBE_KUBE_APISERVER env or the in-cluster IP-literal
+	// KUBERNETES_SERVICE_HOST — and cluster DNS is a blackhole on bootstrap
+	// nodes without a CNI, the exact nodes this design exists to serve.
 	if !agent.Spec.Template.Spec.HostNetwork {
 		t.Fatal("agent must run on the host network")
 	}
-	if agent.Spec.Template.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
-		t.Fatalf("agent dnsPolicy=%q, want ClusterFirstWithHostNet so host-network pods resolve cluster Services", agent.Spec.Template.Spec.DNSPolicy)
+	if agent.Spec.Template.Spec.DNSPolicy != corev1.DNSDefault {
+		t.Fatalf("agent dnsPolicy=%q, want Default so bootstrap nodes without cluster DNS can still dial the relay and apiserver", agent.Spec.Template.Spec.DNSPolicy)
 	}
 }
 

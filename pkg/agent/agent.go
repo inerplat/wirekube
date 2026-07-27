@@ -47,6 +47,10 @@ type Agent struct {
 	relayMode    string
 	relayTimeout time.Duration
 	relayRetry   time.Duration
+	// relayDialEndpoint records the control endpoint the current relayPool
+	// was built for, so the sync loop can detect a late-arriving
+	// status.relayEndpoint and rebuild the pool without a pod restart.
+	relayDialEndpoint string
 
 	handshakeValidWindow  time.Duration
 	directConnectedWindow time.Duration
@@ -675,6 +679,7 @@ func (a *Agent) sync(ctx context.Context) error {
 				a.relayMode = newMode
 			}
 		}
+		a.maybeRefreshRelayEndpoint(ctx, mesh)
 	}
 
 	// Invalidate gateway client cache so it's rebuilt with fresh data this cycle
@@ -1545,6 +1550,56 @@ func (a *Agent) publishNATClassification(ctx context.Context) error {
 	return a.client.Status().Patch(ctx, peer, patch)
 }
 
+// maybeRefreshRelayEndpoint re-resolves the managed relay dial config from a
+// freshly read mesh and rebuilds the relay pool when the endpoint changed.
+// This is the seam that lets an agent that started BEFORE
+// status.relayEndpoint was synced (a bootstrap node dialing the cluster-DNS
+// fallback, which is a blackhole without CNI) pick up the discovered
+// LoadBalancer endpoint without a pod restart. The sync loop already re-reads
+// the mesh every cycle, so re-checking here is the least invasive seam: it
+// only acts while the pool is disconnected — an agent with a working relay
+// session keeps its current endpoint.
+func (a *Agent) maybeRefreshRelayEndpoint(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) {
+	if mesh.Spec.Relay == nil || mesh.Spec.Relay.Provider != "managed" || a.relayMode == relayModeNever {
+		return
+	}
+	config, err := managedRelayDialConfig(mesh.Spec.Relay.Managed, mesh.Status.RelayEndpoint, a.podNamespace)
+	if err != nil {
+		return
+	}
+	poolExists := a.relayPool != nil
+	if !relayRebuildDecision(poolExists, poolExists && a.relayPool.IsConnected(), a.relayDialEndpoint, config.endpoint) {
+		return
+	}
+	if poolExists {
+		a.log.Info("relay dial endpoint changed while disconnected; rebuilding relay pool",
+			"oldEndpoint", a.relayDialEndpoint, "newEndpoint", config.endpoint)
+		a.relayPool.Close()
+		a.relayPool = nil
+	} else {
+		// A previous rebuild failed mid-swap and left no pool; keep retrying so
+		// one transient init error cannot disable this seam permanently.
+		a.log.V(1).Info("relay pool missing after a failed rebuild; retrying init", "endpoint", config.endpoint)
+	}
+	if err := a.initRelay(ctx, mesh, a.ownPublicKeyB64); err != nil {
+		a.log.Error(err, "relay re-init after endpoint change failed")
+	}
+}
+
+// relayRebuildDecision reports whether the relay pool must be torn down and
+// re-initialized for the freshly resolved dial endpoint. A connected pool is
+// never disturbed; a disconnected pool is rebuilt only when the endpoint
+// actually changed; a missing pool (failed earlier rebuild) always retries.
+func relayRebuildDecision(poolExists, poolConnected bool, currentEndpoint, resolvedEndpoint string) bool {
+	if poolExists && poolConnected {
+		return false
+	}
+	if poolExists && resolvedEndpoint == currentEndpoint {
+		return false
+	}
+	return true
+}
+
 // initRelay sets up the relay client from the mesh relay configuration.
 func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, myPubKeyB64 string) error {
 	if mesh.Spec.Relay == nil {
@@ -1611,7 +1666,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		relayTransport = config.transport
 		tokenRequired = config.tokenRequired
 	case "managed":
-		config, err := managedRelayDialConfig(relay.Managed, a.podNamespace)
+		config, err := managedRelayDialConfig(relay.Managed, mesh.Status.RelayEndpoint, a.podNamespace)
 		if err != nil {
 			return err
 		}
@@ -1631,6 +1686,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	copy(pubKey[:], keyBytes)
 
 	wgPort := a.wgMgr.ListenPort()
+	a.relayDialEndpoint = endpoint
 	a.relayPool = agentrelay.NewPool(endpoint, pubKey, wgPort)
 	a.relayPool.SetProbeAddr(probeAddr)
 	if tokenRequired {
@@ -1749,7 +1805,7 @@ func externalRelayDialConfig(external *wirekubev1alpha1.ExternalRelaySpec) (rela
 	}
 }
 
-func managedRelayDialConfig(managed *wirekubev1alpha1.ManagedRelaySpec, namespace string) (relayDialConfig, error) {
+func managedRelayDialConfig(managed *wirekubev1alpha1.ManagedRelaySpec, statusEndpoint, namespace string) (relayDialConfig, error) {
 	port := int32(3478)
 	transport := relayTransportTCP
 	if managed != nil {
@@ -1763,7 +1819,29 @@ func managedRelayDialConfig(managed *wirekubev1alpha1.ManagedRelaySpec, namespac
 	config := relayDialConfig{transport: transport}
 	switch transport {
 	case relayTransportTCP:
-		config.endpoint = managedRelayControlEndpoint(namespace, port)
+		// Dial priority for the managed TCP relay:
+		//   1. spec.relay.managed.controlEndpoint — operator-pinned address.
+		//   2. status.relayEndpoint — auto-synced from the relay Service
+		//      LoadBalancer ingress by the leader agent's reconciler.
+		//   3. the cluster-local control Service DNS name — legacy fallback
+		//      that requires working cluster DNS, which bootstrap (CNI-less)
+		//      nodes do not have.
+		explicit := ""
+		if managed != nil {
+			explicit = strings.TrimSpace(managed.ControlEndpoint)
+		}
+		switch {
+		case explicit != "":
+			config.endpoint = explicit
+		case strings.TrimSpace(statusEndpoint) != "":
+			config.endpoint = strings.TrimSpace(statusEndpoint)
+		default:
+			config.endpoint = managedRelayControlEndpoint(namespace, port)
+			return config, nil
+		}
+		if err := validateManagedTCPEndpoint(config.endpoint); err != nil {
+			return relayDialConfig{}, err
+		}
 		return config, nil
 	case relayTransportWSS:
 		if managed == nil || strings.TrimSpace(managed.ControlEndpoint) == "" {
@@ -1778,6 +1856,27 @@ func managedRelayDialConfig(managed *wirekubev1alpha1.ManagedRelaySpec, namespac
 	default:
 		return relayDialConfig{}, fmt.Errorf("unsupported managed relay transport %q", transport)
 	}
+}
+
+// validateManagedTCPEndpoint mirrors the external tcp endpoint validation in
+// externalRelayDialConfig for the managed provider: the dial address must be
+// a plain HOST:PORT, never a WebSocket URL.
+func validateManagedTCPEndpoint(endpoint string) error {
+	if websocketScheme(endpoint) != "" {
+		return fmt.Errorf("managed relay transport tcp cannot use WebSocket endpoint %q", endpoint)
+	}
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return fmt.Errorf("managed relay transport tcp requires a host:port endpoint, got %q: %w", endpoint, err)
+	}
+	if host == "" {
+		return fmt.Errorf("managed relay transport tcp endpoint %q has no host", endpoint)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("managed relay transport tcp endpoint %q has an invalid port", endpoint)
+	}
+	return nil
 }
 
 func websocketScheme(endpoint string) string {
