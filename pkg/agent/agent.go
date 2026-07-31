@@ -2298,8 +2298,8 @@ func (a *Agent) findPeerNameByKey(pubKeyB64 string) string {
 // NAT. Shared-NAT TTLs measured on carrier-grade deployments sit below the
 // default 25s: a ping started while the pinhole is closed loses ~10 packets
 // before the next keepalive re-opens it. Tailscale can keep a fixed interval
-// because it targets typical home/office NATs with longer TTL — this override is
-// WireKube's concession to shared-CGNAT-grade deployments.
+// because it targets typical home/office NATs with longer TTL — this
+// override is WireKube's concession to shared-CGNAT-grade deployments.
 func (a *Agent) keepaliveForPeer(p *wirekubev1alpha1.WireKubePeer) int {
 	ka := int(p.Spec.PersistentKeepalive)
 	switch a.detectedNATType {

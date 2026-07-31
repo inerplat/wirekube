@@ -132,7 +132,7 @@ func TestGenerateCandidates_HighIncrement(t *testing.T) {
 
 // TestGenerateCandidates_NegativeIncrement covers NATs where the second
 // observed port is lower than the first (an observed shared-NAT node
-// reported BasePort=33792, Increment=-26134). The sequential fan-out only yields
+// reported BasePort=33792, Increment=-26134). The sequential fan-out yields
 // one valid candidate (BasePort+Increment) before going negative; the
 // wide-scan top-up must supply the remainder.
 func TestGenerateCandidates_NegativeIncrement(t *testing.T) {
