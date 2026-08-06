@@ -75,6 +75,18 @@ type WireKubePeerStatus struct {
 	// +optional
 	LastHandshake *metav1.Time `json:"lastHandshake,omitempty"`
 
+	// LastReportedAt is when this peer's own agent last wrote this status.
+	// Only the owning agent refreshes it, which is what makes it useful: a
+	// dead agent cannot mark itself dead, and Connected simply freezes at
+	// its last value. A LastReportedAt that stops advancing is the one
+	// signal that outlives the agent. Node conditions are a poor substitute
+	// — kubelet and the agent fail independently — and ownerReference GC
+	// only fires when the Node object is deleted, not when it goes NotReady.
+	// Observers must still corroborate with their own WireGuard handshake
+	// evidence before acting; see Agent.peerIsDormant.
+	// +optional
+	LastReportedAt *metav1.Time `json:"lastReportedAt,omitempty"`
+
 	// BytesReceived is the number of bytes received from this peer.
 	BytesReceived int64 `json:"bytesReceived,omitempty"`
 

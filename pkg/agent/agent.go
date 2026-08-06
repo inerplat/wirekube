@@ -65,6 +65,14 @@ type Agent struct {
 	peerFirstSeen map[string]time.Time
 	// relayedPeers tracks which peers are currently using relay transport.
 	relayedPeers map[string]bool
+	// dormantPeers tracks peers currently judged dormant, so the transition
+	// is logged once instead of every sync tick.
+	dormantPeers map[string]bool
+	// startedAt is when this agent began syncing. Peers whose CR predates
+	// the heartbeat field carry no LastReportedAt at all, so dormancy is
+	// suppressed until the agent itself has been running long enough for a
+	// live peer to have published one.
+	startedAt time.Time
 	// directEndpoints stores the original direct endpoint before relay override.
 	directEndpoints map[string]string
 	// directRetryTime tracks the last time we attempted direct connectivity for a relayed peer.
@@ -182,6 +190,8 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		syncEvery:            parseSyncEvery(),
 		peerFirstSeen:        make(map[string]time.Time),
 		relayedPeers:         make(map[string]bool),
+		dormantPeers:         make(map[string]bool),
+		startedAt:            time.Now(),
 		directEndpoints:      make(map[string]string),
 		directRetryTime:      make(map[string]time.Time),
 		directProbing:        make(map[string]bool),
@@ -935,7 +945,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	// SetPeerPath call per sync cycle — legacy SetPeerPath calls earlier in
 	// the pipeline (enableRelayForPeer, upgradeToDirect, probe logic) are
 	// superseded by whatever PathMonitor.Evaluate returns here.
-	a.driveTransportMode(remotePeerNames, remotePeers)
+	a.driveTransportMode(remotePeerNames, remotePeers, statsByKey)
 
 	// Publish status after ICE transitions so Status.Connections and Connected
 	// reflect the current path choice instead of the pre-failover snapshot.
@@ -1297,6 +1307,10 @@ func (a *Agent) updateOwnStatus(
 		t := metav1.NewTime(lastHandshake)
 		peer.Status.LastHandshake = &t
 	}
+	// Heartbeat. Written unconditionally on every sync so remote agents can
+	// tell "this peer's agent is alive but idle" from "nobody is home".
+	reportedAt := metav1.NewTime(time.Now())
+	peer.Status.LastReportedAt = &reportedAt
 	if err := a.client.Status().Patch(ctx, peer, patch); err != nil {
 		return err
 	}
@@ -1379,10 +1393,12 @@ func (a *Agent) updatePeerConnections(
 func (a *Agent) driveTransportMode(
 	peerNames []string,
 	peers map[string]*wirekubev1alpha1.WireKubePeer,
+	statsByKey map[string]wireguard.PeerStats,
 ) {
 	if a.pathMonitor == nil {
 		return
 	}
+	now := time.Now()
 	for _, name := range peerNames {
 		peer := peers[name]
 		if peer == nil || peer.Spec.PublicKey == "" {
@@ -1398,7 +1414,23 @@ func (a *Agent) driveTransportMode(
 		if ep, ok := a.directEndpoints[name]; ok && ep != "" {
 			directAddr = ep
 		}
-		if err := a.wgMgr.SetPeerPath(peer.Spec.PublicKey, mode.toWireguardPathMode(), directAddr); err != nil {
+		// A dormant peer is demoted to direct-only dispatch. The relay leg is
+		// what costs the whole mesh: a warm peer keeps duplicating every
+		// packet onto a relay session the dead node will never read, and the
+		// relay burns a per-destination write slot on each one.
+		//
+		// Recovery rides on the CR heartbeat, not on the direct path. A peer
+		// that needs relay to be reachable at all would never hand us a
+		// handshake while demoted, so waiting for one would strand it here.
+		// Its returning agent republishes LastReportedAt instead, which the
+		// next sync sees, and the relay leg comes back with no CR churn.
+		wgMode := mode.toWireguardPathMode()
+		dormant := a.peerIsDormant(peer, statsByKey, now)
+		if dormant {
+			wgMode = wireguard.PathDirect
+		}
+		a.noteDormantTransition(name, dormant)
+		if err := a.wgMgr.SetPeerPath(peer.Spec.PublicKey, wgMode, directAddr); err != nil {
 			a.log.Error(err, "SetPeerPath failed", "peer", name, "mode", mode)
 		}
 		// Mirror PathMonitor into the legacy relayedPeers map so any path
@@ -1407,7 +1439,7 @@ func (a *Agent) driveTransportMode(
 		// PathMonitor made. ICE paths still write relayedPeers directly,
 		// but this assignment happens at the end of every sync tick and
 		// therefore wins, collapsing the old racing-writers problem.
-		if mode == PathModeRelay {
+		if mode == PathModeRelay && !dormant {
 			a.relayedPeers[name] = true
 		} else {
 			delete(a.relayedPeers, name)
@@ -1415,6 +1447,70 @@ func (a *Agent) driveTransportMode(
 	}
 	// Forget state for peers that disappeared.
 	a.pathMonitor.ForgetMissing(peerNames)
+	for name := range a.dormantPeers {
+		if _, ok := peers[name]; !ok {
+			delete(a.dormantPeers, name)
+		}
+	}
+}
+
+// dormantPeerThreshold is how long both liveness signals must stay silent
+// before a peer is treated as dormant. Sync runs every 30s by default, so
+// this allows ten missed heartbeats — long enough that a slow status write,
+// a brief apiserver outage, or an agent restart never trips it.
+const dormantPeerThreshold = 5 * time.Minute
+
+// peerIsDormant reports whether a peer looks abandoned rather than merely
+// unreachable.
+//
+// Two independent signals must agree, because either one alone produces a
+// wrong answer in a case that actually happens:
+//
+//   - Local WireGuard evidence alone cannot distinguish "the node is gone"
+//     from "the direct path is broken and relay is carrying us", which is
+//     the normal state for a NAT-bound peer.
+//   - The CR heartbeat alone misfires during a rolling upgrade, where a peer
+//     still running the previous agent never publishes LastReportedAt even
+//     though it is healthy. Demoting it to direct-only would cut a live
+//     relay-dependent peer off.
+//
+// So a recent handshake vetoes dormancy outright, and a missing heartbeat
+// only counts once this agent has been up long enough for a live peer to
+// have written one.
+func (a *Agent) peerIsDormant(
+	peer *wirekubev1alpha1.WireKubePeer,
+	statsByKey map[string]wireguard.PeerStats,
+	now time.Time,
+) bool {
+	if s, ok := statsByKey[peer.Spec.PublicKey]; ok {
+		if !s.LastHandshake.IsZero() && now.Sub(s.LastHandshake) < dormantPeerThreshold {
+			return false
+		}
+	}
+	if peer.Status.LastReportedAt == nil {
+		return now.Sub(a.startedAt) >= dormantPeerThreshold
+	}
+	return now.Sub(peer.Status.LastReportedAt.Time) >= dormantPeerThreshold
+}
+
+// noteDormantTransition logs only the edges of the dormant state so a dead
+// peer does not reprint the same line every sync tick.
+func (a *Agent) noteDormantTransition(name string, dormant bool) {
+	if dormant == a.dormantPeers[name] {
+		return
+	}
+	if dormant {
+		// Tests and any other caller that builds an Agent literal skip
+		// NewAgent, so the map may be nil on the first transition.
+		if a.dormantPeers == nil {
+			a.dormantPeers = map[string]bool{}
+		}
+		a.dormantPeers[name] = true
+		a.log.Info("peer dormant, suspending relay leg", "peer", name)
+		return
+	}
+	delete(a.dormantPeers, name)
+	a.log.Info("peer no longer dormant, relay leg eligible again", "peer", name)
 }
 
 func (a *Agent) publishedTransportForPeer(

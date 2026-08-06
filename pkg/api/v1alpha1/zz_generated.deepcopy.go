@@ -679,6 +679,10 @@ func (in *WireKubePeerStatus) DeepCopyInto(out *WireKubePeerStatus) {
 		in, out := &in.LastHandshake, &out.LastHandshake
 		*out = (*in).DeepCopy()
 	}
+	if in.LastReportedAt != nil {
+		in, out := &in.LastReportedAt, &out.LastReportedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.ICECandidates != nil {
 		in, out := &in.ICECandidates, &out.ICECandidates
 		*out = make([]ICECandidate, len(*in))
