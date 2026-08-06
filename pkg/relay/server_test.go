@@ -8,27 +8,73 @@ import (
 	"time"
 )
 
-func TestClientConnWriteFrameTimesOut(t *testing.T) {
-	oldTimeout := relayClientWriteTimeout
-	relayClientWriteTimeout = 20 * time.Millisecond
-	defer func() { relayClientWriteTimeout = oldTimeout }()
-
+// A destination whose socket never drains must not hold up the peers sending
+// to it. writeFrame is called from another peer's read loop, so blocking here
+// is what previously froze the entire relay behind one stalled connection.
+func TestClientConnWriteFrameNeverBlocksOnStalledPeer(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
 	defer clientSide.Close()
 
-	cc := &clientConn{
-		pubKey: pubkey(1),
-		conn:   serverSide,
-		writer: bufio.NewWriter(serverSide),
-	}
+	// No reader on clientSide and no writeLoop started, so nothing can ever
+	// drain sendQ. Every write past the queue depth must still return at once.
+	cc := newClientConn(pubkey(1), serverSide)
 
 	start := time.Now()
-	err := cc.writeFrame(MakeKeepaliveFrame())
-	if err == nil {
-		t.Fatal("writeFrame succeeded; want timeout")
+	for i := 0; i < sendQueueDepth*2; i++ {
+		if err := cc.writeFrame(MakeKeepaliveFrame()); err != nil {
+			t.Fatalf("writeFrame returned %v; want nil (overflow drops, not errors)", err)
+		}
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("writeFrame blocked for %s; want bounded timeout", elapsed)
+		t.Fatalf("writeFrame blocked for %s; want non-blocking enqueue", elapsed)
+	}
+	if dropped := cc.dropped.Load(); dropped == 0 {
+		t.Fatal("no frames dropped; want overflow past the queue depth")
+	}
+}
+
+func TestClientConnWriteFrameErrsAfterClose(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	cc := newClientConn(pubkey(1), serverSide)
+	cc.close()
+
+	if err := cc.writeFrame(MakeKeepaliveFrame()); err == nil {
+		t.Fatal("writeFrame succeeded on a closed conn; want error so callers drop the peer")
+	}
+	// close is called from both the read loop's defer and dropPeer, so it has
+	// to tolerate repeats.
+	cc.close()
+}
+
+func TestClientConnWriteLoopDeliversQueuedFrames(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	cc := newClientConn(pubkey(1), serverSide)
+	go cc.writeLoop()
+	defer cc.close()
+
+	const want = 4
+	for i := 0; i < want; i++ {
+		if err := cc.writeFrame(MakeKeepaliveFrame()); err != nil {
+			t.Fatalf("writeFrame: %v", err)
+		}
+	}
+
+	if err := clientSide.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	reader := bufio.NewReader(clientSide)
+	for i := 0; i < want; i++ {
+		frame, err := ReadFrame(reader)
+		if err != nil {
+			t.Fatalf("ReadFrame %d: %v", i, err)
+		}
+		if frame.Type != MsgKeepalive {
+			t.Fatalf("frame %d type = %v; want keepalive", i, frame.Type)
+		}
 	}
 }
 

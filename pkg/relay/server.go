@@ -73,41 +73,145 @@ type Server struct {
 	probeSeq   atomic.Uint64
 }
 
+// sendQueueDepth bounds how many frames may be waiting for one destination.
+// Frames are WireGuard packets, which the transport layer above already
+// treats as lossy, so overflow drops the newest frame rather than stalling
+// the sender. The depth only needs to cover a short scheduling hiccup; a
+// destination that stays behind for longer is genuinely broken and dropping
+// is the correct answer.
+const sendQueueDepth = 256
+
+// dropLogInterval rate-limits the overflow warning. Without it a single
+// wedged destination would reproduce the log flood this queue exists to
+// prevent.
+const dropLogInterval = 10 * time.Second
+
 type clientConn struct {
-	pubKey  [PubKeySize]byte
-	conn    net.Conn
-	writer  *bufio.Writer
-	mu      sync.Mutex
+	pubKey [PubKeySize]byte
+	conn   net.Conn
+	writer *bufio.Writer
+
+	// sendQ decouples "a peer wants to send to this destination" from "this
+	// destination's socket accepts bytes". Before it existed, writeFrame ran
+	// synchronously inside the *sending* peer's read loop while holding this
+	// connection's write mutex, so one slow destination blocked every peer
+	// trying to reach it, and those peers then could not forward to any
+	// other destination either. A single stalled socket froze the whole
+	// relay for as long as the write deadline allowed.
+	sendQ     chan Frame
+	done      chan struct{}
+	closeOnce sync.Once
+
+	dropped     atomic.Uint64
+	dropLogMu   sync.Mutex
+	lastDropLog time.Time
+
 	probeMu sync.Mutex
 	probes  map[uint64]chan struct{}
 }
 
 var relayClientWriteTimeout = 2 * time.Second
 
-func (c *clientConn) writeFrame(frame Frame) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func newClientConn(pubKey [PubKeySize]byte, conn net.Conn) *clientConn {
+	return &clientConn{
+		pubKey: pubKey,
+		conn:   conn,
+		writer: bufio.NewWriterSize(conn, 64*1024),
+		sendQ:  make(chan Frame, sendQueueDepth),
+		done:   make(chan struct{}),
+	}
+}
 
+// writeFrame hands a frame to this connection's writer goroutine. It never
+// blocks and never reports a full queue as an error: the caller is another
+// peer's read loop, and making it wait here is exactly the head-of-line
+// blocking this design removes. A closed connection is still an error so
+// callers can drop the peer.
+func (c *clientConn) writeFrame(frame Frame) error {
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	default:
+	}
+
+	select {
+	case c.sendQ <- frame:
+		return nil
+	default:
+		c.noteDrop()
+		return nil
+	}
+}
+
+func (c *clientConn) noteDrop() {
+	total := c.dropped.Add(1)
+
+	c.dropLogMu.Lock()
+	defer c.dropLogMu.Unlock()
+	now := time.Now()
+	if now.Sub(c.lastDropLog) < dropLogInterval {
+		return
+	}
+	c.lastDropLog = now
+	log.Printf("relay: send queue full for %x, dropping frames (total dropped %d)", c.pubKey[:8], total)
+}
+
+// writeLoop is the only goroutine that touches the socket's write side, so
+// the per-connection write mutex is gone along with the contention it caused.
+func (c *clientConn) writeLoop() {
+	defer c.close()
+	for {
+		select {
+		case <-c.done:
+			return
+		case frame := <-c.sendQ:
+			if err := c.writeBatch(frame); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// writeBatch writes the frame plus whatever else is already queued, then
+// flushes once. Coalescing matters here: warm-bimodal peers deliver frames in
+// bursts, and one flush per burst keeps the syscall count off the critical
+// path.
+func (c *clientConn) writeBatch(first Frame) error {
 	if relayClientWriteTimeout > 0 {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(relayClientWriteTimeout)); err != nil {
 			return err
 		}
+		defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	}
-	err := WriteFrame(c.writer, frame)
-	if err == nil {
-		err = c.writer.Flush()
+
+	if err := WriteFrame(c.writer, first); err != nil {
+		return err
 	}
-	if relayClientWriteTimeout > 0 {
-		_ = c.conn.SetWriteDeadline(time.Time{})
+	// Bounded so the deadline above stays meaningful: producers can refill
+	// sendQ while we drain it, and an unbounded loop would let one batch run
+	// arbitrarily long under a single deadline.
+	for i := 1; i < sendQueueDepth; i++ {
+		select {
+		case next := <-c.sendQ:
+			if err := WriteFrame(c.writer, next); err != nil {
+				return err
+			}
+		default:
+			return c.writer.Flush()
+		}
 	}
-	if err != nil {
+	return c.writer.Flush()
+}
+
+func (c *clientConn) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
 		_ = c.conn.Close()
-	}
-	return err
+	})
 }
 
 func (s *Server) dropPeer(c *clientConn) {
-	_ = c.conn.Close()
+	c.close()
 	s.mu.Lock()
 	if s.peers[c.pubKey] == c {
 		delete(s.peers, c.pubKey)
@@ -270,11 +374,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	var pubKey [PubKeySize]byte
 	copy(pubKey[:], frame.Body)
 
-	cc := &clientConn{
-		pubKey: pubKey,
-		conn:   conn,
-		writer: bufio.NewWriterSize(conn, 64*1024),
-	}
+	cc := newClientConn(pubKey, conn)
+	go cc.writeLoop()
 
 	s.mu.Lock()
 	old, exists := s.peers[pubKey]
@@ -282,16 +383,24 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.mu.Unlock()
 
 	if exists {
-		old.conn.Close()
+		old.close()
 	}
 
 	log.Printf("relay: peer registered: %x", pubKey[:8])
 	defer func() {
+		// Stop the writer goroutine too: the read loop exiting is what tells
+		// us this peer is gone, and without this the goroutine would sit on
+		// sendQ until the next write error.
+		cc.close()
 		s.mu.Lock()
 		if s.peers[pubKey] == cc {
 			delete(s.peers, pubKey)
 		}
 		s.mu.Unlock()
+		if dropped := cc.dropped.Load(); dropped > 0 {
+			log.Printf("relay: peer disconnected: %x (dropped %d frames)", pubKey[:8], dropped)
+			return
+		}
 		log.Printf("relay: peer disconnected: %x", pubKey[:8])
 	}()
 
