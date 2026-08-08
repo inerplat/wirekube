@@ -455,7 +455,7 @@ func (s *server) viewPeerConfig(w http.ResponseWriter, r *http.Request, name str
 		s.render(w, r, status, pageData{Error: fmt.Sprintf("get external peer: %v", err)})
 		return
 	}
-	conf, err := s.loadPeerConfig(r.Context(), name)
+	conf, err := s.currentPeerConfig(r.Context(), cr)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if apierrors.IsNotFound(err) {
@@ -619,6 +619,58 @@ func (s *server) savePeerConfig(ctx context.Context, cr *wirekubev1alpha1.WireKu
 		return s.client.Update(ctx, current)
 	}
 	return nil
+}
+
+// currentPeerConfig returns the client config for cr, rendered from the CR's
+// CURRENT status. The stored secret contributes only the private key. The
+// [Peer] side — ingress public key, relay endpoint, allowed destinations,
+// MTU — tracks the live allocation, which can legitimately change after
+// issuance: re-pinning a peer off a dead ingress node is the case that
+// motivated this. Serving the issuance-time render verbatim kept handing out
+// configs whose ingress no longer existed, and the client's handshakes died
+// silently against a public key nobody held.
+func (s *server) currentPeerConfig(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer) (string, error) {
+	stored, err := s.loadPeerConfig(ctx, cr.Name)
+	if err != nil {
+		return "", err
+	}
+	priv := privateKeyFromConfig(stored)
+	if priv == "" {
+		// A secret without a parsable key predates this scheme or was
+		// written by something else; the stored text is all there is.
+		return stored, nil
+	}
+	if cr.Status.AssignedMeshIP == "" || cr.Status.IngressPublicKey == "" || cr.Status.RelayEndpoint == "" {
+		// Allocation incomplete (peer back in Pending). A config rendered
+		// from half a status would be broken in new ways; keep the last
+		// known-good render until the allocation settles.
+		return stored, nil
+	}
+	conf := externalpeer.RenderConfig(priv, cr)
+	if conf != stored {
+		// Refresh the stored copy so anything else reading the secret
+		// (kubectl, backups) sees the same config the web serves. Failure
+		// only costs that convenience, never the download.
+		if err := s.savePeerConfig(ctx, cr, conf); err != nil {
+			log.Printf("refresh stored config for %s: %v", cr.Name, err)
+		}
+	}
+	return conf, nil
+}
+
+// privateKeyFromConfig pulls the PrivateKey value out of a rendered config.
+// Cutting at the first '=' keeps the base64 padding intact.
+func privateKeyFromConfig(conf string) string {
+	for _, line := range strings.Split(conf, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(key) == "PrivateKey" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (s *server) loadPeerConfig(ctx context.Context, name string) (string, error) {
