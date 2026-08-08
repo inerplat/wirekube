@@ -29,6 +29,20 @@ import (
 //   0x13 = IngressProbe: request body = [2 bytes count][32 bytes ingress pubkey]...
 //                         response body = [2 bytes count]([32 bytes ingress pubkey][8 bytes RTT ns])...
 //   0x20 = ExternalData: body = [8 bytes source token][2 bytes source addr length][source addr string][WG payload]
+//   0x21 = ClusterEnvelope: body = [32 bytes dest public key][1 byte inner type][inner body]
+//          Relay-to-relay only. Carries a frame for a peer whose TCP session
+//          lives on another replica; the receiving replica unwraps and writes
+//          the inner frame to its local peer. Never re-forwarded, so a stale
+//          registry entry cannot create a forwarding loop.
+//   0x22 = ClusterExternalReply: body = [8 bytes token][32 bytes ingress pubkey][WG payload]
+//          Relay-to-relay only. Returns an ingress agent's raw-WireGuard
+//          response to the replica that owns the external client's UDP flow
+//          (identified by the token's origin tag). Carries the replying
+//          ingress pubkey so the owning replica can pin the flow.
+//   0x23 = ClusterExternalFanout: body = [8 bytes token][2 bytes source addr length][source addr][WG payload]
+//          Relay-to-relay only. Extends the dynamic-ingress fanout of a new
+//          external source's first packets to agents connected to sibling
+//          replicas. The receiver fans out to its LOCAL peers only.
 //   0xFF = Error:    body = UTF-8 error string
 //
 // BimodalHint is sent by a peer that suspects its inbound direct path is
@@ -50,6 +64,9 @@ const (
 	MsgForwarderStats      byte = 0x12
 	MsgIngressProbe        byte = 0x13
 	MsgExternalData        byte = 0x20
+	MsgClusterEnvelope     byte = 0x21
+	MsgClusterExtReply     byte = 0x22
+	MsgClusterExtFanout    byte = 0x23
 	MsgError               byte = 0xFF
 
 	MaxFrameSize = 65536

@@ -71,6 +71,16 @@ type Server struct {
 
 	externalWG *ExternalWGListener
 	probeSeq   atomic.Uint64
+
+	// cluster, when non-nil, forwards frames for peers whose TCP session
+	// lives on another relay replica. Nil on single-replica deployments.
+	cluster *Cluster
+
+	// destMissLog throttles the dest-not-found line. Dead peers attract
+	// warm-relay traffic from the entire mesh, and logging every miss at
+	// mesh scale (hundreds/sec) once starved this process through the
+	// global log mutex.
+	destMissLog *suppressedLogger
 }
 
 // sendQueueDepth bounds how many frames may be waiting for one destination.
@@ -224,7 +234,64 @@ func NewServer() *Server {
 		peers:        make(map[[PubKeySize]byte]*clientConn),
 		probeSem:     make(chan struct{}, 16),
 		probeLimiter: rate.NewLimiter(probeRateLimit, probeRateBurst),
+		destMissLog:  newSuppressedLogger(time.Second),
 	}
+}
+
+// EnableCluster joins this server to the replica mesh. Frames for peers not
+// connected here are forwarded to the owning replica, and envelopes arriving
+// from sibling replicas are delivered to local peers. Must be called before
+// ListenAndServe.
+func (s *Server) EnableCluster(c *Cluster) {
+	s.cluster = c
+	c.deliver = s.deliverLocal
+	c.deliverExtReply = func(token uint64, ingress [PubKeySize]byte, payload []byte) {
+		if s.externalWG == nil {
+			return
+		}
+		// This replica issued the token, so it owns the UDP flow. Pin the
+		// flow to the agent that answered — later packets skip the fanout
+		// and travel a single cluster hop straight to it.
+		s.externalWG.BindTokenIngress(token, ingress)
+		if err := s.externalWG.SendToExternal(token, payload); err != nil {
+			s.destMissLog.Logf("relay cluster: external reply token=%d: %v", token, err)
+		}
+	}
+	// Fanout needs only this replica's peer table, not its UDP listener, so
+	// it works on replicas that run without --external-wg-addr too.
+	c.deliverExtFanout = s.fanoutExternalLocal
+}
+
+// fanoutExternalLocal delivers a sibling replica's external fanout to LOCAL
+// peers only. The cluster hop already happened; fanning out again would loop.
+func (s *Server) fanoutExternalLocal(token uint64, srcAddr string, payload []byte) {
+	s.mu.RLock()
+	conns := make([]*clientConn, 0, len(s.peers))
+	for _, cc := range s.peers {
+		conns = append(conns, cc)
+	}
+	s.mu.RUnlock()
+	frame := MakeExternalDataFrame(token, srcAddr, payload)
+	for _, cc := range conns {
+		if err := cc.writeFrame(frame); err != nil {
+			s.dropPeer(cc)
+		}
+	}
+}
+
+// deliverLocal is the terminal hop for cluster envelopes: local delivery or
+// drop, never another forward.
+func (s *Server) deliverLocal(dest [PubKeySize]byte, inner Frame) bool {
+	s.mu.RLock()
+	peer, ok := s.peers[dest]
+	s.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if err := peer.writeFrame(inner); err != nil {
+		s.dropPeer(peer)
+	}
+	return true
 }
 
 // EnableForwarder wires a per-replica port allocator and a UDP forwarder
@@ -257,6 +324,11 @@ func (s *Server) Dispatch(ingress, external [PubKeySize]byte, payload []byte, _ 
 	dest, ok := s.peers[ingress]
 	s.mu.RUnlock()
 	if !ok {
+		// The ingress agent may be connected to a sibling replica while the
+		// external client's UDP landed here via the shared load balancer.
+		if s.cluster != nil && s.cluster.ForwardToPeer(ingress, MakeDataFrame(external, payload)) {
+			return nil
+		}
 		return fmt.Errorf("ingress %x not connected", ingress[:8])
 	}
 	out := MakeDataFrame(external, payload)
@@ -385,6 +457,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	if exists {
 		old.close()
 	}
+	if s.cluster != nil {
+		s.cluster.registry.PublishPeer(pubKey)
+	}
 
 	log.Printf("relay: peer registered: %x", pubKey[:8])
 	defer func() {
@@ -393,10 +468,17 @@ func (s *Server) handleConn(conn net.Conn) {
 		// sendQ until the next write error.
 		cc.close()
 		s.mu.Lock()
-		if s.peers[pubKey] == cc {
+		stillOwner := s.peers[pubKey] == cc
+		if stillOwner {
 			delete(s.peers, pubKey)
 		}
 		s.mu.Unlock()
+		// Withdraw only when this connection was still the registered one:
+		// if a reconnect already replaced it, the peer is still local and
+		// the registry entry must survive.
+		if stillOwner && s.cluster != nil {
+			s.cluster.registry.WithdrawPeer(pubKey)
+		}
 		if dropped := cc.dropped.Load(); dropped > 0 {
 			log.Printf("relay: peer disconnected: %x (dropped %d frames)", pubKey[:8], dropped)
 			return
@@ -437,7 +519,11 @@ func (s *Server) handleConn(conn net.Conn) {
 						continue
 					}
 				}
-				log.Printf("relay: data from %x to %x: dest not found", pubKey[:8], destKey[:8])
+				// The dest may hold its TCP session on a sibling replica.
+				if s.cluster != nil && s.cluster.ForwardToPeer(destKey, MakeDataFrame(pubKey, payload)) {
+					continue
+				}
+				s.destMissLog.Logf("relay: data from %x to %x: dest not found", pubKey[:8], destKey[:8])
 				continue
 			}
 
@@ -459,11 +545,26 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 			if s.externalWG == nil {
+				// No local flow table, but the token names its issuer: a
+				// replica that runs without the external listener can still
+				// route an agent's reply home.
+				if s.cluster != nil && s.cluster.RouteExternalReply(token, pubKey, payload) {
+					continue
+				}
 				log.Printf("relay: external data from %x dropped: shared external listener disabled", pubKey[:8])
 				continue
 			}
 			if !s.externalWG.AllowsIngress(pubKey) {
 				log.Printf("relay: external data from non-ingress peer %x dropped", pubKey[:8])
+				continue
+			}
+			// A token minted by another replica means the external client's
+			// UDP flow lives there; send the response home instead of
+			// consulting the local (tokenless) flow table.
+			if s.cluster != nil && s.externalWG.foreignToken(token) {
+				if !s.cluster.RouteExternalReply(token, pubKey, payload) {
+					s.destMissLog.Logf("relay: external reply token=%d: issuing replica unknown", token)
+				}
 				continue
 			}
 			s.externalWG.BindTokenIngress(token, pubKey)
@@ -479,15 +580,22 @@ func (s *Server) handleConn(conn net.Conn) {
 				log.Printf("relay: bad bimodal hint frame from %x: %v", pubKey[:8], err)
 				continue
 			}
+			// Forward with sender pubkey so the destination can key the hint
+			// by peer; body carries the sender (not the dest) on the wire.
+			outFrame := Frame{Type: MsgBimodalHint, Body: pubKey[:]}
+
 			s.mu.RLock()
 			dest, ok := s.peers[destKey]
 			s.mu.RUnlock()
 			if !ok {
+				// Hints matter for convergence speed, so chase the peer to
+				// its owning replica like data frames do. A miss is fine:
+				// the sender's FSM falls back on its slower demote path.
+				if s.cluster != nil {
+					_ = s.cluster.ForwardToPeer(destKey, outFrame)
+				}
 				continue
 			}
-			// Forward with sender pubkey so the destination can key the hint
-			// by peer; body carries the sender (not the dest) on the wire.
-			outFrame := Frame{Type: MsgBimodalHint, Body: pubKey[:]}
 			if err := dest.writeFrame(outFrame); err != nil {
 				log.Printf("relay: forward bimodal hint to %x: %v", destKey[:8], err)
 				s.dropPeer(dest)

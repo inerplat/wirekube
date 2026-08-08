@@ -43,6 +43,40 @@ rules:
   - get
   - list
 ---
+# Replica/peer lease registry for relay clustering (--cluster-kube). Each
+# replica renews one replica lease plus one lease per connected peer so
+# siblings can route frames to whichever replica holds a peer's session.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-relay-cluster
+  namespace: wirekube-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-relay-cluster
+  namespace: wirekube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-relay-cluster
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: wirekube-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -131,6 +165,22 @@ spec:
           args:
             - --addr=:3478
             - --external-wg-addr=:3478
+            - --relay-id=$(POD_NAME)
+            - --cluster-kube=true
+            - --cluster-addr=:3479
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: relay-tcp
               containerPort: 3478
@@ -138,6 +188,9 @@ spec:
             - name: relay-udp
               containerPort: 3478
               protocol: UDP
+            - name: relay-cluster
+              containerPort: 3479
+              protocol: TCP
           readinessProbe:
             exec:
               command: ["sh", "-c", "nc -z 127.0.0.1 3478"]

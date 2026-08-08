@@ -22,6 +22,12 @@ type ExternalWGListener struct {
 	conn         *net.UDPConn
 	fixedIngress [PubKeySize]byte
 
+	// originTag, pre-shifted into a token's top 16 bits, marks every token
+	// this replica issues with its cluster identity so sibling replicas can
+	// route ingress replies back here. Zero when clustering is off, which
+	// keeps single-replica tokens identical to the historical scheme.
+	originTag uint64
+
 	mu             sync.Mutex
 	next           uint64
 	byToken        map[uint64]netip.AddrPort
@@ -63,6 +69,9 @@ func (s *Server) EnableExternalWGListener(addr string, ingress [PubKeySize]byte)
 		bySource:       make(map[netip.AddrPort]uint64),
 		byTokenIngress: make(map[uint64][PubKeySize]byte),
 		lastSeen:       make(map[uint64]time.Time),
+	}
+	if s.cluster != nil {
+		l.originTag = uint64(clusterAddrTag(s.cluster.registry.SelfAddr())) << clusterTokenTagShift
 	}
 	s.externalWG = l
 	go l.run()
@@ -110,12 +119,18 @@ func (l *ExternalWGListener) tokenForSource(src netip.AddrPort) uint64 {
 			l.evictOldestLocked()
 		}
 	}
-	token := l.next
+	token := l.originTag | l.next
 	l.next++
 	l.bySource[src] = token
 	l.byToken[token] = src
 	l.lastSeen[token] = now
 	return token
+}
+
+// foreignToken reports whether a token was issued by a different replica.
+func (l *ExternalWGListener) foreignToken(token uint64) bool {
+	const tagMask = uint64(0xFFFF) << clusterTokenTagShift
+	return token&tagMask != l.originTag
 }
 
 func (l *ExternalWGListener) pruneLocked(now time.Time) {
@@ -174,7 +189,17 @@ func (l *ExternalWGListener) forwardToIngress(token uint64, src netip.AddrPort, 
 		return bytes.Compare(keys[i][:], keys[j][:]) < 0
 	})
 
+	// Agents connected to sibling replicas also get the first packets of an
+	// unpinned flow. Whoever answers first becomes the pinned ingress via
+	// the reply path (BindTokenIngress on this replica).
+	if l.server.cluster != nil {
+		l.server.cluster.FanoutExternal(token, src.String(), payload)
+	}
+
 	if len(keys) == 0 {
+		if l.server.cluster != nil {
+			return nil
+		}
 		return fmt.Errorf("no connected ingress peers")
 	}
 
@@ -188,13 +213,20 @@ func (l *ExternalWGListener) forwardToIngress(token uint64, src netip.AddrPort, 
 }
 
 func (l *ExternalWGListener) writeToIngress(ingressKey [PubKeySize]byte, token uint64, src netip.AddrPort, payload []byte) error {
+	frame := MakeExternalDataFrame(token, src.String(), payload)
+
 	l.server.mu.RLock()
 	ingress, ok := l.server.peers[ingressKey]
 	l.server.mu.RUnlock()
 	if !ok {
+		// Behind the shared LB the external client's datagram can land on a
+		// replica that does not hold the ingress agent's session; hand the
+		// frame to whichever replica does.
+		if l.server.cluster != nil && l.server.cluster.ForwardToPeer(ingressKey, frame) {
+			return nil
+		}
 		return fmt.Errorf("ingress peer %x not connected", ingressKey[:8])
 	}
-	frame := MakeExternalDataFrame(token, src.String(), payload)
 	if err := ingress.writeFrame(frame); err != nil {
 		l.server.dropPeer(ingress)
 		return err
