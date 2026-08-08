@@ -285,6 +285,16 @@ func (r *Reconciler) pickIngressPeer(ctx context.Context, cr *wirekubev1alpha1.W
 		return "", zero, res, retErr, false
 	}
 
+	// Heartbeats are the only signal that survives a node whose agent stopped:
+	// Status.Connected freezes at its last value, and the WireKubePeer CR
+	// outlives a NotReady node because ownerReference GC only fires on Node
+	// deletion. Without this filter an abandoned peer stays a candidate, and
+	// since every candidate scores the same when no relay latency is known,
+	// the tie-break falls through to name ordering — which is how a dead node
+	// alphabetically ahead of the live ones wins and every client bound to it
+	// silently fails to hand shake.
+	liveByName := freshlyReportedPeers(peerList, r.now())
+
 	candidates := make([]ingressCandidate, 0, len(peerList.Items))
 	for i := range peerList.Items {
 		peer := &peerList.Items[i]
@@ -293,6 +303,13 @@ func (r *Reconciler) pickIngressPeer(ctx context.Context, cr *wirekubev1alpha1.W
 			return "", zero, ctrl.Result{}, err, false
 		}
 		if !ok {
+			continue
+		}
+		// Only enforced once some peer publishes a heartbeat. A fleet still
+		// running agents that predate the field reports nothing at all, and
+		// excluding everyone there would strand external peers that work
+		// today.
+		if len(liveByName) > 0 && !liveByName[peer.Name] {
 			continue
 		}
 		latency, reachable := latencies[pubKey]
@@ -346,6 +363,30 @@ type ingressCandidate struct {
 	load    int
 	latency time.Duration
 	score   time.Duration
+}
+
+// ingressHeartbeatThreshold is how stale a peer's self-reported timestamp may
+// get before it stops being eligible to front external clients. Agents refresh
+// it every sync (30s by default), so this tolerates ten missed writes. Picking
+// a dead ingress is worse than picking a slow one — the client pins the ingress
+// public key in its config, so the mistake persists until the peer is re-issued.
+const ingressHeartbeatThreshold = 5 * time.Minute
+
+// freshlyReportedPeers returns the set of peers whose agent has published a
+// heartbeat recently. An empty result means no peer reports one at all, which
+// callers must treat as "no information" rather than "everyone is dead".
+func freshlyReportedPeers(peerList *wirekubev1alpha1.WireKubePeerList, now time.Time) map[string]bool {
+	live := map[string]bool{}
+	for i := range peerList.Items {
+		peer := &peerList.Items[i]
+		if peer.Status.LastReportedAt == nil {
+			continue
+		}
+		if now.Sub(peer.Status.LastReportedAt.Time) < ingressHeartbeatThreshold {
+			live[peer.Name] = true
+		}
+	}
+	return live
 }
 
 func (r *Reconciler) resolveNamedIngressPeer(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, peerName, source string, relayCtl RelayController) (string, [32]byte, ctrl.Result, error, bool) {
