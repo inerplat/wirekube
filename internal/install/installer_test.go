@@ -131,6 +131,44 @@ func TestInstallIsIdempotentWithSameInventory(t *testing.T) {
 	}
 }
 
+func TestAdoptForcesFieldOwnershipAndPlainInstallDoesNot(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		adopt bool
+	}{
+		{"plain install never forces", false},
+		{"adopt forces ownership", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := installTestScheme(t)
+			base := fake.NewClientBuilder().WithScheme(scheme).Build()
+			c := &applyTestClient{Client: base, ready: true, forcedApplies: map[string]bool{}}
+			options := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only", WireKubeVersion: "v1.0.0", Adopt: tc.adopt}
+			plan := Plan{SchemaVersion: SchemaVersion, Namespace: options.Namespace, Image: options.Image, Relay: options.Relay, MeshCIDR: options.MeshCIDR}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if _, err := (Installer{Client: c}).Apply(ctx, plan, options, "install"); err != nil {
+				t.Fatal(err)
+			}
+			if len(c.forcedApplies) == 0 {
+				t.Fatal("no apply patches were observed")
+			}
+			for name, forced := range c.forcedApplies {
+				if name == InventoryName {
+					if forced {
+						t.Fatalf("inventory %s must never be force-applied", name)
+					}
+					continue
+				}
+				if forced != tc.adopt {
+					t.Fatalf("object %s force=%t, want %t", name, forced, tc.adopt)
+				}
+			}
+		})
+	}
+}
+
 func TestInstallRejectsSecondNamespaceWithoutChangingClusterRBAC(t *testing.T) {
 	scheme := installTestScheme(t)
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
@@ -523,6 +561,7 @@ type applyTestClient struct {
 	ready          bool
 	failPatchName  string
 	failDeleteName string
+	forcedApplies  map[string]bool
 }
 
 func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
@@ -531,6 +570,13 @@ func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch
 	}
 	if patch.Type() != types.ApplyPatchType {
 		return c.Client.Patch(ctx, object, patch, options...)
+	}
+	if c.forcedApplies != nil {
+		resolved := &client.PatchOptions{}
+		for _, option := range options {
+			option.ApplyToPatch(resolved)
+		}
+		c.forcedApplies[object.GetName()] = resolved.Force != nil && *resolved.Force
 	}
 	desired := object.DeepCopyObject().(client.Object)
 	c.setStatus(desired)

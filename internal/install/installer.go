@@ -230,7 +230,15 @@ func (i Installer) applyObject(ctx context.Context, desired client.Object, adopt
 			return applyOutcome{}, fmt.Errorf("%s %s is managed by wirekubectl but has no installation ID; refusing to assume ownership without --adopt", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired))
 		}
 	}
-	if err := i.Client.Patch(ctx, desired, client.Apply, client.FieldOwner(FieldManager)); err != nil {
+	patchOptions := []client.PatchOption{client.FieldOwner(FieldManager)}
+	if adopt {
+		// Adopted resources carry field ownership from their previous manager
+		// (kubectl apply, GitOps controllers, manual patches). --adopt is the
+		// operator's explicit consent to take those fields over, so resolve
+		// server-side apply conflicts instead of failing on them.
+		patchOptions = append(patchOptions, client.ForceOwnership)
+	}
+	if err := i.Client.Patch(ctx, desired, client.Apply, patchOptions...); err != nil {
 		return applyOutcome{}, fmt.Errorf("apply %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), err)
 	}
 	outcome := applyOutcome{applied: desired.DeepCopyObject().(client.Object), created: created, changed: true}

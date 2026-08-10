@@ -683,7 +683,7 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")
 	cmd.Flags().BoolVar(&flags.yes, "yes", false, "apply the displayed plan without prompting")
 	cmd.Flags().BoolVar(&flags.dryRun, "dry-run", false, "inspect and print the plan without mutating the cluster")
-	cmd.Flags().BoolVar(&flags.adopt, "adopt", false, "explicitly adopt conflicting existing resources")
+	cmd.Flags().BoolVar(&flags.adopt, "adopt", false, "explicitly adopt conflicting existing resources, taking over their field ownership")
 }
 
 func buildInstallationPlan(cmd *cobra.Command, flags *lifecycleFlags) (internalinstall.Plan, internalinstall.Options, internalinstall.Installer, error) {
