@@ -130,10 +130,20 @@ func sameInstallConfig(left, right Options) bool {
 		left.RelayUDP == right.RelayUDP &&
 		left.MeshCIDR == right.MeshCIDR &&
 		left.NodeAddresses == right.NodeAddresses &&
+		normalizedListenPort(left.ListenPort) == normalizedListenPort(right.ListenPort) &&
 		// Compare the resolved URL, not just the explicit flag: the kubeconfig server is
 		// the fallback source, so re-running install from a different kubeconfig entry
 		// would otherwise rewrite the agent DaemonSet without tripping this check.
 		agentAPIServerURL(left) == agentAPIServerURL(right)
+}
+
+// normalizedListenPort treats the zero value stored by pre-listen-port
+// inventories as the default port so old installations still match.
+func normalizedListenPort(port int32) int32 {
+	if port == 0 {
+		return DefaultListenPort
+	}
+	return port
 }
 
 func normalizedRelayTransport(transport string) string {

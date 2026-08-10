@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 )
 
 type Planner struct {
@@ -74,6 +76,12 @@ func (r SelfSubjectAccessReviewer) Review(ctx context.Context, requirements []Ac
 func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, error) {
 	if options.MeshCIDR == "" {
 		options.MeshCIDR = "auto"
+	}
+	// A running mesh has already committed every agent to its listen port, so
+	// an unset --listen-port must inherit it instead of the packaged default.
+	liveListenPort := p.liveMeshListenPort(ctx)
+	if options.ListenPort == 0 && liveListenPort > 0 {
+		options.ListenPort = liveListenPort
 	}
 	if err := options.Normalize(); err != nil {
 		return Plan{}, options, err
@@ -139,11 +147,15 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 		RelayUDP:         options.RelayUDP,
 		MeshCIDR:         options.MeshCIDR,
 		NodeAddresses:    options.NodeAddresses,
+		ListenPort:       options.ListenPort,
 		Resources:        bundle.Resources,
 		Impact: []string{
 			"privileged host-networked agent Pod on each selected Linux node",
 			"WireGuard interface, host routes, and policy routing rules on each agent node",
 		},
+	}
+	if liveListenPort > 0 && options.ListenPort != liveListenPort {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("this apply changes the WireGuard listen port of the existing mesh from %d to %d; every agent re-binds and all peer endpoints must re-discover before traffic recovers", liveListenPort, options.ListenPort))
 	}
 	if autoMeshCIDR {
 		plan.Warnings = append(plan.Warnings, "automatic mesh CIDR selection is best effort and cannot inspect every VPC, corporate, or node routing table; review the selected CIDR and provide --exclude-cidr for known routes")
@@ -439,4 +451,14 @@ func overlappingPrefixes(candidate netip.Prefix, occupied []netip.Prefix) []stri
 	}
 	sort.Strings(conflicts)
 	return conflicts
+}
+
+// liveMeshListenPort returns the listen port of the cluster's existing
+// WireKubeMesh, or 0 when no mesh (or no CRD) is installed yet.
+func (p Planner) liveMeshListenPort(ctx context.Context) int32 {
+	mesh := &wirekubev1alpha1.WireKubeMesh{}
+	if err := p.Client.Get(ctx, client.ObjectKey{Name: "default"}, mesh); err != nil {
+		return 0
+	}
+	return mesh.Spec.ListenPort
 }

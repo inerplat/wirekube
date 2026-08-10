@@ -320,6 +320,40 @@ func TestUpgradePreservesStoredAgentAPIServer(t *testing.T) {
 	}
 }
 
+func TestUpgradePreservesStoredListenPort(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().Int32("listen-port", 0, "")
+	cmd.Flags().String("image", lifecycleTestImage, "")
+	flags := &lifecycleFlags{image: lifecycleTestImage}
+	stored := internalinstall.Options{ListenPort: 51822}
+
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if flags.listenPort != 51822 {
+		t.Fatalf("listenPort=%d, want stored 51822", flags.listenPort)
+	}
+
+	if err := cmd.Flags().Set("listen-port", "51825"); err != nil {
+		t.Fatal(err)
+	}
+	flags.listenPort = 51825
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if flags.listenPort != 51825 {
+		t.Fatalf("listenPort=%d, want the explicit upgrade override", flags.listenPort)
+	}
+}
+
+func TestUpgradeLeavesListenPortSentinelForLegacyInventory(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().Int32("listen-port", 0, "")
+	cmd.Flags().String("image", lifecycleTestImage, "")
+	flags := &lifecycleFlags{image: lifecycleTestImage}
+
+	applyStoredLifecycleDefaults(cmd, flags, internalinstall.Options{})
+	if flags.listenPort != 0 {
+		t.Fatalf("listenPort=%d, want the 0 sentinel so the planner inherits the live mesh port", flags.listenPort)
+	}
+}
+
 func runMeshInit(t *testing.T, c client.Client, args ...string) {
 	t.Helper()
 	oldClient, oldOutput := options.client, options.output

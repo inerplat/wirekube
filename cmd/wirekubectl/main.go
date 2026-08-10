@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	internalinstall "github.com/inerplat/wirekube/internal/install"
 	internalconfig "github.com/inerplat/wirekube/internal/kubeconfig"
 	internalversion "github.com/inerplat/wirekube/internal/version"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
@@ -202,7 +203,7 @@ func meshCmd() *cobra.Command {
 			return writeResult(cmd, map[string]any{"name": "default", "operation": "unchanged"}, "WireKubeMesh 'default' already exists; no fields were changed\n")
 		},
 	}
-	initCmd.Flags().Int32Var(&listenPort, "port", 51820, "WireGuard listen port")
+	initCmd.Flags().Int32Var(&listenPort, "port", internalinstall.DefaultListenPort, "WireGuard listen port")
 	initCmd.Flags().StringSliceVar(&stunServers, "stun-server", []string{"stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"}, "STUN server; may be repeated")
 	cmd.AddCommand(initCmd)
 

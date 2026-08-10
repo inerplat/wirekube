@@ -25,6 +25,10 @@ const (
 
 	RelayTransportTCP = "tcp"
 	RelayTransportWSS = "wss"
+
+	// DefaultListenPort is the WireGuard UDP port every agent binds when the
+	// installation does not override it.
+	DefaultListenPort int32 = 51820
 )
 
 type Options struct {
@@ -39,6 +43,7 @@ type Options struct {
 	PreviousResources  []Resource `json:"-"`
 	MeshCIDR           string
 	NodeAddresses      string
+	ListenPort         int32
 	ExcludeCIDRs       []string
 	Yes                bool
 	DryRun             bool
@@ -79,6 +84,7 @@ type Plan struct {
 	RelayUDP         bool       `json:"relayUDP"`
 	MeshCIDR         string     `json:"meshCIDR"`
 	NodeAddresses    string     `json:"nodeAddresses"`
+	ListenPort       int32      `json:"listenPort"`
 	Resources        []Resource `json:"resources"`
 	Impact           []string   `json:"infrastructureImpact"`
 	Warnings         []string   `json:"warnings,omitempty"`
@@ -113,6 +119,12 @@ func (o *Options) Normalize() error {
 	}
 	if o.NodeAddresses == "" {
 		o.NodeAddresses = "mesh-only"
+	}
+	if o.ListenPort == 0 {
+		o.ListenPort = DefaultListenPort
+	}
+	if o.ListenPort < 1024 || o.ListenPort > 65535 {
+		return fmt.Errorf("invalid --listen-port %d: must be between 1024 and 65535 (the WireKubeMesh CRD rejects lower ports)", o.ListenPort)
 	}
 	if o.Relay == "" {
 		if o.Yes {

@@ -178,6 +178,36 @@ func TestRenderUsesPortableDefaultsAndSeparateRelayServices(t *testing.T) {
 	}
 }
 
+func TestRenderHonorsCustomListenPort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		port int32
+		want int32
+	}{
+		{"custom port", 51822, 51822},
+		{"zero defaults", 0, DefaultListenPort},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, MeshCIDR: "100.96.0.0/11", ListenPort: tc.port, WireKubeVersion: "v1.0.0"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mesh *wirekubev1alpha1.WireKubeMesh
+			for _, object := range bundle.Objects {
+				if m, ok := object.(*wirekubev1alpha1.WireKubeMesh); ok {
+					mesh = m
+				}
+			}
+			if mesh == nil {
+				t.Fatal("bundle has no WireKubeMesh")
+			}
+			if mesh.Spec.ListenPort != tc.want {
+				t.Fatalf("mesh listenPort = %d, want %d", mesh.Spec.ListenPort, tc.want)
+			}
+		})
+	}
+}
+
 func TestRenderManagedWSSGatewayAndUDPLoadBalancer(t *testing.T) {
 	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
 	if err != nil {

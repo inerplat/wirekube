@@ -444,7 +444,7 @@ func relayUDPService(options Options, labels map[string]string) *corev1.Service 
 }
 
 func meshObject(options Options) *wirekubev1alpha1.WireKubeMesh {
-	mesh := &wirekubev1alpha1.WireKubeMesh{TypeMeta: typeMeta(wirekubev1alpha1.GroupVersion.String(), "WireKubeMesh"), ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: managedLabels(options.WireKubeVersion)}, Spec: wirekubev1alpha1.WireKubeMeshSpec{ListenPort: 51820, InterfaceName: "wire_kube", MTU: 1420, MeshCIDR: options.MeshCIDR, STUNServers: []string{"stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"}}}
+	mesh := &wirekubev1alpha1.WireKubeMesh{TypeMeta: typeMeta(wirekubev1alpha1.GroupVersion.String(), "WireKubeMesh"), ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: managedLabels(options.WireKubeVersion)}, Spec: wirekubev1alpha1.WireKubeMeshSpec{ListenPort: options.ListenPort, InterfaceName: "wire_kube", MTU: 1420, MeshCIDR: options.MeshCIDR, STUNServers: []string{"stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"}}}
 	if options.NodeAddresses == "internal-ip" {
 		mesh.Spec.AutoAllowedIPs = &wirekubev1alpha1.AutoAllowedIPsSpec{IncludeNodeInternalIP: true}
 	}

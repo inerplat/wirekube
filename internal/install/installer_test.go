@@ -357,6 +357,35 @@ func TestSameInstallConfigTreatsLegacyEmptyTransportAsTCP(t *testing.T) {
 	}
 }
 
+func TestSameInstallConfigTreatsLegacyZeroListenPortAsDefault(t *testing.T) {
+	legacy := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayLoadBalancer, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only", RelayTransport: RelayTransportTCP}
+	current := legacy
+	current.ListenPort = DefaultListenPort
+	if !sameInstallConfig(legacy, current) {
+		t.Fatal("legacy zero listen port was not treated as the default")
+	}
+	current.ListenPort = 51822
+	if sameInstallConfig(legacy, current) {
+		t.Fatal("a custom listen port was treated as the legacy default")
+	}
+}
+
+func TestLiveMeshListenPort(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: wirekubev1alpha1.WireKubeMeshSpec{ListenPort: 51822}}
+	withMesh := Planner{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(mesh).Build()}
+	if got := withMesh.liveMeshListenPort(context.Background()); got != 51822 {
+		t.Fatalf("liveMeshListenPort=%d, want 51822", got)
+	}
+	empty := Planner{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	if got := empty.liveMeshListenPort(context.Background()); got != 0 {
+		t.Fatalf("liveMeshListenPort=%d, want 0 for a cluster without a mesh", got)
+	}
+}
+
 func TestUninstallDeletesResourcesRecordedByInventory(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
