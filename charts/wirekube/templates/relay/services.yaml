@@ -1,0 +1,87 @@
+{{- if .Values.relay.enabled }}
+# Cluster-local control endpoint. The agent resolves this Service by its
+# fixed name: wirekube-relay-control.<namespace>.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay-control
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: relay-control
+      port: {{ .Values.relay.port }}
+      targetPort: {{ .Values.relay.port }}
+      protocol: TCP
+{{- if ne .Values.mesh.relay.transport "wss" }}
+---
+# External TCP entry point. TCP and UDP are separate Services because
+# mixed-protocol LoadBalancers are not supported on every cloud. The
+# relay-endpoint reconciler syncs the LoadBalancer ingress of the Service
+# named `wirekube-relay` into the mesh status.
+#
+# Omitted for wss transport: agents connect through the authenticated
+# relay-ws front instead, and the raw control port is unauthenticated so it
+# must not be exposed alongside it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+  {{- with .Values.relay.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.relay.service.type }}
+  selector:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: relay-tcp
+      port: {{ .Values.relay.port }}
+      targetPort: {{ .Values.relay.port }}
+      protocol: TCP
+      {{- if eq .Values.relay.service.type "NodePort" }}
+      nodePort: {{ .Values.relay.service.nodePorts.tcp }}
+      {{- end }}
+{{- end }}
+{{- if .Values.relay.service.udp.enabled }}
+---
+# External UDP entry point advertised to external WireGuard peers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay-udp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+  {{- with .Values.relay.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.relay.service.type }}
+  selector:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: relay-udp
+      port: {{ .Values.relay.port }}
+      targetPort: {{ .Values.relay.port }}
+      protocol: UDP
+      {{- if eq .Values.relay.service.type "NodePort" }}
+      nodePort: {{ .Values.relay.service.nodePorts.udp }}
+      {{- end }}
+{{- end }}
+{{- end }}

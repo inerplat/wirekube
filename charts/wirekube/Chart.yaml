@@ -1,0 +1,19 @@
+apiVersion: v2
+name: wirekube
+description: WireGuard mesh between Kubernetes nodes using CRDs for coordination. No VPN server, no external control plane.
+type: application
+version: 0.1.0
+appVersion: "v0.0.9-dev.1"
+kubeVersion: ">=1.24.0-0"
+home: https://inerplat.github.io/wirekube/
+sources:
+  - https://github.com/inerplat/wirekube
+keywords:
+  - wireguard
+  - mesh
+  - vpn
+  - networking
+  - nat-traversal
+maintainers:
+  - name: inerplat
+    url: https://github.com/inerplat

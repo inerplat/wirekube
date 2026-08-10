@@ -1,0 +1,16 @@
+{{- if and .Values.relay.enabled .Values.relayWs.enabled .Values.relayWs.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wirekube-relay-ws
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relayWs.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.relayWs.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "wirekube.relayWs.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,83 @@
+{{- if and .Values.relay.enabled .Values.relayWs.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wirekube-relay-ws
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relayWs.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.relayWs.replicas }}
+  selector:
+    matchLabels:
+      {{- include "wirekube.relayWs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wirekube.relayWs.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: relay
+        {{- include "wirekube.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: wirekube-relay
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.relayWs.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.relayWs.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.relayWs.affinity }}
+      affinity:
+        {{- toYaml .Values.relayWs.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "wirekube.relayWs.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        - name: relay-ws
+          image: {{ include "wirekube.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["wirekube-relay-ws"]
+          args:
+            - --addr=:{{ .Values.relayWs.port }}
+            - --backend-addr=wirekube-relay-control.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.relay.port }}
+            - --path={{ .Values.relayWs.path }}
+            - --audience={{ .Values.relayWs.audience }}
+            - --agent-service-account={{ .Release.Namespace }}/wirekube-agent
+            {{- with .Values.relayWs.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: relay-ws
+              containerPort: {{ .Values.relayWs.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.relayWs.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.relayWs.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.relayWs.resources | nindent 12 }}
+{{- end }}

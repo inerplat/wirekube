@@ -1,0 +1,169 @@
+{{- if .Values.relay.enabled }}
+# The raw relay reads WireKube peer resources; the optional WebSocket gateway
+# uses TokenReview and bound Pod lookup; the admin-web sidecar manages
+# WireKubeExternalPeer resources and generated client Secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wirekube-relay
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - create
+  - delete
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubepeers
+  - wirekubemeshes
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wirekube-relay
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wirekube-relay
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+{{- if .Values.relay.clusterKube }}
+---
+# Replica/peer lease registry for relay clustering (--cluster-kube). Each
+# replica renews one replica lease plus one lease per connected peer so
+# siblings can route frames to whichever replica holds a peer's session.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-relay-cluster
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-relay-cluster
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-relay-cluster
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.relay.adminWeb.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-relay-admin-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - create
+  - update
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - services
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-relay-admin-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-relay-admin-web
+subjects:
+- kind: ServiceAccount
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

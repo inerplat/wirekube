@@ -1,0 +1,36 @@
+{{- if and .Values.agent.metrics.enabled .Values.agent.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: wirekube-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+    {{- with .Values.agent.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: wirekube-agent
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.agent.metrics.serviceMonitor.interval }}
+      path: /metrics
+      scrapeTimeout: {{ .Values.agent.metrics.serviceMonitor.scrapeTimeout }}
+      {{- if .Values.agent.metrics.serviceMonitor.useNodeInternalIP }}
+      relabelings:
+        # Replace scrape address with the node's InternalIP (annotated by the
+        # agent). Hybrid nodes have a public host IP unreachable from within
+        # the cluster; the InternalIP is routable via WireGuard VGW.
+        - sourceLabels: [__meta_kubernetes_pod_annotation_wirekube_io_node_internal_ip]
+          regex: (.+)
+          targetLabel: __address__
+          replacement: "${1}:9090"
+      {{- end }}
+{{- end }}

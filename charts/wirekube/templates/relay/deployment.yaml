@@ -1,0 +1,118 @@
+{{- if .Values.relay.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.relay.replicas }}
+  selector:
+    matchLabels:
+      {{- include "wirekube.relay.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wirekube.relay.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: relay
+        {{- include "wirekube.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: wirekube-relay
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.relay.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.relay.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.relay.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: relay
+          image: {{ include "wirekube.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["wirekube-relay"]
+          args:
+            - --addr=:{{ .Values.relay.port }}
+            {{- if .Values.relay.service.udp.enabled }}
+            - --external-wg-addr=:{{ .Values.relay.port }}
+            {{- end }}
+            - --relay-id=$(POD_NAME)
+            {{- if .Values.relay.clusterKube }}
+            - --cluster-kube=true
+            - --cluster-addr=:{{ .Values.relay.clusterPort }}
+            {{- end }}
+            {{- with .Values.relay.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: relay-tcp
+              containerPort: {{ .Values.relay.port }}
+              protocol: TCP
+            - name: relay-udp
+              containerPort: {{ .Values.relay.port }}
+              protocol: UDP
+            {{- if .Values.relay.clusterKube }}
+            - name: relay-cluster
+              containerPort: {{ .Values.relay.clusterPort }}
+              protocol: TCP
+            {{- end }}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "nc -z 127.0.0.1 {{ .Values.relay.port }}"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "nc -z 127.0.0.1 {{ .Values.relay.port }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.relay.resources | nindent 12 }}
+        {{- if .Values.relay.adminWeb.enabled }}
+        - name: admin-web
+          image: {{ include "wirekube.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["wirekube-admin-web"]
+          args:
+            # Loopback by default: the console is reachable via
+            # `kubectl port-forward` and is NOT exposed by any Service. It can
+            # download private keys, so set relay.adminWeb.existingAuthSecret
+            # before exposing this port in any other way.
+            - --addr={{ .Values.relay.adminWeb.addr }}
+          {{- with .Values.relay.adminWeb.existingAuthSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
+          ports:
+            - name: admin-web
+              containerPort: {{ (splitList ":" .Values.relay.adminWeb.addr) | last }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.relay.adminWeb.resources | nindent 12 }}
+        {{- end }}
+{{- end }}

@@ -1,0 +1,215 @@
+# Default values for the wirekube chart.
+#
+# Resource names (wirekube-agent, wirekube-relay, wirekube-relay-control,
+# wirekube-relay-ws) are fixed rather than release-derived: the agent resolves
+# `wirekube-relay-control.<namespace>.svc` and the relay-endpoint reconciler
+# watches the Service named `wirekube-relay` by name. Install at most one
+# release per cluster.
+
+image:
+  repository: inerplat/wirekube
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Extra labels added to every object rendered by this chart.
+commonLabels: {}
+
+agent:
+  # WireGuard interface name created on each node. Also rendered into the
+  # WireKubeMesh spec so keep the two in sync by changing only this value.
+  interfaceName: wire_kube
+
+  # Bootstrap-only Kubernetes API override (WIREKUBE_KUBE_APISERVER) for nodes
+  # that cannot reach the in-cluster Service IP before WireKube routes exist.
+  kubeAPIServer: ""
+
+  # Host directory that persists WireGuard key material across pod restarts.
+  keysHostPath: /var/lib/wirekube
+
+  priorityClassName: system-node-critical
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+  tolerations:
+    - operator: Exists
+
+  # Additional node selector terms are not needed by default; the DaemonSet
+  # already excludes wirekube.io/proxy-node=true and non-linux nodes.
+  nodeSelector: {}
+
+  # Extra environment variables for the agent container.
+  extraEnv: []
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  metrics:
+    # Headless Service exposing the agent :9090/metrics endpoints.
+    enabled: true
+    serviceMonitor:
+      # Requires the Prometheus Operator CRDs.
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      # Extra labels so your Prometheus instance selects this monitor,
+      # e.g. release: prometheus
+      labels: {}
+      # Rewrite the scrape address to the node InternalIP annotated by the
+      # agent. Required for hybrid nodes whose host IP is unreachable from
+      # inside the cluster.
+      useNodeInternalIP: true
+
+relay:
+  # Deploy the managed relay (Deployment + Services). Disable when using an
+  # external relay endpoint (set mesh.relay.external.* instead).
+  enabled: true
+
+  replicas: 1
+
+  port: 3478
+
+  # Lease-backed replica/peer registry so multiple relay replicas can route
+  # frames to whichever replica holds a peer's session.
+  clusterKube: true
+  clusterPort: 3479
+
+  service:
+    # LoadBalancer or NodePort (the mesh managed relay spec allows no other
+    # type). NodePort additionally requires mesh.relay.controlEndpoint.
+    # The TCP Service is not rendered when mesh.relay.transport is wss: the
+    # raw control port is unauthenticated and agents use relay-ws instead.
+    type: LoadBalancer
+    annotations: {}
+    udp:
+      # UDP entry point advertised to external WireGuard peers. Disable when
+      # you do not use WireKubeExternalPeer to avoid a public UDP port.
+      enabled: true
+    # Only used when type is NodePort.
+    nodePorts:
+      tcp: 30478
+      udp: 30479
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  extraArgs: []
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+  adminWeb:
+    # External-peer management console sidecar. Binds to loopback only and is
+    # reachable via `kubectl port-forward`; it is NOT exposed by any Service.
+    enabled: true
+    addr: 127.0.0.1:8080
+    # Name of an existing Secret with WIREKUBE_ADMIN_WEB_USERNAME and
+    # WIREKUBE_ADMIN_WEB_PASSWORD_HASH keys. MUST be set before exposing
+    # port 8080 through any Ingress/NodePort/Service: the console can
+    # download private keys and ships with authentication disabled.
+    existingAuthSecret: ""
+    resources:
+      requests:
+        cpu: 10m
+        memory: 24Mi
+      limits:
+        cpu: 100m
+        memory: 96Mi
+
+relayWs:
+  # Authenticated WebSocket front for the relay, for clusters where an HTTPS
+  # Gateway/Ingress must terminate TLS in front of the relay (wss transport).
+  enabled: false
+
+  replicas: 2
+
+  port: 8081
+  path: /relay
+  audience: wirekube-relay
+
+  service:
+    type: ClusterIP
+    annotations: {}
+    # Only used when type is NodePort.
+    nodePort: 30478
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  nodeSelector: {}
+  tolerations: []
+  # Overrides the default preferred pod anti-affinity across nodes.
+  affinity: {}
+
+  extraArgs: []
+
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 96Mi
+
+mesh:
+  # Create the WireKubeMesh CR. Set create=false to manage the mesh yourself.
+  create: true
+
+  name: default
+
+  # REQUIRED when mesh.create is true. Private range that must not overlap
+  # your VPC, Pod, or Service CIDRs. Every node gets a deterministic /32.
+  # Example: "100.96.0.0/11"
+  meshCIDR: ""
+
+  listenPort: 51820
+  mtu: 1420
+
+  stunServers:
+    - stun:stun.cloudflare.com:3478
+    - stun:stun.l.google.com:19302
+
+  autoAllowedIPs:
+    # Also publish each node's private IP into peer AllowedIPs.
+    includeNodeInternalIP: false
+
+  relay:
+    # auto | always | never
+    mode: auto
+    # Transport agents use to reach the chart-managed relay: tcp | wss.
+    # wss requires relayWs.enabled and a controlEndpoint pointing at the
+    # public WSS URL, e.g. wss://relay.example.com/relay
+    transport: tcp
+    # Agent-facing relay endpoint. Empty means agents fall back to
+    # status.relayEndpoint (synced from the LoadBalancer ingress) and then
+    # the cluster-local wirekube-relay-control Service. REQUIRED for
+    # NodePort installs, e.g. "203.0.113.10:30478", and for wss transport
+    # (the public WSS URL).
+    controlEndpoint: ""
+    # Points agents at a pre-existing relay outside this chart when
+    # relay.enabled is false. With relay.enabled + NodePort + wss,
+    # external.endpoint may also set the UDP address advertised to
+    # external peers (it cannot be derived from a WSS URL).
+    external:
+      # Raw WireGuard UDP address advertised to external peers.
+      endpoint: ""
+      controlEndpoint: ""
+      # tcp | ws | wss
+      transport: tcp

@@ -1,0 +1,138 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wirekube-agent
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubepeers
+  verbs:
+  - get
+  - list
+  - create
+  - patch
+  - update
+  - delete
+  - watch
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubepeers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubemeshes
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubemeshes/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubegateways
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubegateways/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers
+  verbs:
+  - get
+  - list
+  - watch
+  # create/delete are required because wirekubectl runs inside the agent
+  # pod ("kubectl exec ... wirekubectl invite alice") and uses the agent
+  # ServiceAccount to mint/revoke external peer CRs.
+  - create
+  - delete
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers/status
+  verbs:
+  - get
+  - patch
+  - update
+# Leader election for the embedded WireKubeExternalPeer reconciler.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wirekube-agent
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wirekube-agent
+subjects:
+- kind: ServiceAccount
+  name: wirekube-agent
+  namespace: {{ .Release.Namespace }}

@@ -1,0 +1,38 @@
+WireKube {{ include "wirekube.imageTag" . }} installed in namespace {{ .Release.Namespace }}.
+
+Check that every node registered a peer and the mesh converges:
+
+  kubectl get wirekubepeers
+{{- if .Values.mesh.create }}
+  kubectl get wirekubemesh {{ .Values.mesh.name }} -o wide
+{{- end }}
+  kubectl -n {{ .Release.Namespace }} get pods -l app=wirekube-agent
+
+{{- if .Values.relay.enabled }}
+{{- if eq .Values.relay.service.type "LoadBalancer" }}
+
+Relay entry points (LoadBalancer ingress is synced into the mesh status by
+the leader agent, so no manual endpoint wiring is needed):
+
+  kubectl -n {{ .Release.Namespace }} get svc -l app.kubernetes.io/name=wirekube-relay
+{{- else }}
+
+Relay is exposed via NodePort (TCP {{ .Values.relay.service.nodePorts.tcp }}{{ if .Values.relay.service.udp.enabled }}, UDP {{ .Values.relay.service.nodePorts.udp }}{{ end }}).
+Agents reach it through mesh.relay.controlEndpoint.
+{{- end }}
+{{- end }}
+
+{{- if and .Values.relay.enabled .Values.relay.adminWeb.enabled }}
+{{- $adminPort := (splitList ":" .Values.relay.adminWeb.addr) | last }}
+
+Admin console (external peer management):
+
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/wirekube-relay {{ $adminPort }}:{{ $adminPort }}
+  open http://127.0.0.1:{{ $adminPort }}
+
+{{- if not .Values.relay.adminWeb.existingAuthSecret }}
+It ships with authentication DISABLED (loopback-only). Set
+relay.adminWeb.existingAuthSecret before exposing it through any Ingress,
+NodePort, or Service.
+{{- end }}
+{{- end }}

@@ -1,0 +1,67 @@
+{{- if .Values.mesh.create }}
+{{- $cidr := required "mesh.meshCIDR is required (pick a private range that does not overlap your VPC, Pod, or Service CIDRs, e.g. 100.96.0.0/11). Set mesh.create=false to manage the WireKubeMesh yourself." .Values.mesh.meshCIDR }}
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeMesh
+metadata:
+  name: {{ .Values.mesh.name }}
+  labels:
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  meshCIDR: {{ $cidr | quote }}
+  listenPort: {{ .Values.mesh.listenPort }}
+  interfaceName: {{ .Values.agent.interfaceName | quote }}
+  mtu: {{ .Values.mesh.mtu }}
+  stunServers:
+    {{- toYaml .Values.mesh.stunServers | nindent 4 }}
+  {{- if .Values.mesh.autoAllowedIPs.includeNodeInternalIP }}
+  autoAllowedIPs:
+    includeNodeInternalIP: true
+  {{- end }}
+  {{- if .Values.relay.enabled }}
+  {{- if eq .Values.relay.service.type "NodePort" }}
+  {{- $ce := required "mesh.relay.controlEndpoint is required for NodePort installs: NodePort Services have no LoadBalancer ingress to sync into the mesh status, so agents need an explicit reachable address, e.g. \"203.0.113.10:30478\"." .Values.mesh.relay.controlEndpoint }}
+  # NodePort uses provider "external": the managed provider discovers the
+  # relay endpoint from the LoadBalancer ingress, which NodePort lacks.
+  relay:
+    mode: {{ .Values.mesh.relay.mode }}
+    provider: external
+    external:
+      transport: {{ .Values.mesh.relay.transport }}
+      controlEndpoint: {{ $ce | quote }}
+      {{- if .Values.relay.service.udp.enabled }}
+      {{- if eq .Values.mesh.relay.transport "wss" }}
+      {{- with .Values.mesh.relay.external.endpoint }}
+      endpoint: {{ . | quote }}
+      {{- end }}
+      {{- else }}
+      endpoint: {{ printf "%s:%v" (first (splitList ":" $ce)) .Values.relay.service.nodePorts.udp | quote }}
+      {{- end }}
+      {{- end }}
+  {{- else }}
+  relay:
+    mode: {{ .Values.mesh.relay.mode }}
+    provider: managed
+    managed:
+      replicas: {{ .Values.relay.replicas }}
+      serviceType: {{ .Values.relay.service.type }}
+      port: {{ .Values.relay.port }}
+      image: {{ include "wirekube.image" . }}
+      transport: {{ .Values.mesh.relay.transport }}
+      {{- with .Values.mesh.relay.controlEndpoint }}
+      controlEndpoint: {{ . | quote }}
+      {{- end }}
+  {{- end }}
+  {{- else if or .Values.mesh.relay.external.endpoint .Values.mesh.relay.external.controlEndpoint }}
+  relay:
+    mode: {{ .Values.mesh.relay.mode }}
+    provider: external
+    external:
+      transport: {{ .Values.mesh.relay.external.transport }}
+      {{- with .Values.mesh.relay.external.endpoint }}
+      endpoint: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.mesh.relay.external.controlEndpoint }}
+      controlEndpoint: {{ . | quote }}
+      {{- end }}
+  {{- end }}
+{{- end }}

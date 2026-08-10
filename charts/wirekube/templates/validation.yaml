@@ -1,0 +1,24 @@
+{{- /* Cross-value validation. Renders nothing; fails fast on broken combos. */ -}}
+{{- if .Values.relay.enabled }}
+{{- if not (has .Values.relay.service.type (list "LoadBalancer" "NodePort")) }}
+{{- fail (printf "relay.service.type must be LoadBalancer or NodePort (the WireKubeMesh managed relay spec allows no other type), got %q" .Values.relay.service.type) }}
+{{- end }}
+{{- if and (gt (int .Values.relay.replicas) 1) (not .Values.relay.clusterKube) }}
+{{- fail "relay.replicas > 1 requires relay.clusterKube=true: without the lease-backed peer registry, replicas cannot route frames to the replica holding a peer's session" }}
+{{- end }}
+{{- if eq .Values.mesh.relay.transport "wss" }}
+{{- if not .Values.relayWs.enabled }}
+{{- fail "mesh.relay.transport=wss requires relayWs.enabled=true: agents connect through the authenticated WebSocket front and the raw TCP Service is not rendered" }}
+{{- end }}
+{{- if and .Values.mesh.create (not .Values.mesh.relay.controlEndpoint) }}
+{{- fail "mesh.relay.transport=wss requires mesh.relay.controlEndpoint (the public WSS URL, e.g. wss://relay.example.com/relay)" }}
+{{- end }}
+{{- end }}
+{{- else if .Values.relayWs.enabled }}
+{{- fail "relayWs.enabled=true requires relay.enabled=true: the WebSocket front proxies to the in-cluster relay backend" }}
+{{- end }}
+{{- if and .Values.relay.enabled .Values.relay.adminWeb.enabled }}
+{{- if and (not (hasPrefix "127.0.0.1:" .Values.relay.adminWeb.addr)) (not .Values.relay.adminWeb.existingAuthSecret) }}
+{{- fail "relay.adminWeb.addr is not loopback: set relay.adminWeb.existingAuthSecret first (the console can download private keys and refuses to start unauthenticated on a non-loopback address)" }}
+{{- end }}
+{{- end }}

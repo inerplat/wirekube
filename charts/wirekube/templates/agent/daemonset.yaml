@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wirekube-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: wirekube-agent
+  updateStrategy:
+    type: {{ .Values.agent.updateStrategy.type }}
+    {{- if and (eq .Values.agent.updateStrategy.type "RollingUpdate") .Values.agent.updateStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.agent.updateStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "wirekube.agent.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+        {{- include "wirekube.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: wirekube-agent
+      hostNetwork: true
+      # Node resolver: no agent dial path needs cluster DNS, and cluster DNS
+      # is unreachable on bootstrap nodes without a CNI.
+      dnsPolicy: Default
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: wirekube.io/proxy-node
+                    operator: NotIn
+                    values:
+                      - "true"
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: wirekube-agent-proxy
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent
+          image: {{ include "wirekube.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["wirekube-agent"]
+          args:
+            - --node-name=$(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WIREKUBE_INTERFACE
+              value: {{ .Values.agent.interfaceName | quote }}
+            - name: WIREKUBE_RELAY_TOKEN_FILE
+              value: /var/run/secrets/wirekube-relay/token
+            {{- if .Values.agent.kubeAPIServer }}
+            - name: WIREKUBE_KUBE_APISERVER
+              value: {{ .Values.agent.kubeAPIServer | quote }}
+            {{- end }}
+            {{- with .Values.agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            # privileged is required to open /dev/net/tun on Ubuntu 24.04+
+            # hosts where containerd's default device cgroup denies TUN
+            # write even with CAP_NET_ADMIN.
+            privileged: true
+            # The default containerd AppArmor profile denies TUN-related
+            # operations on Ubuntu 24.04.
+            appArmorProfile:
+              type: Unconfined
+            capabilities:
+              add: ["NET_ADMIN", "SYS_MODULE"]
+          volumeMounts:
+            - name: wireguard-keys
+              mountPath: /var/lib/wirekube
+            - name: host-proc-sys-net
+              mountPath: /host/proc/sys/net
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+            - name: relay-token
+              mountPath: /var/run/secrets/wirekube-relay
+              readOnly: true
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+      volumes:
+        - name: wireguard-keys
+          hostPath:
+            path: {{ .Values.agent.keysHostPath }}
+            type: DirectoryOrCreate
+        - name: host-proc-sys-net
+          hostPath:
+            path: /proc/sys/net
+            type: Directory
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: relay-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: wirekube-relay
+                  expirationSeconds: 3600
