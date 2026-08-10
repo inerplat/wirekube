@@ -87,7 +87,7 @@ Default uninstall removes resources recorded in the installation inventory while
 
 ## Container Image
 
-The official multi-architecture container image supports `linux/amd64` and `linux/arm64`. Installation resources use the digest embedded in the matching `wirekubectl` release and do not use `latest` or development tags.
+The official multi-architecture container image supports `linux/amd64` and `linux/arm64`. Released `wirekubectl` binaries default to the digest embedded in the matching release. `--image` also accepts mutable tag references: the plan warns about them, tagged workloads pull on every Pod start, and a re-pushed tag reaches running Pods only after the next rollout. Pin `IMAGE@sha256:DIGEST` for deterministic rollouts.
 
 ## Install from repository manifests
 

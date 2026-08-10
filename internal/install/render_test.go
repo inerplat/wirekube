@@ -25,10 +25,59 @@ func TestOptionsRequireExplicitRelayForNonInteractiveInstall(t *testing.T) {
 	}
 }
 
-func TestOptionsRequireImageDigest(t *testing.T) {
-	options := Options{Image: "registry.example.test/wirekube:v1", Relay: RelayNone}
-	if err := options.Normalize(); err == nil || !strings.Contains(err.Error(), "pinned by digest") {
-		t.Fatalf("error=%v", err)
+func TestOptionsAcceptTagImagesAndRequireSomeImage(t *testing.T) {
+	tagged := Options{Image: "registry.example.test/wirekube:v1", Relay: RelayNone, MeshCIDR: "100.96.0.0/11"}
+	if err := tagged.Normalize(); err != nil {
+		t.Fatalf("a tag-only image must normalize, got %v", err)
+	}
+	missing := Options{Relay: RelayNone, MeshCIDR: "100.96.0.0/11"}
+	if err := missing.Normalize(); err == nil || !strings.Contains(err.Error(), "--image is required") {
+		t.Fatalf("error=%v, want a missing-image rejection", err)
+	}
+}
+
+func TestRenderPullPolicyFollowsImageReferenceType(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		image string
+		want  corev1.PullPolicy
+	}{
+		{"digest stays IfNotPresent", testImage, corev1.PullIfNotPresent},
+		{"tag forces Always", "registry.example.test/wirekube:v1", corev1.PullAlways},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle, err := Render(Options{Image: tc.image, Relay: RelayLoadBalancer, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, object := range bundle.Objects {
+				switch typed := object.(type) {
+				case *appsv1.DaemonSet:
+					if got := typed.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != tc.want {
+						t.Fatalf("%s pull policy = %s, want %s", typed.Name, got, tc.want)
+					}
+					checked++
+				case *appsv1.Deployment:
+					if got := typed.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != tc.want {
+						t.Fatalf("%s pull policy = %s, want %s", typed.Name, got, tc.want)
+					}
+					checked++
+				}
+			}
+			if checked < 2 {
+				t.Fatalf("checked only %d workloads", checked)
+			}
+		})
+	}
+}
+
+func TestImageMutabilityWarning(t *testing.T) {
+	if warning := ImageMutabilityWarning(testImage); warning != "" {
+		t.Fatalf("digest-pinned image warned: %q", warning)
+	}
+	if warning := ImageMutabilityWarning("registry.example.test/wirekube:v1"); !strings.Contains(warning, "mutable tag") {
+		t.Fatalf("tag image warning=%q", warning)
 	}
 }
 

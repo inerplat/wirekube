@@ -679,7 +679,7 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().StringVar(&flags.meshCIDR, "mesh-cidr", "auto", "mesh CIDR or auto")
 	cmd.Flags().StringVar(&flags.nodeAddresses, "node-addresses", "mesh-only", "node address exposure: mesh-only or internal-ip")
 	cmd.Flags().StringVar(&flags.agentAPIServer, "agent-apiserver", "", "apiserver URL the node agents dial, or in-cluster to keep in-cluster discovery (defaults to the kubeconfig server; must be reachable from nodes before CNI is ready)")
-	cmd.Flags().StringVar(&flags.image, "image", internalversion.DefaultImage, "immutable WireKube image reference (IMAGE@sha256:DIGEST)")
+	cmd.Flags().StringVar(&flags.image, "image", internalversion.DefaultImage, "WireKube image reference; a digest pin (IMAGE@sha256:DIGEST) is optional but recommended for deterministic rollouts")
 	cmd.Flags().Int32Var(&flags.listenPort, "listen-port", 0, "WireGuard UDP listen port shared by every agent (default: the existing mesh's port, else 51820)")
 	cmd.Flags().StringSliceVar(&flags.imagePullSecrets, "image-pull-secret", nil, "existing Secret name attached to every rendered Pod for private-registry pulls; may be repeated")
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")

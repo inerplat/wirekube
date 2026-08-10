@@ -155,6 +155,9 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 			"WireGuard interface, host routes, and policy routing rules on each agent node",
 		},
 	}
+	if warning := ImageMutabilityWarning(options.Image); warning != "" {
+		plan.Warnings = append(plan.Warnings, warning)
+	}
 	if liveListenPort > 0 && options.ListenPort != liveListenPort {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf("this apply changes the WireGuard listen port of the existing mesh from %d to %d; every agent re-binds and all peer endpoints must re-discover before traffic recovers", liveListenPort, options.ListenPort))
 	}

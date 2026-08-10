@@ -63,7 +63,7 @@ wirekubectl install \
   --dry-run
 ```
 
-Review the selected mesh CIDR, immutable image digest, agent placement, relay
+Review the selected mesh CIDR, image reference, agent placement, relay
 Services, and any public entry points. Automatic CIDR selection is best effort;
 provide `--mesh-cidr` when the CLI cannot know every routed network.
 

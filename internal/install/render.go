@@ -203,7 +203,7 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 					Containers: []corev1.Container{{
 						Name:            "agent",
 						Image:           options.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
+						ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.Image)),
 						Command:         []string{"wirekube-agent"},
 						Args:            []string{"--node-name=$(NODE_NAME)"},
 						Env:             env,
@@ -321,7 +321,7 @@ func relayDeployment(options Options, labels map[string]string) *appsv1.Deployme
 	componentLabels["app.kubernetes.io/component"] = "relay"
 	return &appsv1.Deployment{
 		TypeMeta: typeMeta(appsv1.SchemeGroupVersion.String(), "Deployment"), ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Namespace: options.Namespace, Labels: componentLabels},
-		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-relay"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "wirekube-relay", "app.kubernetes.io/component": "relay", "app.kubernetes.io/part-of": "wirekube", "app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: corev1.PodSpec{ImagePullSecrets: imagePullSecretRefs(options), Containers: []corev1.Container{{Name: "relay", Image: options.Image, Command: []string{"wirekube-relay"}, Args: relayArgs(options), Ports: []corev1.ContainerPort{{Name: "relay-tcp", ContainerPort: 3478, Protocol: corev1.ProtocolTCP}, {Name: "relay-udp", ContainerPort: 3478, Protocol: corev1.ProtocolUDP}}}}}}},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-relay"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "wirekube-relay", "app.kubernetes.io/component": "relay", "app.kubernetes.io/part-of": "wirekube", "app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: corev1.PodSpec{ImagePullSecrets: imagePullSecretRefs(options), Containers: []corev1.Container{{Name: "relay", Image: options.Image, ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.Image)), Command: []string{"wirekube-relay"}, Args: relayArgs(options), Ports: []corev1.ContainerPort{{Name: "relay-tcp", ContainerPort: 3478, Protocol: corev1.ProtocolTCP}, {Name: "relay-udp", ContainerPort: 3478, Protocol: corev1.ProtocolUDP}}}}}}},
 	}
 }
 
@@ -375,9 +375,10 @@ func relayWebSocketDeployment(options Options, labels map[string]string) *appsv1
 						PodAffinityTerm: corev1.PodAffinityTerm{LabelSelector: &metav1.LabelSelector{MatchLabels: selectorLabels}, TopologyKey: "kubernetes.io/hostname"},
 					}}}},
 					Containers: []corev1.Container{{
-						Name:    "relay-ws",
-						Image:   options.Image,
-						Command: []string{"wirekube-relay-ws"},
+						Name:            "relay-ws",
+						ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.Image)),
+						Image:           options.Image,
+						Command:         []string{"wirekube-relay-ws"},
 						Args: []string{
 							"--addr=:8081",
 							"--backend-addr=wirekube-relay-control." + options.Namespace + ".svc.cluster.local:3478",

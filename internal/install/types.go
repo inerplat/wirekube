@@ -224,8 +224,9 @@ func (o *Options) Normalize() error {
 	default:
 		return fmt.Errorf("unsupported relay mode %q", o.Relay)
 	}
-	if !digestPattern.MatchString(o.Image) {
-		return fmt.Errorf("--image must be pinned by digest (IMAGE@sha256:DIGEST)")
+	o.Image = strings.TrimSpace(o.Image)
+	if o.Image == "" {
+		return fmt.Errorf("--image is required: this build embeds no default image reference")
 	}
 	if o.RelayUDP && o.Relay != RelayLoadBalancer && o.Relay != RelayNodePort {
 		return fmt.Errorf("--relay-udp is supported only with load-balancer or node-port relay provisioning")
@@ -236,6 +237,28 @@ func (o *Options) Normalize() error {
 		return fmt.Errorf("unsupported --node-addresses value %q", o.NodeAddresses)
 	}
 	return nil
+}
+
+// ImageMutabilityWarning returns a plan warning when the image reference is a
+// mutable tag instead of a digest pin, and "" when the reference is pinned.
+// Digest pinning stopped being mandatory so day-to-day dev tags stay usable;
+// the warning keeps the determinism trade-off visible in every plan.
+func ImageMutabilityWarning(image string) string {
+	if digestPattern.MatchString(image) {
+		return ""
+	}
+	return fmt.Sprintf("image %s is a mutable tag reference; workloads pull on every start, but Pods already running an older build keep it until the next rollout, so pin the image as IMAGE@sha256:DIGEST for deterministic rollouts", image)
+}
+
+// ImagePullPolicyFor keeps digest-pinned references on IfNotPresent (the
+// content cannot change, so the cache is always right) and forces tag
+// references to Always so a re-pushed tag is at least picked up whenever a
+// Pod starts instead of sticking to a stale node cache forever.
+func ImagePullPolicyFor(image string) string {
+	if digestPattern.MatchString(image) {
+		return "IfNotPresent"
+	}
+	return "Always"
 }
 
 func validateEndpoint(flag, value string) error {
