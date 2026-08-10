@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -429,6 +430,59 @@ func TestLiveMeshListenPort(t *testing.T) {
 	}
 }
 
+func TestAdoptReplacesObjectsWithImmutableFieldConflicts(t *testing.T) {
+	scheme := installTestScheme(t)
+	oldSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "wirekube-agent"}}
+	newSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-agent"}}
+	newDS := func() *appsv1.DaemonSet {
+		return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "wirekube-system", Name: "wirekube-agent"}, Spec: appsv1.DaemonSetSpec{Selector: newSelector}}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	t.Run("adopt replaces via orphan delete and recreate", func(t *testing.T) {
+		existing := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "wirekube-system", Name: "wirekube-agent"}, Spec: appsv1.DaemonSetSpec{Selector: oldSelector}}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+		c := &applyTestClient{Client: base, ready: true, immutableApplyNames: map[string]bool{"wirekube-agent": true}}
+		outcome, err := (Installer{Client: c}).applyObject(ctx, newDS(), true, "install-id", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !outcome.recreated {
+			t.Fatal("outcome was not marked as recreated")
+		}
+		current := &appsv1.DaemonSet{}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: "wirekube-system", Name: "wirekube-agent"}, current); err != nil {
+			t.Fatal(err)
+		}
+		if current.Spec.Selector.MatchLabels["app.kubernetes.io/name"] != "wirekube-agent" {
+			t.Fatalf("selector was not replaced: %v", current.Spec.Selector)
+		}
+	})
+
+	t.Run("without adopt the conflict surfaces", func(t *testing.T) {
+		existing := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "wirekube-system", Name: "wirekube-agent", Labels: map[string]string{"app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: appsv1.DaemonSetSpec{Selector: oldSelector}}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+		c := &applyTestClient{Client: base, ready: true, immutableApplyNames: map[string]bool{"wirekube-agent": true}}
+		if _, err := (Installer{Client: c}).applyObject(ctx, newDS(), false, "install-id", true); err == nil || !strings.Contains(err.Error(), "field is immutable") {
+			t.Fatalf("err=%v, want the surfaced immutable-field conflict", err)
+		}
+	})
+
+	t.Run("CRDs are never replaced", func(t *testing.T) {
+		existing := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "wirekubemeshes.wirekube.io"}}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+		c := &applyTestClient{Client: base, ready: true, immutableApplyNames: map[string]bool{"wirekubemeshes.wirekube.io": true}}
+		desired := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "wirekubemeshes.wirekube.io"}}
+		if _, err := (Installer{Client: c}).applyObject(ctx, desired, true, "install-id", false); err == nil || !strings.Contains(err.Error(), "field is immutable") {
+			t.Fatalf("err=%v, want the surfaced conflict instead of a CRD replacement", err)
+		}
+		if err := c.Get(ctx, client.ObjectKey{Name: "wirekubemeshes.wirekube.io"}, &apiextensionsv1.CustomResourceDefinition{}); err != nil {
+			t.Fatalf("CRD disappeared: %v", err)
+		}
+	})
+}
+
 func TestUninstallDeletesResourcesRecordedByInventory(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -567,6 +621,11 @@ type applyTestClient struct {
 	failPatchName  string
 	failDeleteName string
 	forcedApplies  map[string]bool
+	// immutableApplyNames simulates a server-side immutable-field rejection:
+	// apply patches over an EXISTING object with this name fail the way a
+	// changed DaemonSet spec.selector does, while a create after deletion
+	// succeeds.
+	immutableApplyNames map[string]bool
 }
 
 func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
@@ -575,6 +634,12 @@ func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch
 	}
 	if patch.Type() != types.ApplyPatchType {
 		return c.Client.Patch(ctx, object, patch, options...)
+	}
+	if c.immutableApplyNames[object.GetName()] {
+		probe := reflect.New(reflect.TypeOf(object).Elem()).Interface().(client.Object)
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(object), probe); err == nil {
+			return apierrors.NewInvalid(object.GetObjectKind().GroupVersionKind().GroupKind(), object.GetName(), field.ErrorList{field.Invalid(field.NewPath("spec", "selector"), "", "field is immutable")})
+		}
 	}
 	if c.forcedApplies != nil {
 		resolved := &client.PatchOptions{}

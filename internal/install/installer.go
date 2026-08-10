@@ -155,10 +155,11 @@ func normalizedRelayTransport(transport string) string {
 }
 
 type applyOutcome struct {
-	applied  client.Object
-	previous client.Object
-	created  bool
-	changed  bool
+	applied   client.Object
+	previous  client.Object
+	created   bool
+	changed   bool
+	recreated bool
 }
 
 type rollbackAction struct {
@@ -239,19 +240,104 @@ func (i Installer) applyObject(ctx context.Context, desired client.Object, adopt
 		// server-side apply conflicts instead of failing on them.
 		patchOptions = append(patchOptions, client.ForceOwnership)
 	}
-	if err := i.Client.Patch(ctx, desired, client.Apply, patchOptions...); err != nil {
-		return applyOutcome{}, fmt.Errorf("apply %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), err)
+	patchErr := i.Client.Patch(ctx, desired, client.Apply, patchOptions...)
+	recreated := false
+	if patchErr != nil && adopt && !created && isImmutableFieldError(patchErr) && recreatableForAdoption(desired) {
+		// An adopted workload can disagree with the rendered one on an
+		// immutable field — a foreign DaemonSet's spec.selector, most
+		// commonly — and no apply can change that in place. --adopt consents
+		// to replacement: delete the old object while orphaning its Pods so
+		// the workload keeps serving, then create the rendered object, whose
+		// selector adopts the orphaned Pods and rolls them gradually.
+		if deleteErr := i.Client.Delete(ctx, existing, client.PropagationPolicy(metav1.DeletePropagationOrphan)); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			return applyOutcome{}, fmt.Errorf("replace %s %s: delete immutable predecessor: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), deleteErr)
+		}
+		if waitErr := i.waitForObjectDeletion(ctx, desired); waitErr != nil {
+			return applyOutcome{}, fmt.Errorf("replace %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), waitErr)
+		}
+		patchErr = i.Client.Patch(ctx, desired, client.Apply, patchOptions...)
+		recreated = patchErr == nil
 	}
-	outcome := applyOutcome{applied: desired.DeepCopyObject().(client.Object), created: created, changed: true}
+	if patchErr != nil {
+		return applyOutcome{}, fmt.Errorf("apply %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), patchErr)
+	}
+	outcome := applyOutcome{applied: desired.DeepCopyObject().(client.Object), created: created, changed: true, recreated: recreated}
 	if !created {
 		outcome.previous = existing.DeepCopyObject().(client.Object)
 	}
 	return outcome, nil
 }
 
+// isImmutableFieldError reports whether the apply failed because the server
+// rejected a change to an immutable field, such as a workload selector.
+func isImmutableFieldError(err error) bool {
+	return apierrors.IsInvalid(err) && strings.Contains(err.Error(), "field is immutable")
+}
+
+// recreatableForAdoption reports whether replacing the object is an
+// acceptable way to resolve an immutable-field conflict. Deleting a CRD
+// cascades into every custom resource and deleting a Namespace into every
+// object inside it, so those always surface the conflict instead.
+func recreatableForAdoption(object client.Object) bool {
+	switch object.(type) {
+	case *apiextensionsv1.CustomResourceDefinition, *corev1.Namespace:
+		return false
+	default:
+		return true
+	}
+}
+
+// waitForObjectDeletion blocks until the object is gone so the follow-up
+// create does not race the server-side finalization of the delete.
+func (i Installer) waitForObjectDeletion(ctx context.Context, object client.Object) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		current := reflect.New(reflect.TypeOf(object).Elem()).Interface().(client.Object)
+		err := i.Client.Get(ctx, client.ObjectKeyFromObject(object), current)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("await deletion: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("await deletion: %s still present after 30s", client.ObjectKeyFromObject(object))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func appendApplyRollback(journal []rollbackAction, c client.Client, outcome applyOutcome) []rollbackAction {
 	if !outcome.changed {
 		return journal
+	}
+	if outcome.recreated {
+		object := outcome.applied.DeepCopyObject().(client.Object)
+		snapshot := outcome.previous.DeepCopyObject().(client.Object)
+		return append(journal, rollbackAction{
+			description: "restore replaced " + object.GetName(),
+			run: func(ctx context.Context) error {
+				current := reflect.New(reflect.TypeOf(object).Elem()).Interface().(client.Object)
+				current.GetObjectKind().SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
+				if err := c.Get(ctx, client.ObjectKeyFromObject(object), current); err == nil {
+					if err := c.Delete(ctx, current, client.PropagationPolicy(metav1.DeletePropagationOrphan)); err != nil && !apierrors.IsNotFound(err) {
+						return err
+					}
+				} else if !apierrors.IsNotFound(err) {
+					return err
+				}
+				toCreate := snapshot.DeepCopyObject().(client.Object)
+				toCreate.SetResourceVersion("")
+				toCreate.SetUID("")
+				toCreate.SetManagedFields(nil)
+				toCreate.SetCreationTimestamp(metav1.Time{})
+				return c.Create(ctx, toCreate)
+			},
+		})
 	}
 	if outcome.created {
 		object := outcome.applied.DeepCopyObject().(client.Object)
