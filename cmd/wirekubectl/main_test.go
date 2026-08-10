@@ -342,6 +342,28 @@ func TestUpgradePreservesStoredListenPort(t *testing.T) {
 	}
 }
 
+func TestUpgradePreservesStoredImagePullSecrets(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().StringSlice("image-pull-secret", nil, "")
+	cmd.Flags().String("image", lifecycleTestImage, "")
+	flags := &lifecycleFlags{image: lifecycleTestImage}
+	stored := internalinstall.Options{ImagePullSecrets: []string{"ncloud-registry"}}
+
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if len(flags.imagePullSecrets) != 1 || flags.imagePullSecrets[0] != "ncloud-registry" {
+		t.Fatalf("imagePullSecrets=%v, want the stored secret", flags.imagePullSecrets)
+	}
+
+	if err := cmd.Flags().Set("image-pull-secret", "other"); err != nil {
+		t.Fatal(err)
+	}
+	flags.imagePullSecrets = []string{"other"}
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if len(flags.imagePullSecrets) != 1 || flags.imagePullSecrets[0] != "other" {
+		t.Fatalf("imagePullSecrets=%v, want the explicit override", flags.imagePullSecrets)
+	}
+}
+
 func TestUpgradeLeavesListenPortSentinelForLegacyInventory(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.Flags().Int32("listen-port", 0, "")

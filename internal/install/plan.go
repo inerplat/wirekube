@@ -148,6 +148,7 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 		MeshCIDR:         options.MeshCIDR,
 		NodeAddresses:    options.NodeAddresses,
 		ListenPort:       options.ListenPort,
+		ImagePullSecrets: options.ImagePullSecrets,
 		Resources:        bundle.Resources,
 		Impact: []string{
 			"privileged host-networked agent Pod on each selected Linux node",

@@ -208,6 +208,60 @@ func TestRenderHonorsCustomListenPort(t *testing.T) {
 	}
 }
 
+func TestRenderAttachesImagePullSecretsToEveryPodSpec(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{"ncloud-registry", "backup-registry"}, WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	podSpecs := map[string]corev1.PodSpec{}
+	for _, object := range bundle.Objects {
+		switch typed := object.(type) {
+		case *appsv1.DaemonSet:
+			podSpecs["daemonset/"+typed.Name] = typed.Spec.Template.Spec
+		case *appsv1.Deployment:
+			podSpecs["deployment/"+typed.Name] = typed.Spec.Template.Spec
+		}
+	}
+	for _, want := range []string{"daemonset/wirekube-agent", "deployment/wirekube-relay", "deployment/wirekube-relay-ws"} {
+		if _, ok := podSpecs[want]; !ok {
+			t.Fatalf("rendered workloads %v are missing %s", podSpecs, want)
+		}
+	}
+	for name, spec := range podSpecs {
+		if len(spec.ImagePullSecrets) != 2 || spec.ImagePullSecrets[0].Name != "ncloud-registry" || spec.ImagePullSecrets[1].Name != "backup-registry" {
+			t.Fatalf("%s imagePullSecrets=%v, want both secrets in order", name, spec.ImagePullSecrets)
+		}
+	}
+}
+
+func TestNormalizeTrimsAndRejectsImagePullSecrets(t *testing.T) {
+	padded := Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{" ncloud-registry "}}
+	if err := padded.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if padded.ImagePullSecrets[0] != "ncloud-registry" {
+		t.Fatalf("imagePullSecrets=%v, want trimmed name", padded.ImagePullSecrets)
+	}
+	empty := Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{"  "}}
+	if err := empty.Normalize(); err == nil || !strings.Contains(err.Error(), "image-pull-secret") {
+		t.Fatalf("err=%v, want an empty image-pull-secret rejection", err)
+	}
+}
+
+func TestRenderOmitsImagePullSecretsByDefault(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range bundle.Objects {
+		if ds, ok := object.(*appsv1.DaemonSet); ok {
+			if ds.Spec.Template.Spec.ImagePullSecrets != nil {
+				t.Fatalf("agent imagePullSecrets=%v, want omitted", ds.Spec.Template.Spec.ImagePullSecrets)
+			}
+		}
+	}
+}
+
 func TestRenderManagedWSSGatewayAndUDPLoadBalancer(t *testing.T) {
 	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
 	if err != nil {

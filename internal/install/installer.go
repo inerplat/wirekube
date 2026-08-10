@@ -131,6 +131,7 @@ func sameInstallConfig(left, right Options) bool {
 		left.MeshCIDR == right.MeshCIDR &&
 		left.NodeAddresses == right.NodeAddresses &&
 		normalizedListenPort(left.ListenPort) == normalizedListenPort(right.ListenPort) &&
+		strings.Join(left.ImagePullSecrets, ",") == strings.Join(right.ImagePullSecrets, ",") &&
 		// Compare the resolved URL, not just the explicit flag: the kubeconfig server is
 		// the fallback source, so re-running install from a different kubeconfig entry
 		// would otherwise rewrite the agent DaemonSet without tripping this check.

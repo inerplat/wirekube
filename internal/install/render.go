@@ -182,6 +182,7 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: map[string]string{"wirekube.io/relay-config-revision": relayConfigRevision(options)}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "wirekube-agent",
+					ImagePullSecrets:   imagePullSecretRefs(options),
 					HostNetwork:        true,
 					// Default (node resolver) instead of ClusterFirstWithHostNet: no agent
 					// dial path needs cluster DNS anymore (the relay endpoint comes from
@@ -320,7 +321,7 @@ func relayDeployment(options Options, labels map[string]string) *appsv1.Deployme
 	componentLabels["app.kubernetes.io/component"] = "relay"
 	return &appsv1.Deployment{
 		TypeMeta: typeMeta(appsv1.SchemeGroupVersion.String(), "Deployment"), ObjectMeta: metav1.ObjectMeta{Name: "wirekube-relay", Namespace: options.Namespace, Labels: componentLabels},
-		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-relay"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "wirekube-relay", "app.kubernetes.io/component": "relay", "app.kubernetes.io/part-of": "wirekube", "app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "relay", Image: options.Image, Command: []string{"wirekube-relay"}, Args: relayArgs(options), Ports: []corev1.ContainerPort{{Name: "relay-tcp", ContainerPort: 3478, Protocol: corev1.ProtocolTCP}, {Name: "relay-udp", ContainerPort: 3478, Protocol: corev1.ProtocolUDP}}}}}}},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "wirekube-relay"}}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "wirekube-relay", "app.kubernetes.io/component": "relay", "app.kubernetes.io/part-of": "wirekube", "app.kubernetes.io/managed-by": "wirekubectl"}}, Spec: corev1.PodSpec{ImagePullSecrets: imagePullSecretRefs(options), Containers: []corev1.Container{{Name: "relay", Image: options.Image, Command: []string{"wirekube-relay"}, Args: relayArgs(options), Ports: []corev1.ContainerPort{{Name: "relay-tcp", ContainerPort: 3478, Protocol: corev1.ProtocolTCP}, {Name: "relay-udp", ContainerPort: 3478, Protocol: corev1.ProtocolUDP}}}}}}},
 	}
 }
 
@@ -368,6 +369,7 @@ func relayWebSocketDeployment(options Options, labels map[string]string) *appsv1
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "wirekube-relay",
+					ImagePullSecrets:   imagePullSecretRefs(options),
 					Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
 						Weight:          100,
 						PodAffinityTerm: corev1.PodAffinityTerm{LabelSelector: &metav1.LabelSelector{MatchLabels: selectorLabels}, TopologyKey: "kubernetes.io/hostname"},
@@ -468,6 +470,20 @@ func meshObject(options Options) *wirekubev1alpha1.WireKubeMesh {
 		mesh.Spec.Relay = &wirekubev1alpha1.RelaySpec{Mode: "auto", Provider: "external", External: &wirekubev1alpha1.ExternalRelaySpec{Endpoint: options.RelayUDPEndpoint, ControlEndpoint: options.RelayEndpoint, Transport: options.RelayTransport}}
 	}
 	return mesh
+}
+
+// imagePullSecretRefs converts the installation's pull-secret names into the
+// references every rendered Pod spec carries. nil when none are configured so
+// the field is omitted from the server-side applyset entirely.
+func imagePullSecretRefs(options Options) []corev1.LocalObjectReference {
+	if len(options.ImagePullSecrets) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(options.ImagePullSecrets))
+	for _, name := range options.ImagePullSecrets {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return refs
 }
 
 func typeMeta(apiVersion, kind string) metav1.TypeMeta {

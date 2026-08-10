@@ -44,6 +44,7 @@ type Options struct {
 	MeshCIDR           string
 	NodeAddresses      string
 	ListenPort         int32
+	ImagePullSecrets   []string
 	ExcludeCIDRs       []string
 	Yes                bool
 	DryRun             bool
@@ -85,6 +86,7 @@ type Plan struct {
 	MeshCIDR         string     `json:"meshCIDR"`
 	NodeAddresses    string     `json:"nodeAddresses"`
 	ListenPort       int32      `json:"listenPort"`
+	ImagePullSecrets []string   `json:"imagePullSecrets,omitempty"`
 	Resources        []Resource `json:"resources"`
 	Impact           []string   `json:"infrastructureImpact"`
 	Warnings         []string   `json:"warnings,omitempty"`
@@ -125,6 +127,13 @@ func (o *Options) Normalize() error {
 	}
 	if o.ListenPort < 1024 || o.ListenPort > 65535 {
 		return fmt.Errorf("invalid --listen-port %d: must be between 1024 and 65535 (the WireKubeMesh CRD rejects lower ports)", o.ListenPort)
+	}
+	for i, secret := range o.ImagePullSecrets {
+		trimmed := strings.TrimSpace(secret)
+		if trimmed == "" {
+			return fmt.Errorf("--image-pull-secret must not be empty")
+		}
+		o.ImagePullSecrets[i] = trimmed
 	}
 	if o.Relay == "" {
 		if o.Yes {

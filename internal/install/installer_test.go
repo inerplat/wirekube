@@ -406,6 +406,11 @@ func TestSameInstallConfigTreatsLegacyZeroListenPortAsDefault(t *testing.T) {
 	if sameInstallConfig(legacy, current) {
 		t.Fatal("a custom listen port was treated as the legacy default")
 	}
+	current.ListenPort = DefaultListenPort
+	current.ImagePullSecrets = []string{"ncloud-registry"}
+	if sameInstallConfig(legacy, current) {
+		t.Fatal("a differing image pull secret list was treated as the same config")
+	}
 }
 
 func TestLiveMeshListenPort(t *testing.T) {

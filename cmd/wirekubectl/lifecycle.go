@@ -39,6 +39,7 @@ type lifecycleFlags struct {
 	agentAPIServer     string
 	image              string
 	listenPort         int32
+	imagePullSecrets   []string
 	excludeCIDRs       []string
 	yes                bool
 	dryRun             bool
@@ -680,6 +681,7 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().StringVar(&flags.agentAPIServer, "agent-apiserver", "", "apiserver URL the node agents dial, or in-cluster to keep in-cluster discovery (defaults to the kubeconfig server; must be reachable from nodes before CNI is ready)")
 	cmd.Flags().StringVar(&flags.image, "image", internalversion.DefaultImage, "immutable WireKube image reference (IMAGE@sha256:DIGEST)")
 	cmd.Flags().Int32Var(&flags.listenPort, "listen-port", 0, "WireGuard UDP listen port shared by every agent (default: the existing mesh's port, else 51820)")
+	cmd.Flags().StringSliceVar(&flags.imagePullSecrets, "image-pull-secret", nil, "existing Secret name attached to every rendered Pod for private-registry pulls; may be repeated")
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")
 	cmd.Flags().BoolVar(&flags.yes, "yes", false, "apply the displayed plan without prompting")
 	cmd.Flags().BoolVar(&flags.dryRun, "dry-run", false, "inspect and print the plan without mutating the cluster")
@@ -705,7 +707,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 		return internalinstall.Plan{}, internalinstall.Options{}, installer, err
 	}
 	installOptions := internalinstall.Options{
-		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
+		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ImagePullSecrets: flags.imagePullSecrets, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
 	}
 	plan, normalized, err := (internalinstall.Planner{Client: c, Discovery: discovery, AccessReviewer: internalinstall.SelfSubjectAccessReviewer{Client: c}}).Build(cmd.Context(), installOptions)
 	return plan, normalized, installer, err
@@ -764,6 +766,9 @@ func applyStoredLifecycleDefaults(cmd *cobra.Command, flags *lifecycleFlags, sto
 	if !cmd.Flags().Changed("listen-port") && stored.ListenPort != 0 {
 		flags.listenPort = stored.ListenPort
 	}
+	if !cmd.Flags().Changed("image-pull-secret") {
+		flags.imagePullSecrets = stored.ImagePullSecrets
+	}
 	if !cmd.Flags().Changed("image") && strings.TrimSpace(flags.image) == "" {
 		flags.image = stored.Image
 	}
@@ -781,6 +786,9 @@ func writePlanText(out io.Writer, plan internalinstall.Plan) {
 	fmt.Fprintln(out, "WireKube installation plan")
 	fmt.Fprintf(out, "\nCluster\n  Context:       %s\n  Kubernetes:    %s\n  Provider:      %s\n  CNI:           %s\n", plan.Context, plan.Detection.KubernetesVersion, plan.Detection.Provider, plan.Detection.CNI)
 	fmt.Fprintf(out, "\nComponents\n  Resources:     %d\n  Agent:         privileged DaemonSet\n  Relay:         %s\n  Transport:     %s\n  Mesh CIDR:     %s\n  Listen Port:   %d\n  Image:         %s\n", len(plan.Resources), plan.Relay, plan.RelayTransport, plan.MeshCIDR, plan.ListenPort, plan.Image)
+	if len(plan.ImagePullSecrets) > 0 {
+		fmt.Fprintf(out, "  Pull Secrets:  %s\n", strings.Join(plan.ImagePullSecrets, ", "))
+	}
 	fmt.Fprintln(out, "\nInfrastructure impact")
 	for _, impact := range plan.Impact {
 		fmt.Fprintf(out, "  - %s\n", impact)
