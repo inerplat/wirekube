@@ -64,6 +64,21 @@ docker push inerplat/wirekube:latest
 
 Tag builds run formatting, vet, lint, unit tests, and the TCP/WSS disposable-cluster E2E matrix before publishing anything. After those gates pass, the workflow publishes the multi-architecture image, builds four standalone `wirekubectl` binaries, injects the version, commit, build date, and immutable image digest, and creates a GitHub Release with SHA256 checksums.
 
+### Cutting a release
+
+The manifests under `config/` and the chart's `appVersion` pin a release tag, and the image for that tag does not exist until the tag is pushed. So the pin lands first and is verified afterwards:
+
+1. Update `config/**` image tags, `charts/wirekube/Chart.yaml` `appVersion`, and the `VERSION=` example in `docs/getting-started/installation.md` to the tag you are about to cut. Commit to `main`.
+2. Push the tag. `release.yml` publishes the image, then its `verify-pins` job re-checks every pin with `verifyflags -strict`.
+
+CI's `manifest-images` job runs the same check on `main` without `-strict`, so an as-yet-unpublished tag reports `PENDING` rather than failing. Anything else it reports is real: `REJECT` means the pinned binary does not define a flag the manifest passes, which is a `CrashLoopBackOff` on install.
+
+```bash
+CONTAINER_ENGINE=podman go run ./hack/verifyflags $(git ls-files 'config/**/*.yaml')
+```
+
+The E2E suite overrides the image with the one it just built, so it cannot catch a stale pin. This check is the only thing that does.
+
 ### Homebrew tap
 
 The public formula lives in
@@ -139,7 +154,10 @@ wirekube/
 │   ├── crd/             # CustomResourceDefinition YAMLs (generated)
 │   ├── relay/           # Relay deployment + service examples
 │   └── examples/         # WireKubeMesh and EKS Hybrid Node examples
+├── charts/wirekube/     # Helm chart (appVersion tracks the latest release tag)
 ├── docs/                # Documentation (MkDocs Material)
+├── hack/
+│   └── verifyflags/     # Checks pinned images accept their manifest args
 ├── .github/workflows/   # CI (tag-triggered build + test)
 ├── Dockerfile
 ├── Makefile
