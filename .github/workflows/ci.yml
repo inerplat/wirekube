@@ -91,6 +91,7 @@ jobs:
 
   manifest-images:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -108,19 +109,26 @@ jobs:
       # binary rejects a flag the manifest still passes and the pod
       # CrashLoopBackOffs. The e2e suite cannot catch this because it overrides
       # the image with the one it just built.
+      #
+      # Not -strict: the commit that prepares a release pins the tag the
+      # release itself will publish, so an unresolved pin here is expected.
+      # release.yml re-runs this with -strict once the image exists.
       - name: Pinned manifests accept their own args
         run: |
-          go run ./hack/verifyflags \
-            config/agent/daemonset.yaml \
-            config/relay/deployment.yaml \
-            config/relay/websocket.yaml \
-            config/examples/relay-wss/agent-canary-daemonset.yaml
+          set -o pipefail
+          go run ./hack/verifyflags $(git ls-files 'config/**/*.yaml')
 
-      - name: Chart default render accepts its own args
+      - name: Chart renders accept their own args
         run: |
-          helm template wk charts/wirekube -n wirekube-system \
-            --set mesh.meshCIDR=100.96.0.0/11 \
-            | go run ./hack/verifyflags -
+          set -o pipefail
+          render() {
+            helm template wk charts/wirekube -n wirekube-system "$@" \
+              | go run ./hack/verifyflags -
+          }
+          render --set mesh.meshCIDR=100.96.0.0/11
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relayWs.enabled=true \
+            --set mesh.relay.transport=wss \
+            --set mesh.relay.controlEndpoint=wss://relay.example.com/relay
 
   test:
     needs: lint

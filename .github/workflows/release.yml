@@ -151,6 +151,51 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # The pins in config/ and charts/ name this tag, whose image did not exist
+  # while the release-prep commit sat on main. CI checked them without -strict
+  # and let the unresolved pin through. Now that the image is published, the
+  # same check has to hold strictly, or the release ships manifests that
+  # CrashLoopBackOff on their own image.
+  verify-pins:
+    needs: publish-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Chart appVersion tracks this tag
+        run: |
+          want='appVersion: "${{ github.ref_name }}"'
+          grep -qxF "$want" charts/wirekube/Chart.yaml || {
+            echo "charts/wirekube/Chart.yaml must carry $want"
+            grep -n appVersion charts/wirekube/Chart.yaml
+            exit 1
+          }
+
+      - name: Pinned manifests accept their own args
+        run: |
+          set -o pipefail
+          go run ./hack/verifyflags -strict $(git ls-files 'config/**/*.yaml')
+
+      - name: Chart renders accept their own args
+        run: |
+          set -o pipefail
+          render() {
+            helm template wk charts/wirekube -n wirekube-system "$@" \
+              | go run ./hack/verifyflags -strict -
+          }
+          render --set mesh.meshCIDR=100.96.0.0/11
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relayWs.enabled=true \
+            --set mesh.relay.transport=wss \
+            --set mesh.relay.controlEndpoint=wss://relay.example.com/relay
+
   release-cli:
     needs: publish-image
     runs-on: ubuntu-latest
