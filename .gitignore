@@ -6,8 +6,11 @@ terraform.tfstate.backup
 *.tfstate.*.backup
 .terraform/
 site/
+.DS_Store
 /relay
+/relay-ws
 /agent
+/admin-web
 /operator
 /wirekubectl
 /stun-server
