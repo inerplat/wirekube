@@ -1,10 +1,9 @@
 # EKS Hybrid Nodes with WireKube
 
-This guide covers deploying WireKube on an Amazon EKS cluster with
-[Hybrid Nodes](https://docs.aws.amazon.com/eks/latest/userguide/hybrid-nodes-overview.html) —
-external worker nodes (on-premises or other clouds) managed by an EKS control plane.
-
-WireKube establishes a WireGuard mesh VPN across all nodes, enabling:
+Amazon EKS [Hybrid Nodes](https://docs.aws.amazon.com/eks/latest/userguide/hybrid-nodes-overview.html)
+are external worker nodes (on-premises or other clouds) managed by an EKS
+control plane. On such a cluster, WireKube establishes a WireGuard mesh VPN
+across all nodes, enabling:
 
 - **Encrypted node-to-node connectivity** over WireGuard tunnels
 - **Cross-node pod networking** via Cilium VXLAN over WireGuard
@@ -84,7 +83,7 @@ Careful CIDR allocation prevents routing conflicts:
 
 !!! critical "Cilium Pod CIDR must NOT overlap with VPC CIDR or cloud internal ranges"
     By default, Cilium's `cluster-pool` IPAM may use the same CIDR as the VPC
-    (e.g., `10.100.0.0/16`). This causes routing conflicts — WireGuard routes
+    (e.g., `10.100.0.0/16`). This causes routing conflicts: WireGuard routes
     for hybrid pod CIDRs would capture VPC-local traffic. Use a completely
     separate RFC 1918 range like `10.200.0.0/16`. Avoid CGNAT (100.64.0.0/10)
     as some cloud providers use it internally. EKS requires `remotePodNetworks`
@@ -277,7 +276,7 @@ echo "Set WIREKUBE_KUBE_APISERVER to: ${EKS_ENDPOINT}"
 kubectl apply -f config/examples/eks-hybrid/daemonset.yaml
 ```
 
-!!! note "Why WIREKUBE_KUBE_APISERVER?"
+!!! note "Purpose of WIREKUBE_KUBE_APISERVER"
     Hybrid nodes cannot reach the Kubernetes service ClusterIP before CNI
     is ready. The agent needs API access at startup to create its
     WireKubePeer CRD. The EKS public endpoint bypasses this dependency.
@@ -388,7 +387,7 @@ To enable full pod-to-pod communication across EC2 and hybrid nodes:
 
 This works automatically. Cilium's VXLAN tunneling uses node IPs as
 endpoints, which are routed through WireGuard. No additional configuration
-is needed — verify with:
+is needed. Verify with:
 
 ```bash
 kubectl exec <pod-on-hybrid-A> -- wget -qO- http://<pod-IP-on-hybrid-B>
@@ -487,7 +486,7 @@ When deploying on freshly joined hybrid nodes, follow this exact order:
 > The reboot is only required when Cilium and kube-proxy state was established
 > before WireKube's first deployment.
 
-**Why reboot?** Three types of stale kernel state interfere with WireKube:
+The reboot clears three kinds of stale kernel state that interfere with WireKube:
 
 - **`KUBE-FIREWALL` iptables chain** — Created by kube-proxy before exclusion.
   Contains a DROP rule for non-local source packets to loopback
@@ -504,11 +503,8 @@ When deploying on freshly joined hybrid nodes, follow this exact order:
   persistent `EPERM` errors on `sendto()`. A reboot clears all BPF maps and
   cgroup attachments, allowing clean endpoint registration.
 
-A reboot cleanly resets all three: iptables chains are rebuilt from scratch,
-conntrack is emptied, and BPF programs are detached.
-
-**After the initial reboot, subsequent agent updates (DaemonSet rolling
-updates) work without rebooting** — the agent handles transient EPERM by
+After the initial reboot, subsequent agent updates (DaemonSet rolling
+updates) work without rebooting; the agent handles transient EPERM by
 recreating the affected UDP socket after the BPF state settles.
 
 ### EPERM on relay proxy

@@ -1,7 +1,7 @@
 # Deployment Topologies
 
-WireKube adapts to various network topologies automatically. This page
-describes common deployment patterns and their expected behavior.
+WireKube adapts to various network topologies automatically. Each pattern
+below lists the expected path mode for every node pair.
 
 ## Topology 1: All Private (Cloud NAT)
 
@@ -126,7 +126,7 @@ flowchart LR
 ```
 
 WireKube's TCP relay works through firewalls that allow outbound TCP.
-Agents initiate outbound TCP connections to the relay — no inbound
+Agents initiate outbound TCP connections to the relay, so no inbound
 ports need to be opened on the node's firewall.
 
 ## Choosing the Right Topology

@@ -8,7 +8,7 @@ The NAT traversal design draws from [Tailscale's architecture](https://tailscale
 
 ---
 
-## When Do You Need WireKube?
+## When to Use WireKube
 
 Kubernetes clusters increasingly span multiple clouds, VPCs, and on-premises networks. Traditional solutions — VPC peering, dedicated VPN appliances, complex overlays — are expensive, rigid, or vendor-locked.
 
@@ -57,7 +57,7 @@ flowchart LR
 2. Each agent registers itself as a **WireKubePeer** CRD with its public key and endpoint
 3. All agents watch all WireKubePeer CRDs and configure WireGuard peers accordingly
 4. Direct P2P handshake is attempted first; if it times out, traffic routes through the **TCP relay**
-5. The relay preserves WireGuard end-to-end encryption — it cannot decrypt traffic
+5. The relay preserves WireGuard end-to-end encryption; it cannot decrypt traffic
 6. Periodically, the agent re-probes direct paths and upgrades back from relay when possible
 
 No coordination server, no external etcd, no control plane beyond the Kubernetes API itself.

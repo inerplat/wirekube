@@ -46,7 +46,7 @@ flowchart TB
 
 In Symmetric NAT, the NAT gateway assigns a **different external port for each
 destination**. STUN discovers `1.2.3.4:50001` when talking to server A, but a
-peer trying to send to `1.2.3.4:50001` gets a different mapping — the packet
+peer trying to send to `1.2.3.4:50001` gets a different mapping. The packet
 never arrives.
 
 ### Cloud Provider NAT Behavior
@@ -62,7 +62,7 @@ All major cloud NAT gateways use Symmetric NAT:
 
 Most home/ISP routers use Cone NAT (STUN-based P2P works).
 
-!!! info "When is relay needed?"
+!!! info "When relay is needed"
     Relay is required whenever direct probing cannot establish a usable path. Symmetric ↔ Symmetric is the common case, but restrictive firewalls, port-restricted mappings, and asymmetric filtering can also require relay. Each node publishes its `natType` so peers can choose an appropriate probe strategy.
 
 ## Traversal Strategy
@@ -157,7 +157,7 @@ The agent evaluates the NAT type of both sides to select the optimal strategy:
 #### Same-NAT Detection
 
 When two peers share the same public IP (behind the same NAT gateway), STUN
-endpoints are unreliable — the NAT can only forward a given external port to one
+endpoints are unreliable: the NAT can only forward a given external port to one
 internal host. WireKube detects this by comparing STUN-discovered IPs and
 switches to the peer's `host` candidate (internal LAN IP) for direct
 communication. If the host candidate probe fails (e.g., peers are in different
@@ -208,7 +208,7 @@ Key properties:
 - **Direct auto-upgrades to dual-send on stale receive**. Inside `Send()`,
   if the peer is in `PathModeDirect` but `DirectHealth.LastSeen` is older
   than `directTrustWindow` (3s), this packet is also sent on the relay
-  leg. The failover blackout is thus bounded by the trust window — not by
+  leg. The failover blackout is thus bounded by the trust window, not by
   the agent's sync interval.
 - **Error-based fallback is intentionally absent**. UDP `WriteToUDP` only
   errors on local socket failures; using it as a reachability signal
@@ -240,7 +240,7 @@ peer A                  relay                  peer B
 
 Rate-limited to one hint per peer per 250 ms; the receiving side arms a
 10-second dual-send window on that peer. The FSM continues to run as
-before — hints are a datapath accelerator, not a replacement for the
+before. Hints are a datapath accelerator, not a replacement for the
 mode transitions.
 
 ### Per-Peer FSM (`PathMonitor`)

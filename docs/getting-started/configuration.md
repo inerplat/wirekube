@@ -133,7 +133,7 @@ The default DaemonSet does not include an initContainer. During graceful shutdow
 
 On startup, the agent sets `disable_xfrm=1` and `disable_policy=1` on the WireGuard
 interface via `/proc/sys/net/ipv4/conf/<iface>/`. This prevents IPSec xfrm policies
-from intercepting WireGuard traffic — critical for environments with existing
+from intercepting WireGuard traffic in environments with existing
 site-to-site IPSec tunnels.
 
 The DaemonSet mounts the host's `/proc/sys/net` to `/host/proc/sys/net` to write

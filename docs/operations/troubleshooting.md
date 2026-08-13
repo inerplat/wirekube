@@ -220,7 +220,7 @@ kubectl get wirekubepeer <name> -o jsonpath='{.spec.allowedIPs}'
 Peer CRD exists but no routes are added and no traffic flows.
 
 **Root Cause:** AllowedIPs are intentionally user-managed. When empty, the agent
-enters passive mode — no routes added for any peer.
+enters passive mode and adds no routes for any peer.
 
 **Fix:**
 
@@ -311,7 +311,7 @@ spec:
 ```
 
 The agent already runs with `hostNetwork: true`, so the added surface
-from `privileged` is narrow — this is simply the only K8s-visible switch
+from `privileged` is narrow. It is the only K8s-visible switch
 that loosens the device cgroup enough for TUN creation.
 
 ---
@@ -334,9 +334,9 @@ kubelet, and apiserver traffic.
 
 - Walks `Node.status.addresses` and uses only **private** (RFC1918 /
   CGNAT / loopback / link-local) entries.
-- If none are present, scans local interfaces directly — cloud
+- If none are present, scans local interfaces directly, so cloud
   instances that hide a private secondary behind a kubelet-reported
-  public InternalIP still get picked up this way.
+  public InternalIP still get picked up.
 - Never, under any code path, auto-publishes a public IP. Operators
   who want a specific non-standard private address can set the
   `wirekube.io/internal-ip` **node** annotation to override selection.

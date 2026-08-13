@@ -36,7 +36,7 @@ flowchart LR
 
 Download and install the latest NVIDIA Game Ready or Studio driver from
 [nvidia.com/drivers](https://www.nvidia.com/drivers). **Do NOT install a
-driver inside WSL2** — the Windows driver provides GPU access to WSL2
+driver inside WSL2**; the Windows driver provides GPU access to WSL2
 automatically.
 
 After installation, verify from PowerShell:
@@ -69,13 +69,13 @@ autoMemoryReclaim=gradual
 !!! critical "dnsTunneling must be disabled"
     `networkingMode=mirrored` enables `dnsTunneling` by default, which binds
     `10.255.255.254/32` to the `lo` interface. Cilium detects this as a
-    NodePort-capable primary address and uses it for BPF LB SNAT — causing
+    NodePort-capable primary address and uses it for BPF LB SNAT, causing
     all Pod-to-ClusterIP traffic to be SNATed to an unreachable loopback IP
     instead of the node's real IP. Result: `i/o timeout` on every service call.
 
-!!! note "Why mirrored networking?"
+!!! note "Mirrored networking"
     `networkingMode=mirrored` gives WSL2 the same IP as the Windows host,
-    making NAT traversal simpler — WireKube's STUN sees the real router-mapped
+    making NAT traversal simpler: WireKube's STUN sees the real router-mapped
     endpoint instead of a double-NAT (Windows NAT + router NAT).
 
 ### 1.3 Install WSL2
@@ -403,7 +403,7 @@ WSL2 requires two flags that differ from standard deployments:
   in-cluster driver pod.
 - **`toolkit.enabled=false`** — The operator's toolkit DaemonSet tries to
   create `/dev/nvidia*` device nodes, which don't exist on WSL2 (GPU is
-  exposed via `/dev/dxg`). We already installed nvidia-container-toolkit
+  exposed via `/dev/dxg`). nvidia-container-toolkit was already installed
   manually in Phase 2.5.
 
 ```bash
@@ -445,7 +445,7 @@ kubectl describe node <wsl2-node-name> | grep -A5 "Allocatable" | grep nvidia
 ## Phase 6: Test GPU Workload
 
 GPU pods on WSL2 **must** use `runtimeClassName: nvidia`. Without it,
-containers cannot find `nvidia-smi` or access the GPU — WSL2 exposes the
+containers cannot find `nvidia-smi` or access the GPU, because WSL2 exposes the
 GPU via `/dev/dxg` and CDI mounts, not `/dev/nvidia*`.
 
 ```bash
@@ -552,8 +552,8 @@ kubectl delete pod matmul-bench
 
 !!! note "Reading the results"
     Ada Lovelace GPUs (RTX 40xx) report FP32 specs including FP32+INT32
-    dual-issue. Pure FP32 matmul achieves ~50% of the advertised TFLOPS —
-    this is expected. FP16/BF16 should reach ~100% of spec. For example,
+    dual-issue. Pure FP32 matmul achieving ~50% of the advertised TFLOPS
+    is expected. FP16/BF16 should reach ~100% of spec. For example,
     RTX 4060 (15.1 TFLOPS advertised): expect ~7.5 FP32, ~30 FP16/BF16.
 
 ## WSL2 Auto-Start (Optional)
@@ -631,7 +631,7 @@ Then `wsl --shutdown` from PowerShell and restart.
 **Symptom:** `iptables: unknown option "--transparent"` in cilium-agent logs.
 
 **Cause:** WSL2 kernel lacks `xt_socket` module. This only affects Cilium's
-L7 transparent proxy — basic networking and service routing still work via
+L7 transparent proxy. Basic networking and service routing still work via
 BPF if cgroup v2 is enabled.
 
 ### MTU issues: large packets dropped
@@ -647,7 +647,7 @@ Verify with `ip link show eth0`.
 ### nvidia-smi works in WSL2 but not in pods
 
 **Cause:** Missing `runtimeClassName: nvidia` in pod spec. WSL2 exposes GPU
-via `/dev/dxg` and CDI — without the nvidia RuntimeClass, containerd does not
+via `/dev/dxg` and CDI; without the nvidia RuntimeClass, containerd does not
 mount the GPU devices into the container.
 
 **Fix:** Add `runtimeClassName: nvidia` to the pod spec (see Phase 6).

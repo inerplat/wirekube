@@ -1,6 +1,6 @@
 # Cloud Provider Notes
 
-WireKube is cloud-agnostic. This page documents provider-specific behaviors
+WireKube is cloud-agnostic. The notes below cover provider-specific behavior
 relevant to NAT traversal and relay deployment.
 
 ---
@@ -9,7 +9,7 @@ relevant to NAT traversal and relay deployment.
 
 All major cloud NAT gateways use Symmetric NAT (Endpoint-Dependent Mapping).
 Cross-VPC Symmetric ↔ Symmetric direct P2P is impossible; relay is required.
-However, Cone ↔ Symmetric pairs can achieve direct P2P — the Symmetric side
+However, Cone ↔ Symmetric pairs can achieve direct P2P: the Symmetric side
 initiates a handshake to the Cone peer's stable STUN-mapped endpoint.
 
 | Provider | NAT Product | NAT Type | Direct P2P (cross-VPC) |

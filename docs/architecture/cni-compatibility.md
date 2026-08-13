@@ -1,8 +1,7 @@
 # CNI Compatibility
 
 WireKube is designed to work alongside any CNI plugin without interference.
-This page documents the specific compatibility considerations, especially
-with Cilium.
+Most of the specific compatibility considerations involve Cilium.
 
 ## Route Isolation
 
@@ -29,7 +28,7 @@ Cilium attaches eBPF programs to cgroup socket operations:
 These hooks implement Cilium's socket-level load balancing for services.
 The current userspace Bind delivers relay packets directly and normally avoids the legacy localhost UDP proxy. The behavior in this section applies to the retained UDPProxy fallback path and older deployments.
 
-### When Does This Happen?
+### Trigger Conditions
 
 The BPF hook triggers when:
 

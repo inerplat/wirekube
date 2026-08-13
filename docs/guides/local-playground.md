@@ -1,8 +1,8 @@
 # Local Playground: Join a Docker Node to Your Cluster
 
-This guide shows how to run a Docker container on your local machine and join
+Run a Docker container on your local machine and join
 it to your **existing** Kubernetes cluster as a worker node. This simulates
-adding a remote node from a completely different network — the exact scenario
+adding a remote node from a different network, the scenario
 WireKube is designed for.
 
 ```mermaid
@@ -292,8 +292,8 @@ automatically. Otherwise, you may need to add a toleration or label.
 ## Deploy WireKube
 
 At this point, `wirekube-node` is registered in your cluster but may not have
-full network connectivity to other nodes — it is behind Docker's NAT, on a
-completely different network. This is exactly the problem WireKube solves.
+full network connectivity to other nodes: it is behind Docker's NAT, on a
+different network.
 
 ### Step 1: Load the WireKube Image
 
@@ -352,8 +352,8 @@ docker exec wirekube-node ping -c 3 -I wire_kube ${CLUSTER_NODE_IP}
 ```
 
 You should see WireGuard handshakes completing and successful pings through
-the `wire_kube` interface — even though the Docker container and your cluster
-nodes are on completely different networks.
+the `wire_kube` interface, even though the Docker container and your cluster
+nodes are on different networks.
 
 ---
 
