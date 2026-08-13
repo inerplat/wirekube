@@ -40,6 +40,55 @@ jobs:
         with:
           version: v2.1
 
+  helm-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Check chart CRDs match config/crd
+        run: |
+          for f in config/crd/wirekube.io_*.yaml; do
+            diff -u "$f" "charts/wirekube/crds/$(basename "$f")"
+          done
+
+      - name: Helm lint
+        run: helm lint charts/wirekube --set mesh.meshCIDR=100.96.0.0/11
+
+      - name: Render valid value combinations
+        run: |
+          set -e
+          render() { echo "render: $*"; helm template wk charts/wirekube -n wirekube-system "$@" > /dev/null; }
+          render --set mesh.meshCIDR=100.96.0.0/11
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relay.service.type=NodePort --set mesh.relay.controlEndpoint=203.0.113.10:30478
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relayWs.enabled=true --set mesh.relay.transport=wss --set mesh.relay.controlEndpoint=wss://relay.example.com/relay
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relay.enabled=false --set mesh.relay.external.endpoint=relay.example.com:3478 --set mesh.relay.external.controlEndpoint=relay.example.com:3478
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relay.enabled=false
+          render --set mesh.meshCIDR=100.96.0.0/11 --set relay.service.udp.enabled=false
+          render --set mesh.meshCIDR=100.96.0.0/11 --set agent.updateStrategy.type=OnDelete
+          render --set mesh.create=false
+
+      - name: Reject invalid value combinations
+        run: |
+          set -e
+          reject() {
+            echo "reject: $*"
+            if helm template wk charts/wirekube -n wirekube-system "$@" > /dev/null 2>&1; then
+              echo "expected template failure but it rendered"; exit 1
+            fi
+          }
+          reject # meshCIDR unset
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set mesh.relay.transport=wss --set mesh.relay.controlEndpoint=wss://x/relay
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relayWs.enabled=true --set mesh.relay.transport=wss
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.service.type=NodePort
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.service.type=ClusterIP
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.replicas=2 --set relay.clusterKube=false
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.enabled=false --set relayWs.enabled=true
+          reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.adminWeb.addr=0.0.0.0:8080
+
   test:
     needs: lint
     runs-on: ubuntu-latest
