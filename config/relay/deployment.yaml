@@ -160,7 +160,7 @@ spec:
         eks.amazonaws.com/nodegroup: relay-ng
       containers:
         - name: relay
-          image: inerplat/wirekube:v0.0.16
+          image: inerplat/wirekube:v0.0.17
           command: ["wirekube-relay"]
           args:
             - --addr=:3478
@@ -209,7 +209,7 @@ spec:
               cpu: 500m
               memory: 128Mi
         - name: admin-web
-          image: inerplat/wirekube:v0.0.16
+          image: inerplat/wirekube:v0.0.17
           command: ["wirekube-admin-web"]
           args:
             # Binds to loopback only: the console is reachable via

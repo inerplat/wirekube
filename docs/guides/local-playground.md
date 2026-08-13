@@ -298,11 +298,13 @@ different network.
 ### Step 1: Load the WireKube Image
 
 The agent runs as a DaemonSet inside the node, so the image must be available
-in the node's containerd:
+in the node's containerd. Load the same tag `config/agent/daemonset.yaml`
+pins, or the node pulls from the registry anyway and the preload is wasted:
 
 ```bash
-docker pull inerplat/wirekube:latest
-docker save inerplat/wirekube:latest -o /tmp/wirekube.tar
+VERSION=$(grep -o 'inerplat/wirekube:[^ ]*' config/agent/daemonset.yaml | cut -d: -f2)
+docker pull "inerplat/wirekube:${VERSION}"
+docker save "inerplat/wirekube:${VERSION}" -o /tmp/wirekube.tar
 docker cp /tmp/wirekube.tar wirekube-node:/tmp/wirekube.tar
 docker exec wirekube-node ctr -n k8s.io images import /tmp/wirekube.tar
 ```

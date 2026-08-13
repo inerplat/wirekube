@@ -28,7 +28,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: relay-ws
-          image: inerplat/wirekube:v0.0.16
+          image: inerplat/wirekube:v0.0.17
           command: ["wirekube-relay-ws"]
           args:
             - --addr=:8081

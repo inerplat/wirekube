@@ -5,7 +5,7 @@ type: application
 version: 0.1.0
 # Must track the latest release tag (git tag / GitHub release). The Makefile
 # VERSION default is a local dev placeholder; do not copy it here.
-appVersion: "v0.0.16"
+appVersion: "v0.0.17"
 kubeVersion: ">=1.24.0-0"
 home: https://inerplat.github.io/wirekube/
 sources:
