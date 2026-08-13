@@ -1,5 +1,5 @@
 IMG ?= inerplat/wirekube
-VERSION ?= v0.0.9-dev.1
+VERSION ?= v0.0.17-dev.5
 
 GO = go
 

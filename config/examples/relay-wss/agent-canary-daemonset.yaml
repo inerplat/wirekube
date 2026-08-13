@@ -41,7 +41,7 @@ spec:
         - name: private-registry
       containers:
         - name: agent
-          image: inerplat/wirekube:v0.0.0-dev.14
+          image: inerplat/wirekube:v0.0.16
           command: ["wirekube-agent"]
           args:
             - --node-name=$(NODE_NAME)
