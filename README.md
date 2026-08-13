@@ -6,7 +6,7 @@ WireKube builds a WireGuard mesh between your Kubernetes nodes using CRDs for co
 
 **[Documentation](https://inerplat.github.io/wirekube/)**
 
-## When Do You Need WireKube?
+## When to Use WireKube
 
 - **Multi-cloud / hybrid clusters** — Your Kubernetes nodes span AWS, GCP, on-prem, or home labs, and they need to communicate directly at the node level without VPC peering or dedicated VPN appliances.
 
@@ -37,7 +37,7 @@ flowchart LR
 1. An **Agent DaemonSet** runs on each node, creates a WireGuard TUN (wireguard-go userspace), and discovers its public endpoint via STUN.
 2. Each agent registers itself as a **WireKubePeer** CRD. All agents watch all peers and configure WireGuard through a custom `Bind` layer.
 3. The custom Bind runs a **bimodal warm-relay datapath**: when direct is unproven or flapping, every packet is duplicated on both the direct UDP leg and the relay TCP leg. WireGuard's replay counter dedupes on the receiver, so blackouts are bounded by the 3-second trust window instead of by control-plane sync intervals.
-4. When direct receive stalls, the bind fires a **BimodalHint** through the relay to pull the remote peer into dual-send too — this is the fix for asymmetric (one-way) UDP drops that would otherwise take ~30s to recover.
+4. When direct receive stalls, the bind fires a **BimodalHint** through the relay to pull the remote peer into dual-send too. This fixes asymmetric (one-way) UDP drops that would otherwise take ~30s to recover.
 5. The per-peer `PathMonitor` FSM promotes `Relay → Warm → Direct` on fresh direct receive evidence and demotes back on stall. Relay is always warm; direct is an opportunistic overlay.
 
 No coordination server, no external etcd, no control plane beyond the Kubernetes API itself.
@@ -55,6 +55,14 @@ wirekubectl status
 The Homebrew formula supports macOS and Linux on ARM64 and AMD64. GitHub
 Release binaries with a checksum file remain available for environments that
 do not use Homebrew.
+
+A [Helm chart](charts/wirekube) is also available for clusters managed through Helm or GitOps:
+
+```bash
+helm install wirekube ./charts/wirekube \
+  --namespace wirekube-system --create-namespace \
+  --set mesh.meshCIDR=100.96.0.0/11
+```
 
 The installer inspects the cluster and shows the exact CRDs, privileged workloads, relay infrastructure, image digest, and mesh CIDR before mutation. Automation must select the relay topology and mesh CIDR explicitly, for example `wirekubectl install --relay load-balancer --mesh-cidr 100.96.0.0/11 --yes --output json`. LoadBalancer installs create separate TCP and UDP entry points by default; use `--relay-transport wss --relay-endpoint wss://relay.example.com/relay` when an existing HTTPS Gateway or Ingress must front the authenticated WebSocket relay backend.
 

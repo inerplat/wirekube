@@ -89,6 +89,20 @@ Default uninstall removes resources recorded in the installation inventory while
 
 The official multi-architecture container image supports `linux/amd64` and `linux/arm64`. Released `wirekubectl` binaries default to the digest embedded in the matching release. `--image` also accepts mutable tag references: the plan warns about them, tagged workloads pull on every Pod start, and a re-pushed tag reaches running Pods only after the next rollout. Pin `IMAGE@sha256:DIGEST` for deterministic rollouts.
 
+## Install with Helm
+
+The [wirekube chart](https://github.com/inerplat/wirekube/tree/main/charts/wirekube) installs the CRDs, agent DaemonSet, relay, and a WireKubeMesh from a source checkout:
+
+```bash
+helm install wirekube ./charts/wirekube \
+  --namespace wirekube-system --create-namespace \
+  --set mesh.meshCIDR=100.96.0.0/11
+```
+
+`mesh.meshCIDR` has no default: pick a private range that does not overlap your VPC, Pod, or Service CIDRs. The chart mirrors the installer's topology options (`relay.service.type`, `relayWs.enabled`, `mesh.relay.transport`); invalid value combinations fail at template time. Helm installs the CRDs on first install but never upgrades them, so apply `charts/wirekube/crds/` manually when upgrading across CRD changes. See the [chart README](https://github.com/inerplat/wirekube/tree/main/charts/wirekube#readme) for the full value reference.
+
+Unlike `wirekubectl install`, Helm does not inspect the cluster for CIDR conflicts, does not embed a pinned image digest, and does not manage the installation inventory used by `wirekubectl upgrade`/`uninstall`. Pick one installation method per cluster and stay with it.
+
 ## Install from repository manifests
 
 The repository manifests remain available for development and manual inspection. They are not the primary release installation contract because they may contain environment-specific examples and require a source checkout.
