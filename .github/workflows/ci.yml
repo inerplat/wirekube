@@ -89,6 +89,39 @@ jobs:
           reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.enabled=false --set relayWs.enabled=true
           reject --set mesh.meshCIDR=100.96.0.0/11 --set relay.adminWeb.addr=0.0.0.0:8080
 
+  manifest-images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install helm
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      # A feature commit changes code and manifests together, so they agree.
+      # Re-pinning an image tag on its own is what breaks them apart: the older
+      # binary rejects a flag the manifest still passes and the pod
+      # CrashLoopBackOffs. The e2e suite cannot catch this because it overrides
+      # the image with the one it just built.
+      - name: Pinned manifests accept their own args
+        run: |
+          go run ./hack/verifyflags \
+            config/agent/daemonset.yaml \
+            config/relay/deployment.yaml \
+            config/relay/websocket.yaml \
+            config/examples/relay-wss/agent-canary-daemonset.yaml
+
+      - name: Chart default render accepts its own args
+        run: |
+          helm template wk charts/wirekube -n wirekube-system \
+            --set mesh.meshCIDR=100.96.0.0/11 \
+            | go run ./hack/verifyflags -
+
   test:
     needs: lint
     runs-on: ubuntu-latest
