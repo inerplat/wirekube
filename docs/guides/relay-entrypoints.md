@@ -134,6 +134,32 @@ relay:
 
 `transport: tcp` uses the raw endpoint and does not open a WebSocket session. `transport: wss` uses only `controlEndpoint` for the agent session and keeps `endpoint` for NAT probing and external WireGuard peers when one is configured. Running both Services is safe because they are entry points to the same relay, but one agent public key must not connect through both transports simultaneously.
 
+### Canary the WSS agent on a subset of nodes
+
+`config/examples/relay-wss/agent-canary-daemonset.yaml` is a second agent DaemonSet that claims only nodes labelled `wirekube.io/agent-canary=true`, so the relay token can be tried on a few nodes before the whole fleet.
+
+The transport still comes from the WireKubeMesh, not from this DaemonSet. Applying the canary without setting `transport: wss` on the mesh gives you a second agent on the same transport, which is the one configuration that must not exist.
+
+```bash
+kubectl apply -f config/examples/relay-wss/agent-canary-daemonset.yaml
+kubectl label node <node> wirekube.io/agent-canary=true
+```
+
+The base DaemonSet excludes `wirekube.io/agent-canary=true` nodes and carries a pod anti-affinity against the canary, so a labelled node runs the canary alone. Both guards matter, and a base DaemonSet predating them will schedule alongside the canary. Confirm exactly one agent per node before trusting the result:
+
+```bash
+kubectl -n wirekube-system get pods -o wide --field-selector spec.nodeName=<node>
+```
+
+Two agents on one node share `/var/lib/wirekube` and the interface name. They present the same public key, so the relay evicts each session as the other registers — visible as `peer registered`/`peer disconnected` for one peer id several times a second in the relay log, and `relay-client: read error: EOF` in both agents. Removing the label then stops the churn, but the departing pod's shutdown deletes the interface the surviving agent was using.
+
+To roll back, remove the label first and confirm the remaining agent still holds its interface:
+
+```bash
+kubectl label node <node> wirekube.io/agent-canary-
+kubectl -n wirekube-system exec <remaining-agent-pod> -- ip -br link show wire_kube
+```
+
 ## Verify the selected path
 
 ```bash
