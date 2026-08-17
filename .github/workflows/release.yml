@@ -196,8 +196,13 @@ jobs:
             --set mesh.relay.transport=wss \
             --set mesh.relay.controlEndpoint=wss://relay.example.com/relay
 
+  # Also waits on verify-pins. The image is published by then and cannot be
+  # unpublished, but the GitHub Release and the CLI binaries can still be held
+  # back — and the CLI embeds the image digest, so shipping it after a failed
+  # pin check would hand users a wirekubectl that installs manifests the image
+  # rejects.
   release-cli:
-    needs: publish-image
+    needs: [publish-image, verify-pins]
     runs-on: ubuntu-latest
     permissions:
       contents: write
