@@ -650,8 +650,39 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 	return a.client.Status().Patch(ctx, peer, patch)
 }
 
+// ensureInterfaceAlive recreates the WireGuard device if it disappeared while
+// the agent was running. EnsureInterface already knows how to rebuild a vanished
+// TUN, but setup() was its only caller, so the device could previously be
+// recovered only by restarting the pod — and nothing restarted it, because the
+// process stays healthy while every sync fails with "device closed".
+//
+// The device goes away when something outside this process removes it. A second
+// agent sharing the same interface name is one way: its cleanup() on SIGTERM
+// deletes the interface unconditionally, taking the survivor's device with it.
+// Following EnsureRoutingRules, this runs on every tick so it self-heals
+// regardless of cause.
+func (a *Agent) ensureInterfaceAlive() error {
+	if a.wgMgr.InterfaceExists() {
+		return nil
+	}
+	a.log.Info("WireGuard interface disappeared, recreating", "interface", a.wgMgr.InterfaceName())
+	if err := a.wgMgr.EnsureInterface(); err != nil {
+		return fmt.Errorf("recreating WireGuard interface: %w", err)
+	}
+	// A fresh device carries no private key or listen port, and SyncPeers
+	// against an unconfigured device fails the same way it did before.
+	if err := a.wgMgr.Configure(); err != nil {
+		return fmt.Errorf("reconfiguring recreated WireGuard interface: %w", err)
+	}
+	return nil
+}
+
 // sync reconciles WireGuard peer config and kernel routes with current WireKubePeer CRDs.
 func (a *Agent) sync(ctx context.Context) error {
+	if err := a.ensureInterfaceAlive(); err != nil {
+		return err
+	}
+
 	// Re-read relay mode from mesh CR so runtime changes are picked up.
 	pokeAfterSync := false
 	var meshCIDR string

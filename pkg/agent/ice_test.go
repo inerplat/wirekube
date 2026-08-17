@@ -25,15 +25,34 @@ type fakeWGEngine struct {
 	stats      []wireguard.PeerStats
 	setPaths   []wireguard.PathMode
 	poked      []string
+
+	// ifaceGone simulates the device being removed from under the agent. The
+	// zero value keeps the interface present, which is what every other test
+	// assumes.
+	ifaceGone      bool
+	ensureCalls    int
+	configureCalls int
+	ensureErr      error
 }
 
-func (f *fakeWGEngine) EnsureInterface() error                   { return nil }
-func (f *fakeWGEngine) Configure() error                         { return nil }
+func (f *fakeWGEngine) EnsureInterface() error {
+	f.ensureCalls++
+	if f.ensureErr != nil {
+		return f.ensureErr
+	}
+	f.ifaceGone = false
+	return nil
+}
+
+func (f *fakeWGEngine) Configure() error {
+	f.configureCalls++
+	return nil
+}
 func (f *fakeWGEngine) DeleteInterface() error                   { return nil }
 func (f *fakeWGEngine) Close() error                             { return nil }
 func (f *fakeWGEngine) InterfaceName() string                    { return "" }
 func (f *fakeWGEngine) ListenPort() int                          { return 0 }
-func (f *fakeWGEngine) InterfaceExists() bool                    { return true }
+func (f *fakeWGEngine) InterfaceExists() bool                    { return !f.ifaceGone }
 func (f *fakeWGEngine) ConfigMatchesKey(*wireguard.KeyPair) bool { return true }
 func (f *fakeWGEngine) SyncPeers([]wireguard.PeerConfig) error   { return nil }
 func (f *fakeWGEngine) ForceEndpoint(string, string) error       { return nil }
