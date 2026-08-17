@@ -104,10 +104,15 @@ type Inventory struct {
 }
 
 type Result struct {
-	SchemaVersion  string    `json:"schemaVersion"`
-	Operation      string    `json:"operation"`
-	InstallationID string    `json:"installationID,omitempty"`
-	Ready          bool      `json:"ready"`
+	SchemaVersion  string `json:"schemaVersion"`
+	Operation      string `json:"operation"`
+	InstallationID string `json:"installationID,omitempty"`
+	Ready          bool   `json:"ready"`
+	// NotReadyReason explains why an applied installation has not reached
+	// full readiness. The resources are installed either way: a drained or
+	// NotReady node keeps its agent Pod pending without invalidating the
+	// installation, so this is reported rather than rolled back.
+	NotReadyReason string    `json:"notReadyReason,omitempty"`
 	Plan           Plan      `json:"plan"`
 	CompletedAt    time.Time `json:"completedAt"`
 }

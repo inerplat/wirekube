@@ -803,6 +803,9 @@ func writeLifecycleResult(cmd *cobra.Command, result internalinstall.Result) err
 		return writeJSON(cmd.OutOrStdout(), result)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "WireKube %s completed: installation=%s ready=%t\n", result.Operation, result.InstallationID, result.Ready)
+	if result.NotReadyReason != "" {
+		fmt.Fprintf(cmd.OutOrStdout(), "  The resources are installed and recorded; readiness is not complete: %s\n", result.NotReadyReason)
+	}
 	return nil
 }
 

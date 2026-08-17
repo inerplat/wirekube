@@ -469,6 +469,25 @@ func TestAdoptReplacesObjectsWithImmutableFieldConflicts(t *testing.T) {
 		}
 	})
 
+	t.Run("a failed recreate restores the deleted predecessor", func(t *testing.T) {
+		existing := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "wirekube-system", Name: "wirekube-agent"}, Spec: appsv1.DaemonSetSpec{Selector: oldSelector}}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+		// failCreateAfterDelete makes the post-deletion apply fail the way a
+		// webhook rejection or a quota denial would.
+		c := &applyTestClient{Client: base, ready: true, immutableApplyNames: map[string]bool{"wirekube-agent": true}, failCreateAfterDelete: true}
+		_, err := (Installer{Client: c}).applyObject(ctx, newDS(), true, "install-id", false)
+		if err == nil || !strings.Contains(err.Error(), "restored") {
+			t.Fatalf("err=%v, want a failure reporting the restore", err)
+		}
+		current := &appsv1.DaemonSet{}
+		if getErr := c.Get(ctx, client.ObjectKey{Namespace: "wirekube-system", Name: "wirekube-agent"}, current); getErr != nil {
+			t.Fatalf("the predecessor was not restored: %v", getErr)
+		}
+		if current.Spec.Selector.MatchLabels["app"] != "wirekube-agent" {
+			t.Fatalf("restored selector=%v, want the original", current.Spec.Selector)
+		}
+	})
+
 	t.Run("CRDs are never replaced", func(t *testing.T) {
 		existing := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "wirekubemeshes.wirekube.io"}}
 		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
@@ -481,6 +500,59 @@ func TestAdoptReplacesObjectsWithImmutableFieldConflicts(t *testing.T) {
 			t.Fatalf("CRD disappeared: %v", err)
 		}
 	})
+}
+
+func TestAdoptClaimsResourcesOrphanedByAMissingInventory(t *testing.T) {
+	orphan := func() *appsv1.DaemonSet {
+		return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "wirekube-system",
+			Name:      "wirekube-agent",
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "wirekubectl", InstallationIDLabel: "installation-from-a-lost-inventory"},
+		}}
+	}
+	desired := func() *appsv1.DaemonSet {
+		return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "wirekube-system", Name: "wirekube-agent"}}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	scheme := installTestScheme(t)
+	withoutAdopt := &applyTestClient{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(orphan()).Build(), ready: true}
+	if _, err := (Installer{Client: withoutAdopt}).applyObject(ctx, desired(), false, "new-installation", false); err == nil || !strings.Contains(err.Error(), "--adopt") {
+		t.Fatalf("err=%v, want a refusal that points at --adopt", err)
+	}
+
+	withAdopt := &applyTestClient{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(orphan()).Build(), ready: true}
+	if _, err := (Installer{Client: withAdopt}).applyObject(ctx, desired(), true, "new-installation", false); err != nil {
+		t.Fatalf("--adopt must claim an orphaned resource, got %v", err)
+	}
+}
+
+func TestUnreachableReadinessKeepsResourcesAndRecordsTheReason(t *testing.T) {
+	scheme := installTestScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := &applyTestClient{Client: base, ready: true, agentNeverReady: true, honorContext: true}
+	options := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only", WireKubeVersion: "v1.0.0", Timeout: time.Second}
+	plan := Plan{SchemaVersion: SchemaVersion, Namespace: options.Namespace, Image: options.Image, Relay: options.Relay, MeshCIDR: options.MeshCIDR}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := (Installer{Client: c}).Apply(ctx, plan, options, "install")
+	if err != nil {
+		t.Fatalf("an unreachable readiness condition must not fail the installation: %v", err)
+	}
+	if result.Ready {
+		t.Fatal("result claims readiness that was never reached")
+	}
+	if result.NotReadyReason == "" {
+		t.Fatal("result does not explain why readiness is incomplete")
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "wirekube-system", Name: "wirekube-agent"}, &appsv1.DaemonSet{}); err != nil {
+		t.Fatalf("the agent DaemonSet was rolled back instead of kept: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "wirekube-system", Name: InventoryName}, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("the inventory was not recorded, so a rerun cannot upgrade: %v", err)
+	}
 }
 
 func TestUninstallDeletesResourcesRecordedByInventory(t *testing.T) {
@@ -626,9 +698,23 @@ type applyTestClient struct {
 	// changed DaemonSet spec.selector does, while a create after deletion
 	// succeeds.
 	immutableApplyNames map[string]bool
+	// failCreateAfterDelete makes the apply that follows a replacement
+	// deletion fail, the way a webhook or quota rejection would.
+	failCreateAfterDelete bool
+	sawDelete             bool
+	// agentNeverReady keeps the agent DaemonSet permanently short of its
+	// desired count, the way a NotReady or drained node does.
+	agentNeverReady bool
+	// honorContext rejects writes once the context expires, the way a real
+	// API client does. The fake client ignores deadlines, so without this a
+	// step that runs after the whole timeout was consumed still succeeds.
+	honorContext bool
 }
 
 func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	if c.honorContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if object.GetName() == c.failPatchName {
 		return fmt.Errorf("injected patch failure for %s", object.GetName())
 	}
@@ -640,6 +726,9 @@ func (c *applyTestClient) Patch(ctx context.Context, object client.Object, patch
 		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(object), probe); err == nil {
 			return apierrors.NewInvalid(object.GetObjectKind().GroupVersionKind().GroupKind(), object.GetName(), field.ErrorList{field.Invalid(field.NewPath("spec", "selector"), "", "field is immutable")})
 		}
+	}
+	if c.failCreateAfterDelete && c.sawDelete {
+		return fmt.Errorf("injected post-deletion apply failure for %s", object.GetName())
 	}
 	if c.forcedApplies != nil {
 		resolved := &client.PatchOptions{}
@@ -666,6 +755,7 @@ func (c *applyTestClient) Delete(ctx context.Context, object client.Object, opti
 	if object.GetName() == c.failDeleteName {
 		return fmt.Errorf("injected delete failure for %s", object.GetName())
 	}
+	c.sawDelete = true
 	return c.Client.Delete(ctx, object, options...)
 }
 
@@ -677,6 +767,15 @@ func (c *applyTestClient) setStatus(object client.Object) {
 	case *apiextensionsv1.CustomResourceDefinition:
 		typed.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{Type: apiextensionsv1.Established, Status: apiextensionsv1.ConditionTrue}}
 	case *appsv1.DaemonSet:
+		if c.agentNeverReady {
+			// One node cannot run its Pod, as with a NotReady or drained
+			// node: the DaemonSet is applied but never fully ready.
+			typed.Status.DesiredNumberScheduled = 2
+			typed.Status.UpdatedNumberScheduled = 2
+			typed.Status.NumberReady = 1
+			typed.Status.NumberAvailable = 1
+			return
+		}
 		typed.Status.DesiredNumberScheduled = 1
 		typed.Status.UpdatedNumberScheduled = 1
 		typed.Status.NumberReady = 1

@@ -83,10 +83,10 @@ func (i Installer) Apply(ctx context.Context, plan Plan, options Options, operat
 		}
 		journal = appendApplyRollback(journal, i.Client, outcome)
 	}
-	if err := i.waitReady(ctx, options); err != nil {
-		return fail(err)
-	}
-
+	// The inventory is recorded before readiness is observed. Waiting first
+	// would let an unreachable readiness condition burn the whole timeout and
+	// leave no budget to save the inventory, and that failure would roll back
+	// resources that are already applied and carrying traffic.
 	storedOptions := options
 	storedOptions.Yes = false
 	storedOptions.DryRun = false
@@ -117,7 +117,16 @@ func (i Installer) Apply(ctx context.Context, plan Plan, options Options, operat
 			}
 		}
 	}
-	return Result{SchemaVersion: SchemaVersion, Operation: operation, InstallationID: installationID, Ready: true, Plan: plan, CompletedAt: time.Now().UTC()}, nil
+	// Readiness is an observation, not part of applying the installation: a
+	// drained or NotReady node keeps its agent Pod pending forever, and
+	// deleting a mesh that already carries traffic over that is a far worse
+	// outcome than reporting the unmet condition.
+	readyErr := i.waitReady(ctx, options)
+	result := Result{SchemaVersion: SchemaVersion, Operation: operation, InstallationID: installationID, Ready: readyErr == nil, Plan: plan, CompletedAt: time.Now().UTC()}
+	if readyErr != nil {
+		result.NotReadyReason = readyErr.Error()
+	}
+	return result, nil
 }
 
 func sameInstallConfig(left, right Options) bool {
@@ -221,8 +230,12 @@ func (i Installer) applyObject(ctx context.Context, desired client.Object, adopt
 		}
 		labels := existing.GetLabels()
 		existingInstallationID := labels[InstallationIDLabel]
-		if existingInstallationID != "" && existingInstallationID != installationID {
-			return applyOutcome{}, fmt.Errorf("%s %s belongs to WireKube installation %s, refusing to take ownership for installation %s", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), existingInstallationID, installationID)
+		if existingInstallationID != "" && existingInstallationID != installationID && !adopt {
+			// Resources stamped with an installation ID whose inventory no
+			// longer exists are orphans of an interrupted install, and every
+			// rerun mints a new ID, so refusing forever leaves no way back.
+			// --adopt is the operator's consent to claim them.
+			return applyOutcome{}, fmt.Errorf("%s %s belongs to WireKube installation %s, refusing to take ownership for installation %s; rerun with --adopt to claim it", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), existingInstallationID, installationID)
 		}
 		managed := labels["app.kubernetes.io/managed-by"] == "wirekubectl"
 		if !managed && !adopt {
@@ -253,10 +266,15 @@ func (i Installer) applyObject(ctx context.Context, desired client.Object, adopt
 			return applyOutcome{}, fmt.Errorf("replace %s %s: delete immutable predecessor: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), deleteErr)
 		}
 		if waitErr := i.waitForObjectDeletion(ctx, desired); waitErr != nil {
-			return applyOutcome{}, fmt.Errorf("replace %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), waitErr)
+			return applyOutcome{}, i.restorePredecessor(ctx, existing, fmt.Errorf("replace %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), waitErr))
 		}
-		patchErr = i.Client.Patch(ctx, desired, client.Apply, patchOptions...)
-		recreated = patchErr == nil
+		if patchErr = i.Client.Patch(ctx, desired, client.Apply, patchOptions...); patchErr != nil {
+			// The predecessor is already gone at this point and the rollback
+			// journal cannot own an object this call never finished applying,
+			// so undo the deletion here or the workload disappears entirely.
+			return applyOutcome{}, i.restorePredecessor(ctx, existing, fmt.Errorf("replace %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), patchErr))
+		}
+		recreated = true
 	}
 	if patchErr != nil {
 		return applyOutcome{}, fmt.Errorf("apply %s %s: %w", desired.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(desired), patchErr)
@@ -266,6 +284,23 @@ func (i Installer) applyObject(ctx context.Context, desired client.Object, adopt
 		outcome.previous = existing.DeepCopyObject().(client.Object)
 	}
 	return outcome, nil
+}
+
+// restorePredecessor recreates an object that the replacement path already
+// deleted, so a failed replacement leaves the workload exactly as it was
+// instead of removing it. The returned error always carries the original
+// cause, and reports the restore failure too when the object could not be
+// brought back.
+func (i Installer) restorePredecessor(ctx context.Context, predecessor client.Object, cause error) error {
+	restored := predecessor.DeepCopyObject().(client.Object)
+	restored.SetResourceVersion("")
+	restored.SetUID("")
+	restored.SetManagedFields(nil)
+	restored.SetCreationTimestamp(metav1.Time{})
+	if err := i.Client.Create(ctx, restored); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("%w; the previous %s %s was deleted for replacement and could NOT be restored (%v) — recreate it from a backup or rerun the installation", cause, predecessor.GetObjectKind().GroupVersionKind().Kind, client.ObjectKeyFromObject(predecessor), err)
+	}
+	return fmt.Errorf("%w; the previous object was restored and its Pods were never stopped", cause)
 }
 
 // isImmutableFieldError reports whether the apply failed because the server
