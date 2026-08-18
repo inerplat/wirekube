@@ -104,7 +104,7 @@ wirekubectl manifest [flags]
 wirekubectl status
 wirekubectl doctor
 wirekubectl upgrade [flags]
-wirekubectl uninstall [--purge --confirm-purge]
+wirekubectl uninstall [--dry-run] [--purge --confirm-purge]
 wirekubectl mesh status
 wirekubectl peers
 wirekubectl export
@@ -116,7 +116,7 @@ wirekubectl external invite <display-name> [flags]
 wirekubectl external revoke <display-name>
 ```
 
-All commands accept `--kubeconfig`, `--context`, `--namespace`, `--timeout`, and `--output text|json`. `install --dry-run` performs cluster inspection and prints the installation plan without mutation. Non-interactive `install --yes` requires explicit `--relay` and `--mesh-cidr` selections and an `--image` unless the released CLI embeds its matching default image. Tag references are accepted; a digest pin (`IMAGE@sha256:DIGEST`) is optional but recommended, and every plan warns when the image is a mutable tag. `--exclude-cidr` records routes that best-effort automatic mesh CIDR selection must avoid.
+All commands accept `--kubeconfig`, `--context`, `--namespace`, `--timeout`, and `--output text|json`. `install` prints the plan and applies it in one run; it never prompts, so use `--dry-run` (or `manifest`, which renders the same resources) to see a plan without mutating the cluster. An unset `--relay` defaults to `load-balancer` and an unset `--mesh-cidr` is selected automatically, so automation that cares about either should pass them. `--image` is required unless the released CLI embeds its matching default image. Tag references are accepted; a digest pin (`IMAGE@sha256:DIGEST`) is optional but recommended, and every plan warns when the image is a mutable tag. `--exclude-cidr` records routes that best-effort automatic mesh CIDR selection must avoid.
 
 `--relay-transport` selects `tcp` or `wss` and defaults to `tcp`. `--relay-endpoint` is `HOST:PORT` for TCP NodePort/external relays and `wss://HOST/PATH` for WSS. Managed WSS installs deploy Service `wirekube-relay-ws` as the HTTP backend, while the user supplies the trusted TLS Gateway or Ingress represented by the WSS URL. `--relay-udp-endpoint` is the independent raw WireGuard endpoint for external peer invites; TCP NodePort derives `HOST:30479`, WSS NodePort requires an explicit `HOST:30479`, and external relay mode accepts any valid UDP `HOST:PORT`.
 
@@ -136,6 +136,6 @@ WireKube supports one installation per cluster because the mesh, CRDs, and RBAC 
 
 `mesh init` creates the default mesh when it is absent. When the mesh already exists, it patches only flags explicitly provided on the command line and never replaces the complete spec.
 
-`uninstall` preserves CRDs and custom resources by default. `--purge` is rejected unless `--confirm-purge` is also present, and `--yes` alone never authorizes purge.
+`uninstall` preserves CRDs and custom resources by default. `--purge` is rejected unless `--confirm-purge` is also present. `uninstall --dry-run` lists what would be deleted and what would be kept without touching the cluster; it deletes nothing, so run it first when the installation is carrying traffic.
 
 `wirekubectl token create` is currently a placeholder that prints guidance and does not issue a token. The WSS relay uses Kubernetes `kubectl create token` and TokenReview instead.

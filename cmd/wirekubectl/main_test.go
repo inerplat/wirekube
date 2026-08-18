@@ -106,7 +106,7 @@ func TestUninstallPurgeRequiresSeparateConfirmationFlag(t *testing.T) {
 	options.output = "text"
 	t.Cleanup(func() { options.output = oldOutput })
 	cmd := newRootCommand()
-	cmd.SetArgs([]string{"uninstall", "--purge", "--yes"})
+	cmd.SetArgs([]string{"uninstall", "--purge"})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	err := cmd.ExecuteContext(context.Background())
@@ -115,17 +115,26 @@ func TestUninstallPurgeRequiresSeparateConfirmationFlag(t *testing.T) {
 	}
 }
 
-func TestInstallJSONRequiresNonInteractiveAcknowledgement(t *testing.T) {
-	oldOutput := options.output
-	options.output = "text"
-	t.Cleanup(func() { options.output = oldOutput })
-	cmd := newRootCommand()
-	cmd.SetArgs([]string{"install", "--output", "json"})
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	err := cmd.ExecuteContext(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "--yes or --dry-run") {
-		t.Fatalf("error=%v", err)
+// Nothing prompts any more, so --yes has no meaning on any command. uninstall
+// registers its own flag set rather than sharing addLifecycleFlags, so it can
+// regain the flag without install noticing; assert flag absence directly on
+// each command instead of relying on one command or on pflag's wording.
+func TestNoCommandAcceptsRemovedYesFlag(t *testing.T) {
+	for _, name := range []string{"install", "upgrade", "manifest", "uninstall"} {
+		t.Run(name, func(t *testing.T) {
+			var found *cobra.Command
+			for _, sub := range newRootCommand().Commands() {
+				if sub.Name() == name {
+					found = sub
+				}
+			}
+			if found == nil {
+				t.Fatalf("command %q is missing", name)
+			}
+			if flag := found.Flags().Lookup("yes"); flag != nil {
+				t.Errorf("command %q still registers --yes", name)
+			}
+		})
 	}
 }
 

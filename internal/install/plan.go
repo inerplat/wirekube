@@ -87,9 +87,6 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 		return Plan{}, options, err
 	}
 	autoMeshCIDR := options.MeshCIDR == "auto"
-	if autoMeshCIDR && options.Yes && !options.DryRun {
-		return Plan{}, options, fmt.Errorf("--mesh-cidr must be explicit for non-interactive installation; automatic selection cannot inspect every VPC, corporate, or node route (use --exclude-cidr during dry-run to evaluate candidates)")
-	}
 	if options.MeshCIDR == "auto" {
 		cidr, err := p.selectMeshCIDR(ctx, options.ExcludeCIDRs)
 		if err != nil {

@@ -46,7 +46,6 @@ type Options struct {
 	ListenPort         int32
 	ImagePullSecrets   []string
 	ExcludeCIDRs       []string
-	Yes                bool
 	DryRun             bool
 	Adopt              bool
 	Timeout            time.Duration
@@ -141,9 +140,6 @@ func (o *Options) Normalize() error {
 		o.ImagePullSecrets[i] = trimmed
 	}
 	if o.Relay == "" {
-		if o.Yes {
-			return fmt.Errorf("--relay must be specified when --yes is used")
-		}
 		o.Relay = RelayLoadBalancer
 	}
 	if o.AgentAPIServer = strings.TrimSpace(o.AgentAPIServer); o.AgentAPIServer != "" && !isInClusterAgentAPIServer(o.AgentAPIServer) {

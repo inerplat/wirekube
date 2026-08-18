@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -41,7 +40,6 @@ type lifecycleFlags struct {
 	listenPort         int32
 	imagePullSecrets   []string
 	excludeCIDRs       []string
-	yes                bool
 	dryRun             bool
 	adopt              bool
 }
@@ -89,9 +87,6 @@ func installCmd() *cobra.Command {
 		Short: "Plan and install WireKube without a source checkout",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if options.output == "json" && !flags.yes && !flags.dryRun {
-				return fmt.Errorf("--output=json requires --yes or --dry-run")
-			}
 			plan, normalized, installer, err := buildInstallationPlan(cmd, flags)
 			if err != nil {
 				return err
@@ -101,15 +96,6 @@ func installCmd() *cobra.Command {
 			}
 			if options.output == "text" {
 				writePlanText(cmd.OutOrStdout(), plan)
-				if !flags.yes {
-					confirmed, err := confirm(cmd.InOrStdin(), cmd.OutOrStdout(), "Install? [y/N] ")
-					if err != nil {
-						return err
-					}
-					if !confirmed {
-						return fmt.Errorf("installation cancelled")
-					}
-				}
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), options.timeout)
 			defer cancel()
@@ -131,9 +117,6 @@ func upgradeCmd() *cobra.Command {
 		Short: "Upgrade resources owned by an existing wirekubectl installation",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if options.output == "json" && !flags.yes && !flags.dryRun {
-				return fmt.Errorf("--output=json requires --yes or --dry-run")
-			}
 			factory := kubeFactory()
 			c, err := factory.Client()
 			if err != nil {
@@ -153,15 +136,8 @@ func upgradeCmd() *cobra.Command {
 			if flags.dryRun {
 				return writePlan(cmd.OutOrStdout(), plan)
 			}
-			if options.output == "text" && !flags.yes {
+			if options.output == "text" {
 				writePlanText(cmd.OutOrStdout(), plan)
-				confirmed, err := confirm(cmd.InOrStdin(), cmd.OutOrStdout(), "Upgrade? [y/N] ")
-				if err != nil || !confirmed {
-					if err != nil {
-						return err
-					}
-					return fmt.Errorf("upgrade cancelled")
-				}
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), options.timeout)
 			defer cancel()
@@ -626,30 +602,14 @@ func writeDoctorResult(cmd *cobra.Command, result doctorOutput) error {
 }
 
 func uninstallCmd() *cobra.Command {
-	var purge, confirmPurge, yes bool
+	var purge, confirmPurge, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Remove managed workloads while preserving CRDs and custom resources",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if options.output == "json" && !yes {
-				return fmt.Errorf("--output=json requires --yes")
-			}
 			if purge && !confirmPurge {
-				return fmt.Errorf("--purge requires --confirm-purge; --yes does not imply destructive data deletion")
-			}
-			if !yes {
-				prompt := "Uninstall managed workloads? [y/N] "
-				if purge {
-					prompt = "Permanently delete WireKube CRDs and all custom resources? [y/N] "
-				}
-				confirmed, err := confirm(cmd.InOrStdin(), cmd.OutOrStdout(), prompt)
-				if err != nil || !confirmed {
-					if err != nil {
-						return err
-					}
-					return fmt.Errorf("uninstall cancelled")
-				}
+				return fmt.Errorf("--purge requires --confirm-purge: destructive CRD and custom-resource deletion is never implied")
 			}
 			c, err := kubeFactory().Client()
 			if err != nil {
@@ -657,7 +617,18 @@ func uninstallCmd() *cobra.Command {
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), options.timeout)
 			defer cancel()
-			inventory, err := (internalinstall.Installer{Client: c}).Uninstall(ctx, options.namespace, purge)
+			installer := internalinstall.Installer{Client: c}
+			// install and upgrade can be previewed with --dry-run, and nothing
+			// prompts any more, so uninstall needs the same preview or it is
+			// the one destructive command with no way to see it coming.
+			if dryRun {
+				inventory, err := installer.LoadInventory(ctx, options.namespace)
+				if err != nil {
+					return err
+				}
+				return writeUninstallPlan(cmd, inventory, purge)
+			}
+			inventory, err := installer.Uninstall(ctx, options.namespace, purge)
 			if err != nil {
 				return err
 			}
@@ -666,8 +637,48 @@ func uninstallCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&purge, "purge", false, "also delete all WireKube custom resources and CRDs")
 	cmd.Flags().BoolVar(&confirmPurge, "confirm-purge", false, "explicitly authorize destructive CRD and custom-resource deletion")
-	cmd.Flags().BoolVar(&yes, "yes", false, "skip the ordinary uninstall confirmation")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "list the resources uninstall would delete without deleting them")
 	return cmd
+}
+
+// writeUninstallPlan reports what an uninstall would remove. Preserved
+// resources are listed too: "kept" is as much a part of the decision as
+// "deleted", and CRDs move between the two depending on --purge.
+func writeUninstallPlan(cmd *cobra.Command, inventory *internalinstall.Inventory, purge bool) error {
+	deleted := []string{}
+	kept := []string{}
+	for index := len(inventory.Resources) - 1; index >= 0; index-- {
+		resource := inventory.Resources[index]
+		name := fmt.Sprintf("%s/%s", resource.Kind, resource.Name)
+		switch {
+		case !resource.Preserve:
+			deleted = append(deleted, name)
+		case purge && resource.Kind == "CustomResourceDefinition":
+			deleted = append(deleted, name)
+		default:
+			kept = append(kept, name)
+		}
+	}
+	if options.output == "json" {
+		return writeResult(cmd, map[string]any{
+			"operation": "uninstall", "dryRun": true, "purged": purge,
+			"installationID": inventory.InstallationID, "deleted": deleted, "kept": kept,
+		}, "")
+	}
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "WireKube uninstall plan for installation %s (purge=%t)\n\n", inventory.InstallationID, purge)
+	fmt.Fprintf(out, "Deletes (%d)\n", len(deleted))
+	for _, name := range deleted {
+		fmt.Fprintf(out, "  - %s\n", name)
+	}
+	fmt.Fprintf(out, "Keeps (%d)\n", len(kept))
+	for _, name := range kept {
+		fmt.Fprintf(out, "  - %s\n", name)
+	}
+	if purge {
+		fmt.Fprintf(out, "\nWARNING: --purge also deletes every WireKube custom resource in the cluster\n")
+	}
+	return nil
 }
 
 func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
@@ -683,7 +694,6 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().Int32Var(&flags.listenPort, "listen-port", 0, "WireGuard UDP listen port shared by every agent (default: the existing mesh's port, else 51820)")
 	cmd.Flags().StringSliceVar(&flags.imagePullSecrets, "image-pull-secret", nil, "existing Secret name attached to every rendered Pod for private-registry pulls; may be repeated")
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")
-	cmd.Flags().BoolVar(&flags.yes, "yes", false, "apply the displayed plan without prompting")
 	cmd.Flags().BoolVar(&flags.dryRun, "dry-run", false, "inspect and print the plan without mutating the cluster")
 	cmd.Flags().BoolVar(&flags.adopt, "adopt", false, "explicitly adopt conflicting existing resources, taking over their field ownership")
 }
@@ -707,7 +717,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 		return internalinstall.Plan{}, internalinstall.Options{}, installer, err
 	}
 	installOptions := internalinstall.Options{
-		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ImagePullSecrets: flags.imagePullSecrets, ExcludeCIDRs: flags.excludeCIDRs, Yes: flags.yes, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
+		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ImagePullSecrets: flags.imagePullSecrets, ExcludeCIDRs: flags.excludeCIDRs, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
 	}
 	plan, normalized, err := (internalinstall.Planner{Client: c, Discovery: discovery, AccessReviewer: internalinstall.SelfSubjectAccessReviewer{Client: c}}).Build(cmd.Context(), installOptions)
 	return plan, normalized, installer, err
@@ -807,20 +817,6 @@ func writeLifecycleResult(cmd *cobra.Command, result internalinstall.Result) err
 		fmt.Fprintf(cmd.OutOrStdout(), "  The resources are installed and recorded; readiness is not complete: %s\n", result.NotReadyReason)
 	}
 	return nil
-}
-
-func confirm(in io.Reader, out io.Writer, prompt string) (bool, error) {
-	fmt.Fprint(out, prompt)
-	line, err := bufio.NewReader(in).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return false, err
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true, nil
-	default:
-		return false, nil
-	}
 }
 
 func messageForError(err error, success string) string {

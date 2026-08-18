@@ -53,7 +53,7 @@ before selecting NodePort, WSS, or an external relay.
 
 ## Preview the installation
 
-Interactive dry run performs discovery and prints the exact plan without
+Dry run performs discovery and prints the exact plan without
 creating resources:
 
 ```bash
@@ -69,8 +69,7 @@ provide `--mesh-cidr` when the CLI cannot know every routed network.
 
 ## Install WireKube
 
-Run the same command without `--dry-run`. The interactive prompt is the final
-approval boundary:
+Run the same command without `--dry-run`:
 
 ```bash
 wirekubectl install \
@@ -78,7 +77,9 @@ wirekubectl install \
   --context "${WIREKUBE_CONTEXT}"
 ```
 
-Automation must make infrastructure choices explicit:
+`install` applies the plan it prints; there is no confirmation step. Run it with `--dry-run` first when you want to see the plan without touching the cluster.
+
+Automation should still state its infrastructure choices rather than inherit defaults:
 
 ```bash
 wirekubectl install \
@@ -87,7 +88,6 @@ wirekubectl install \
   --relay load-balancer \
   --mesh-cidr 100.96.0.0/11 \
   --node-addresses internal-ip \
-  --yes \
   --output json
 ```
 

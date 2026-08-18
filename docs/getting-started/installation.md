@@ -10,7 +10,7 @@ wirekubectl version
 ```
 
 The formula installs only the client. It does not modify a Kubernetes cluster.
-Run a dry run before approving the cluster-wide CRDs, privileged agent, and
+Run a dry run to see the cluster-wide CRDs, privileged agent, and
 relay topology:
 
 ```bash
@@ -44,26 +44,26 @@ chmod +x wirekubectl-linux-amd64
 sudo install wirekubectl-linux-amd64 /usr/local/bin/wirekubectl
 ```
 
-The released CLI contains the matching immutable container image digest. Interactive installation inspects the target cluster and prints the complete resource and infrastructure plan before making changes:
+The released CLI contains the matching immutable container image digest. Installation inspects the target cluster and prints the complete resource and infrastructure plan, then applies it:
 
 ```bash
 wirekubectl install --kubeconfig ~/.kube/config --context my-cluster
 ```
 
-Non-interactive installation must explicitly select the relay topology, especially when it creates a public LoadBalancer:
+`install` prints the plan and applies it in the same run; nothing prompts for confirmation, so `--dry-run` is the way to inspect a plan first. An unset `--relay` defaults to `load-balancer`, which creates public LoadBalancer Services, so state the topology explicitly rather than inheriting it:
 
 ```bash
-wirekubectl install --kubeconfig ~/.kube/config --context my-cluster --relay load-balancer --mesh-cidr 100.96.0.0/11 --node-addresses internal-ip --yes --output json
+wirekubectl install --kubeconfig ~/.kube/config --context my-cluster --relay load-balancer --mesh-cidr 100.96.0.0/11 --node-addresses internal-ip --output json
 ```
 
-Use `--dry-run` to inspect the same plan without creating the Namespace, CRDs, or any workloads. Automatic mesh CIDR selection is best effort because the CLI cannot inspect every VPC, corporate, or node route; add known routes with `--exclude-cidr`, review the selected candidate, and provide an explicit `--mesh-cidr` for non-interactive installation. Use `wirekubectl manifest` to render the exact resources selected by the plan.
+Use `--dry-run` to inspect the same plan without creating the Namespace, CRDs, or any workloads. Automatic mesh CIDR selection is best effort because the CLI cannot inspect every VPC, corporate, or node route; add known routes with `--exclude-cidr`, review the selected candidate with `--dry-run`, and provide an explicit `--mesh-cidr` in automation. Use `wirekubectl manifest` to render the exact resources selected by the plan.
 
 `--relay load-balancer` creates separate TCP and UDP LoadBalancer Services by default so raw TCP relay clients and external WireGuard peers both have a usable entry point without relying on mixed-protocol LoadBalancer support. Use `--relay-udp=false` only when the installation must remain TCP-only. With `--relay node-port --relay-transport tcp`, agents use TCP NodePort `30478` while optional external WireGuard traffic uses UDP NodePort `30479`; supply the reachable node address as `--relay-endpoint HOST:30478` and enable the UDP Service with `--relay-udp`.
 
 Use `--relay-transport wss` when agents must enter through an HTTPS-aware load balancer, Gateway, or Ingress. The installer deploys the authenticated `wirekube-relay-ws` HTTP backend and configures agents to use the supplied public WSS URL; it does not create the hostname, certificate, Gateway, Ingress, or HTTPRoute. Pre-create the selected namespace if necessary, then create the TLS route to Service `wirekube-relay-ws` port `8081` before installation so the readiness wait can complete; `wirekubectl` preserves an existing Namespace.
 
 ```bash
-wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.example.com/relay --mesh-cidr 100.96.0.0/11 --yes
+wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.example.com/relay --mesh-cidr 100.96.0.0/11
 ```
 
 In WSS load-balancer mode, the installer creates the UDP LoadBalancer by default and keeps the WebSocket backend as ClusterIP for the existing TLS Gateway or Ingress; it does not create an unused raw TCP LoadBalancer. In WSS NodePort mode, Service `wirekube-relay-ws` exposes plain HTTP/WebSocket on NodePort `30478` for an upstream TLS terminator. If external WireGuard peers also need the UDP NodePort, add `--relay-udp --relay-udp-endpoint HOST:30479` because the WSS hostname and the reachable UDP node address may differ.
@@ -83,7 +83,7 @@ wirekubectl uninstall
 
 `wirekubectl upgrade` keeps the stored topology unless flags override it and uses the immutable image digest embedded in the new released CLI. Upgrade snapshots existing objects and inventory before mutation; readiness, inventory, or stale-resource deletion failures restore the previous objects and inventory. Resources removed from the selected topology, such as a disabled UDP relay Service, are deleted only when their inventory ownership is still valid.
 
-Default uninstall removes resources recorded in the installation inventory while preserving CRDs and WireKube custom resources. Destructive removal requires both `--purge` and `--confirm-purge`; ordinary `--yes` never implies data deletion.
+`uninstall --dry-run` prints the resources that would be deleted and those that would be kept, without deleting anything. Default uninstall removes resources recorded in the installation inventory while preserving CRDs and WireKube custom resources. Destructive removal requires both `--purge` and `--confirm-purge`; `--purge` alone never authorizes data deletion.
 
 ## Container Image
 

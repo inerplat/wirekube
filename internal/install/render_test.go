@@ -18,10 +18,16 @@ import (
 
 const testImage = "registry.example.test/wirekube@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-func TestOptionsRequireExplicitRelayForNonInteractiveInstall(t *testing.T) {
-	options := Options{Image: testImage, Yes: true}
-	if err := options.Normalize(); err == nil || !strings.Contains(err.Error(), "--relay must be specified") {
+// Nothing prompts for a relay mode, so an unset --relay has to resolve to a
+// working default rather than an error; the plan's LoadBalancer cost warning is
+// what tells the operator what was chosen.
+func TestOptionsDefaultRelayWhenUnset(t *testing.T) {
+	options := Options{Image: testImage}
+	if err := options.Normalize(); err != nil {
 		t.Fatalf("error=%v", err)
+	}
+	if options.Relay != RelayLoadBalancer {
+		t.Errorf("relay=%q, want %q", options.Relay, RelayLoadBalancer)
 	}
 }
 
@@ -664,15 +670,30 @@ func TestPlannerAvoidsOccupiedCIDRsWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestPlannerRequiresExplicitMeshCIDRForNonInteractiveInstall(t *testing.T) {
+// Automatic CIDR selection used to be refused outside a dry run. With no
+// prompt there is no interactive install to distinguish it from, so a bare
+// install has to resolve a CIDR and carry the best-effort warning.
+func TestPlannerResolvesAutoMeshCIDRForApply(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	_, _, err := (Planner{Client: c}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, MeshCIDR: "auto", Yes: true, WireKubeVersion: "v1.0.0"})
-	if err == nil || !strings.Contains(err.Error(), "--mesh-cidr must be explicit") {
+	plan, normalized, err := (Planner{Client: c}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, MeshCIDR: "auto", WireKubeVersion: "v1.0.0"})
+	if err != nil {
 		t.Fatalf("error=%v", err)
+	}
+	if normalized.MeshCIDR == "auto" || normalized.MeshCIDR == "" {
+		t.Errorf("mesh CIDR was not resolved: %q", normalized.MeshCIDR)
+	}
+	found := false
+	for _, warning := range plan.Warnings {
+		if strings.Contains(warning, "automatic mesh CIDR selection is best effort") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("missing best-effort CIDR warning: %v", plan.Warnings)
 	}
 }
 
@@ -682,7 +703,7 @@ func TestPlannerAllowsAutoMeshCIDRForNonMutatingDryRunWithWarning(t *testing.T) 
 		t.Fatal(err)
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	plan, _, err := (Planner{Client: c}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, MeshCIDR: "auto", Yes: true, DryRun: true, WireKubeVersion: "v1.0.0"})
+	plan, _, err := (Planner{Client: c}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, MeshCIDR: "auto", DryRun: true, WireKubeVersion: "v1.0.0"})
 	if err != nil {
 		t.Fatal(err)
 	}

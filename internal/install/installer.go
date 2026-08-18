@@ -88,7 +88,6 @@ func (i Installer) Apply(ctx context.Context, plan Plan, options Options, operat
 	// leave no budget to save the inventory, and that failure would roll back
 	// resources that are already applied and carrying traffic.
 	storedOptions := options
-	storedOptions.Yes = false
 	storedOptions.DryRun = false
 	storedOptions.Adopt = false
 	inventory := Inventory{
