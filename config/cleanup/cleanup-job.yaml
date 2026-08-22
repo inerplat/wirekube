@@ -6,6 +6,10 @@
 # The agent intentionally preserves WireGuard kernel state across pod restarts
 # for zero-downtime operation. Run this job only when decommissioning a node.
 #
+# To rebuild a node's dataplane in place instead (node stays in the mesh), set
+# WIREKUBE_CLEAN_STATE=true on the agent container and restart its pod: the
+# next start tears everything down once and recreates it.
+#
 # Usage:
 #   1. Replace NODE_NAME with the target node name.
 #   2. Delete the WireKubePeer CR for this node:
@@ -50,6 +54,15 @@ spec:
               iptables -t filter -D KUBE-FIREWALL \
                 -m mark --mark "$MARK" -d 127.0.0.0/8 -j ACCEPT \
                 -m comment --comment "wirekube: allow WG relay proxy on loopback" 2>/dev/null || true
+
+              # Remove gateway SNAT rules (tagged wirekube-gw); shutdown no
+              # longer removes them, so a decommission must.
+              iptables-save -t nat 2>/dev/null | \
+                grep -- '-A POSTROUTING' | grep -- '--comment wirekube-gw' | \
+                sed 's/^-A /-D /' | while read -r rule; do
+                  # shellcheck disable=SC2086
+                  iptables -t nat $rule 2>/dev/null || true
+                done
 
               # Flush routes in WireKube table
               ip route flush table 22347 2>/dev/null || true

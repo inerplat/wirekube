@@ -123,15 +123,17 @@ The bundled DaemonSet currently uses `dnsPolicy: Default`. If `provider: managed
 
 ### Cleanup and Reconciliation
 
-The default DaemonSet does not include an initContainer. During graceful shutdown the agent removes the relay clients, routes, routing rules, and TUN interface. During startup and periodic sync it recreates or repairs required interface and routing state.
+The default DaemonSet does not include an initContainer. During graceful shutdown the agent closes only process-owned resources; the persistent TUN, routes, and routing rules stay in place so a rolling update does not disturb forwarding decisions. During startup and periodic sync it adopts, recreates, or repairs interface and routing state.
 
-- Graceful shutdown removes the `wire_kube` interface and WireKube routes
+- The `wire_kube` interface and WireKube routes persist across agent restarts
 - Routing rule reconciliation repairs missing or stale rules
-- The separate cleanup Job is available for abandoned node state
+- `WIREKUBE_CLEAN_STATE=true` rebuilds a node's state once at the next agent start
+- The separate cleanup Job removes all state from a decommissioned node
 
 ### IPSec xfrm Bypass
 
-On startup, the agent sets `disable_xfrm=1` and `disable_policy=1` on the WireGuard
+On startup, whether it creates the interface or adopts a surviving one, the agent
+sets `disable_xfrm=1` and `disable_policy=1` on the WireGuard
 interface via `/proc/sys/net/ipv4/conf/<iface>/`. This prevents IPSec xfrm policies
 from intercepting WireGuard traffic in environments with existing
 site-to-site IPSec tunnels.

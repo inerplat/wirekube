@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -102,6 +103,7 @@ func (u *UserspaceEngine) EnsureInterface() error {
 		return fmt.Errorf("creating TUN %s: %w", u.ifaceName, err)
 	}
 	u.tunDev = tunDev
+	persistTUN(tunDev, u.ifaceName)
 
 	// Look up link for routing operations.
 	link, err := netlink.LinkByName(u.ifaceName)
@@ -140,6 +142,14 @@ func (u *UserspaceEngine) attachExistingTUN() error {
 		return fmt.Errorf("reattaching TUN %s: %w", u.ifaceName, err)
 	}
 	u.tunDev = tunDev
+	persistTUN(tunDev, u.ifaceName)
+
+	// Adoption is the normal restart path now, so it must reassert the same
+	// sysctls the create path sets: another component may have tightened
+	// rp_filter or reinstalled xfrm policies while the previous agent held
+	// the device, and an agent restart is the operator's self-heal for that.
+	setRpFilterForIface(u.ifaceName)
+	disableXfrmForIface(u.ifaceName)
 
 	u.bind = NewWireKubeBind()
 	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
@@ -360,11 +370,23 @@ func (u *UserspaceEngine) SetAddress(meshIP string) error {
 	}
 	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}
 
+	// The TUN is exclusively wirekube's, so every IPv4 address on it is ours
+	// to reconcile. Without teardown on shutdown, a mesh CIDR change while
+	// the agent was down would otherwise leave the old mesh IP alongside the
+	// new one forever.
+	present := false
 	addrs, _ := netlink.AddrList(link, syscall.AF_INET)
-	for _, a := range addrs {
-		if a.IP.Equal(ip) {
-			return nil
+	for _, existing := range addrs {
+		if existing.IP.Equal(ip) {
+			present = true
+			continue
 		}
+		if err := netlink.AddrDel(link, &existing); err != nil {
+			log.Printf("[usp] removing stale address %s from %s: %v", existing.IPNet, u.ifaceName, err)
+		}
+	}
+	if present {
+		return nil
 	}
 	return netlink.AddrAdd(link, addr)
 }
@@ -412,25 +434,34 @@ func (u *UserspaceEngine) InterfaceExists() bool {
 	return err == nil
 }
 
-// ConfigMatchesKey returns true if the wireguard-go device is configured with
-// the same private key as the provided KeyPair.
-func (u *UserspaceEngine) ConfigMatchesKey(kp *KeyPair) bool {
-	if u.wgDev == nil {
-		return false
+// persistTUN marks the TUN with TUNSETPERSIST so it outlives this process.
+// Addresses and routes then survive an agent restart and the next process
+// reattaches instead of rebuilding the dataplane. Set on reattach as well so
+// a device created by an older agent is upgraded the first time it is
+// adopted. Best effort: without persistence the restart is merely cold, so
+// failure is logged, not returned.
+func persistTUN(dev tun.Device, name string) {
+	f := dev.File()
+	if f == nil {
+		log.Printf("[usp] cannot persist %s: TUN exposes no file descriptor", name)
+		return
 	}
-	output, err := u.wgDev.IpcGet()
+	// SyscallConn keeps the fd's non-blocking registration intact; File.Fd()
+	// is the API the runtime documentation steers ioctl users away from, and
+	// wireguard-go itself uses SyscallConn for its TUN ioctls.
+	sc, err := f.SyscallConn()
 	if err != nil {
-		return false
+		log.Printf("[usp] cannot persist %s: %v", name, err)
+		return
 	}
-	wantHex := keyToHex(kp.PrivateKeyBase64())
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "private_key=") {
-			return strings.TrimPrefix(line, "private_key=") == wantHex
-		}
+	var ioctlErr error
+	if ctrlErr := sc.Control(func(fd uintptr) {
+		ioctlErr = unix.IoctlSetInt(int(fd), unix.TUNSETPERSIST, 1)
+	}); ctrlErr != nil {
+		log.Printf("[usp] TUNSETPERSIST on %s failed: %v", name, ctrlErr)
+	} else if ioctlErr != nil {
+		log.Printf("[usp] TUNSETPERSIST on %s failed: %v", name, ioctlErr)
 	}
-	return false
 }
 
 // SetPeerPath updates the Bind's pathTable atomically so that Send routes

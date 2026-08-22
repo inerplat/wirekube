@@ -632,7 +632,10 @@ func uninstallCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeResult(cmd, map[string]any{"operation": "uninstall", "purged": purge, "installationID": inventory.InstallationID}, fmt.Sprintf("WireKube installation %s removed (purge=%t)\n", inventory.InstallationID, purge))
+			text := fmt.Sprintf("WireKube installation %s removed (purge=%t)\n"+
+				"Node dataplane state (WireGuard interface, routes, ip rules) persists on each node;\n"+
+				"run config/cleanup/cleanup-job.yaml per node when decommissioning.\n", inventory.InstallationID, purge)
+			return writeResult(cmd, map[string]any{"operation": "uninstall", "purged": purge, "installationID": inventory.InstallationID, "nodeStateRetained": true}, text)
 		},
 	}
 	cmd.Flags().BoolVar(&purge, "purge", false, "also delete all WireKube custom resources and CRDs")
@@ -675,6 +678,7 @@ func writeUninstallPlan(cmd *cobra.Command, inventory *internalinstall.Inventory
 	for _, name := range kept {
 		fmt.Fprintf(out, "  - %s\n", name)
 	}
+	fmt.Fprintf(out, "  - per-node dataplane state (WireGuard interface, routes, ip rules); run config/cleanup/cleanup-job.yaml per node when decommissioning\n")
 	if purge {
 		fmt.Fprintf(out, "\nWARNING: --purge also deletes every WireKube custom resource in the cluster\n")
 	}

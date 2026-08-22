@@ -10,7 +10,12 @@ On startup, the agent validates the interface name and type:
 - **Legacy kernel WireGuard link:** The engine deletes it and migrates to a userspace TUN.
 - **Foreign interface with the same name:** Startup fails rather than deleting an interface it does not own.
 
-During graceful shutdown the agent closes relay connections, flushes WireKube routes, removes routing rules, and deletes the TUN interface. Relay connections reconnect with exponential backoff after the next startup.
+During graceful shutdown the agent closes relay connections and hole-punch sockets and leaves the dataplane in place: the persistent TUN, its addresses, WireKube routes, routing rules, and gateway SNAT rules all survive the restart, and the next agent reattaches and reconciles them. While no agent is running, packets matching the preserved routes are dropped at the TUN rather than falling back to the underlay; the window is the pod restart itself.
+
+Kernel state is removed only on explicit request:
+
+- `WIREKUBE_CLEAN_STATE=true` on the agent container tears everything down once at the next start and rebuilds it. The flag stays in effect until removed, so unset it after the node comes back clean.
+- The cleanup Job (`config/cleanup/`) removes all state from a node being decommissioned, where no next start exists.
 
 !!! note "Restart impact"
     Restart duration depends on pod scheduling, Kubernetes API access, endpoint discovery, and relay availability. Treat agent restarts as a short network interruption and use rollout settings appropriate for the workload.

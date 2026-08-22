@@ -32,7 +32,6 @@ type WGEngine interface {
 	InterfaceName() string
 	ListenPort() int
 	InterfaceExists() bool
-	ConfigMatchesKey(kp *KeyPair) bool
 
 	// Peer management
 	SyncPeers(peers []PeerConfig) error

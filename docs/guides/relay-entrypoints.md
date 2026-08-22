@@ -151,7 +151,7 @@ The base DaemonSet excludes `wirekube.io/agent-canary=true` nodes and carries a 
 kubectl -n wirekube-system get pods -o wide --field-selector spec.nodeName=<node>
 ```
 
-Two agents on one node share `/var/lib/wirekube` and the interface name. They present the same public key, so the relay evicts each session as the other registers — visible as `peer registered`/`peer disconnected` for one peer id several times a second in the relay log, and `relay-client: read error: EOF` in both agents. Removing the label then stops the churn, but the departing pod's shutdown deletes the interface the surviving agent was using.
+Two agents on one node share `/var/lib/wirekube` and the interface name. They present the same public key, so the relay evicts each session as the other registers — visible as `peer registered`/`peer disconnected` for one peer id several times a second in the relay log, and `relay-client: read error: EOF` in both agents. Removing the label stops the churn; the departing pod leaves the dataplane in place, so the surviving agent keeps its interface.
 
 To roll back, remove the label first and confirm the remaining agent still holds its interface:
 

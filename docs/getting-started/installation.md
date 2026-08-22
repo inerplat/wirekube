@@ -136,7 +136,7 @@ kubectl apply -f config/agent/rbac.yaml
 kubectl apply -f config/agent/daemonset.yaml
 ```
 
-The DaemonSet runs with `hostNetwork: true`, `dnsPolicy: Default`, `privileged: true`, and `appArmorProfile: Unconfined`. It does not include an initContainer; the agent removes routes and the TUN interface during graceful shutdown and reconciles stale routing state during startup and periodic sync.
+The DaemonSet runs with `hostNetwork: true`, `dnsPolicy: Default`, `privileged: true`, and `appArmorProfile: Unconfined`. It does not include an initContainer; the agent leaves the interface, routes, and routing rules in place across restarts and reconciles them during startup and periodic sync. Set `WIREKUBE_CLEAN_STATE=true` on the container to rebuild a node's state once at the next start, or run the cleanup Job when decommissioning a node.
 
 ### 4. (Optional) Relay
 
