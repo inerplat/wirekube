@@ -35,6 +35,15 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 		return nil
 	}
 	if len(gwList.Items) == 0 {
+		// Shutdown no longer removes SNAT rules, so a node that stops being a
+		// gateway while its agent is down would keep masquerading forever if
+		// this path just returned. Reconcile to the empty set when there is
+		// in-process state to clear or when this process has not yet checked
+		// the kernel for rules a previous run left behind.
+		if a.gwState != nil || !a.gwRetainedRulesChecked {
+			a.cleanupGateway()
+			a.gwRetainedRulesChecked = true
+		}
 		return nil
 	}
 

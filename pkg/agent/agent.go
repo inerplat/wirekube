@@ -136,6 +136,10 @@ type Agent struct {
 	// the adoption preserved; one deferred replacement keeps them until real
 	// handshake state exists.
 	keepRoutesUntilHandshakes bool
+	// gwRetainedRulesChecked marks that this process has reconciled gateway
+	// SNAT rules a previous run may have left in the kernel, so the
+	// no-gateways path scans iptables once per process instead of every sync.
+	gwRetainedRulesChecked bool
 	// gwClientCache maps gateway CIDR → set of authorized client peer names.
 	// Rebuilt every sync cycle. nil means not yet built.
 	gwClientCache map[string]map[string]bool

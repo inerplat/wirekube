@@ -140,10 +140,23 @@ func SyncRoutesForLink(linkIndex int, preferredSrc net.IP, desired []string) err
 		desiredSet[ipnet.String()] = struct{}{}
 	}
 
-	routeFilter := &netlink.Route{Table: WKRouteTable, LinkIndex: linkIndex}
-	current, err := netlink.RouteListFiltered(syscall.AF_INET, routeFilter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
+	// The WireKube table belongs to exactly one agent per node, so any entry
+	// on a different link is a leftover from a previous interface name. Those
+	// routes point into a persistent TUN nothing reads (the rename means no
+	// engine will ever adopt it), so they blackhole traffic until removed.
+	// Reconciled every sync, same as the ip rules.
+	all, err := netlink.RouteListFiltered(syscall.AF_INET, &netlink.Route{Table: WKRouteTable}, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return fmt.Errorf("listing routes: %w", err)
+	}
+	current := all[:0:0]
+	for _, r := range all {
+		if r.LinkIndex != linkIndex {
+			log.Printf("[wk-routes] removing route %v owned by another link (index %d); the interface name changed", r.Dst, r.LinkIndex)
+			_ = netlink.RouteDel(&r)
+			continue
+		}
+		current = append(current, r)
 	}
 
 	for _, r := range current {
