@@ -314,6 +314,41 @@ spec:
                 required:
                 - provider
                 type: object
+              routing:
+                description: |-
+                  Routing controls which candidate routes each agent installs into the
+                  WireKube policy-routing table.
+                properties:
+                  excludeCIDRs:
+                    description: |-
+                      ExcludeCIDRs lists destinations no agent may ever install into the
+                      WireKube table, regardless of reachability: corporate ranges this mesh
+                      must never carry outbound. Only route installation is affected; inbound
+                      traffic admitted by AllowedIPs is not. Matching is by containment in route units; routes are
+                      never split, so an entry only overrides a broader gateway route when it
+                      contains that route entirely. Mesh overlay host routes rank above this
+                      list: they exist only inside the tunnel, so excluding one would sever
+                      the address rather than fall back to the main table.
+                    items:
+                      type: string
+                    type: array
+                  localSubnetPolicy:
+                    default: bypass
+                    description: |-
+                      LocalSubnetPolicy decides what happens when a peer's advertised address
+                      is on a segment the observing node can already reach without the
+                      tunnel. "bypass" (default) suppresses the tunnel route so same-segment
+                      traffic stays on the physical link; the suppression additionally
+                      requires cryptographic proof that the peer really is on that segment (a
+                      live authenticated WireGuard handshake with a direct endpoint inside
+                      the same prefix), so VPCs that reuse one private range keep their
+                      tunnel routes. "tunnel" keeps today's behavior and encrypts
+                      same-segment traffic too.
+                    enum:
+                    - bypass
+                    - tunnel
+                    type: string
+                type: object
               stunServers:
                 description: |-
                   STUNServers is a list of STUN server addresses used for public endpoint discovery.

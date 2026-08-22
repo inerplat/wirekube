@@ -52,6 +52,12 @@ var (
 		Help:      "Seconds since the last WireGuard handshake.",
 	}, []string{"source", "peer"})
 
+	suppressedRoutes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "suppressed_routes",
+		Help:      "Routes withheld from the WireKube table by routing policy, by reason (local, excluded).",
+	}, []string{"source", "reason"})
+
 	nodeNATType = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "node_nat_type",
@@ -301,4 +307,19 @@ func pingHost(ip string) float64 {
 		}
 	}
 	return -1
+}
+
+// setSuppressedRouteMetrics rewrites the per-reason suppression counts.
+func setSuppressedRouteMetrics(node string, current map[string]string) {
+	counts := map[string]int{"local": 0, "excluded": 0}
+	for _, reason := range current {
+		key := reason
+		if strings.HasPrefix(key, "local") {
+			key = "local"
+		}
+		counts[key]++
+	}
+	for reason, n := range counts {
+		suppressedRoutes.WithLabelValues(node, reason).Set(float64(n))
+	}
 }
