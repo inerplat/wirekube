@@ -26,6 +26,12 @@ import (
 // fwmark/routing-table rules (see routes.go) so local WireGuard sockets bypass
 // the tunnel while everything else routes through it.
 type UserspaceEngine struct {
+	// preservedRoutes holds table-22347 routes captured off an adopted link
+	// before it is cycled down for device creation; Configure reinstalls them
+	// right after bringing the link back up. Admin-down flushes a link's
+	// routes, and the whole point of adoption is that they survive.
+	preservedRoutes []netlink.Route
+
 	ifaceName  string
 	listenPort int
 	mtu        int
@@ -137,6 +143,28 @@ func (u *UserspaceEngine) EnsureInterface() error {
 // attachExistingTUN reopens an existing TUN device by name and creates a new
 // wireguard-go device on it.
 func (u *UserspaceEngine) attachExistingTUN() error {
+	// wireguard-go's TUN event reader must not observe an already-up link
+	// while the device is being created: the queued EventUp races
+	// Configure's BindUpdate sequence (see the deadlock note in
+	// EnsureInterface). The create path starts with the link down by
+	// construction; adoption has to restore that invariant. Downing the link
+	// flushes its routes, so they are captured first and reinstalled by
+	// Configure after it brings the link back up.
+	if link, err := netlink.LinkByName(u.ifaceName); err == nil {
+		if link.Attrs().Flags&net.FlagUp != 0 {
+			routes, listErr := netlink.RouteListFiltered(syscall.AF_INET,
+				&netlink.Route{Table: WKRouteTable, LinkIndex: link.Attrs().Index},
+				netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
+			if listErr == nil {
+				u.preservedRoutes = routes
+			}
+			if err := netlink.LinkSetDown(link); err != nil {
+				return fmt.Errorf("downing adopted TUN %s for device creation: %w", u.ifaceName, err)
+			}
+			log.Printf("[usp] adopted %s cycled down for device creation; %d routes preserved for reinstall", u.ifaceName, len(u.preservedRoutes))
+		}
+	}
+
 	tunDev, err := tun.CreateTUN(u.ifaceName, u.mtu)
 	if err != nil {
 		return fmt.Errorf("reattaching TUN %s: %w", u.ifaceName, err)
@@ -194,6 +222,19 @@ func (u *UserspaceEngine) Configure() error {
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("bringing up TUN %s: %w", u.ifaceName, err)
+	}
+
+	// Reinstall the routes captured before the adopted link was cycled down.
+	// Failures are logged, not fatal: the next sync reconciles the full set.
+	if len(u.preservedRoutes) > 0 {
+		restored := 0
+		for i := range u.preservedRoutes {
+			if err := netlink.RouteReplace(&u.preservedRoutes[i]); err == nil {
+				restored++
+			}
+		}
+		log.Printf("[usp] restored %d/%d preserved routes on %s", restored, len(u.preservedRoutes), u.ifaceName)
+		u.preservedRoutes = nil
 	}
 
 	return EnsureRoutingRules()
