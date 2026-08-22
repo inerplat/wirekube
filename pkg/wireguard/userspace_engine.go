@@ -88,7 +88,12 @@ func (u *UserspaceEngine) EnsureInterface() error {
 			if err := netlink.LinkDel(link); err != nil {
 				return fmt.Errorf("deleting kernel wireguard link %s: %w", u.ifaceName, err)
 			}
-		case "tun":
+		case "tun", "tuntap":
+			// The kernel reports IFLA_INFO_KIND "tun"; the netlink library
+			// deserializes that into its Tuntap struct, whose Type() is
+			// "tuntap". Both spellings are the same device class, and
+			// matching only "tun" made every adoption of a persisted TUN
+			// fail as a "foreign link".
 			u.linkIndex = link.Attrs().Index
 			return u.attachExistingTUN()
 		default:
