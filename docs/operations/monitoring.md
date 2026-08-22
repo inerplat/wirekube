@@ -87,6 +87,7 @@ The agent exposes Prometheus metrics on `:9090/metrics`. The provided Service se
 | `wirekube_peer_connected` | Gauge | source, peer, nat_type | Connection status (1=connected, 0=disconnected) |
 | `wirekube_peer_transport_mode` | Gauge | source, peer | Transport (1=direct, 2=relay) |
 | `wirekube_peer_last_handshake_seconds` | Gauge | source, peer | Seconds since last WireGuard handshake |
+| `wirekube_suppressed_routes` | Gauge | source, reason | Routes withheld from the WireKube table by routing policy (`local`, `excluded`) |
 | `wirekube_node_nat_type` | Gauge | node | NAT type (0=unknown, 1=cone, 2=symmetric, 3=port-restricted-cone, 4=open) |
 | `wirekube_peers_total` | Gauge | — | Total WireKubePeer count |
 | `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |

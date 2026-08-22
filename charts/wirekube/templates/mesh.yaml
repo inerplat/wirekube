@@ -17,6 +17,16 @@ spec:
   autoAllowedIPs:
     includeNodeInternalIP: true
   {{- end }}
+  {{- if or .Values.mesh.routing.localSubnetPolicy .Values.mesh.routing.excludeCIDRs }}
+  routing:
+    {{- with .Values.mesh.routing.localSubnetPolicy }}
+    localSubnetPolicy: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.mesh.routing.excludeCIDRs }}
+    excludeCIDRs:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
   {{- if .Values.relay.enabled }}
   {{- if eq .Values.relay.service.type "NodePort" }}
   {{- $ce := required "mesh.relay.controlEndpoint is required for NodePort installs: NodePort Services have no LoadBalancer ingress to sync into the mesh status, so agents need an explicit reachable address, e.g. \"203.0.113.10:30478\"." .Values.mesh.relay.controlEndpoint }}

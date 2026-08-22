@@ -62,6 +62,40 @@ type WireKubeMeshSpec struct {
 	// node-internal IP stop tunnelling.
 	// +optional
 	AutoAllowedIPs *AutoAllowedIPsSpec `json:"autoAllowedIPs,omitempty"`
+
+	// Routing controls which candidate routes each agent installs into the
+	// WireKube policy-routing table.
+	// +optional
+	Routing *RoutingSpec `json:"routing,omitempty"`
+}
+
+// RoutingSpec controls route installation on every agent. The decisions are
+// made per observing node: each agent evaluates its own kernel state.
+type RoutingSpec struct {
+	// LocalSubnetPolicy decides what happens when a peer's advertised address
+	// is on a segment the observing node can already reach without the
+	// tunnel. "bypass" (default) suppresses the tunnel route so same-segment
+	// traffic stays on the physical link; the suppression additionally
+	// requires cryptographic proof that the peer really is on that segment (a
+	// live authenticated WireGuard handshake with a direct endpoint inside
+	// the same prefix), so VPCs that reuse one private range keep their
+	// tunnel routes. "tunnel" keeps today's behavior and encrypts
+	// same-segment traffic too.
+	// +kubebuilder:default=bypass
+	// +kubebuilder:validation:Enum=bypass;tunnel
+	// +optional
+	LocalSubnetPolicy string `json:"localSubnetPolicy,omitempty"`
+
+	// ExcludeCIDRs lists destinations no agent may ever install into the
+	// WireKube table, regardless of reachability: corporate ranges this mesh
+	// must never carry outbound. Only route installation is affected; inbound
+	// traffic admitted by AllowedIPs is not. Matching is by containment in route units; routes are
+	// never split, so an entry only overrides a broader gateway route when it
+	// contains that route entirely. Mesh overlay host routes rank above this
+	// list: they exist only inside the tunnel, so excluding one would sever
+	// the address rather than fall back to the main table.
+	// +optional
+	ExcludeCIDRs []string `json:"excludeCIDRs,omitempty"`
 }
 
 // AutoAllowedIPsSpec controls automatic AllowedIPs augmentation.

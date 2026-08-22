@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+	"net/netip"
 )
 
 // Routing constants used by UserspaceEngine for the fwmark/table scheme.
@@ -360,4 +362,53 @@ func disableXfrmForIface(ifaceName string) {
 		}
 	}
 	log.Printf("[wireguard] xfrm bypass enabled on %s\n", ifaceName)
+}
+
+// LocalLinkPrefixes returns the IPv4 prefixes this host reaches without the
+// WireKube tunnel: main-table scope-link routes on interfaces other than
+// excludeIface. Other tunnels (an unrelated wg0, a corporate VPN) count as
+// reachable paths on purpose; the policy question is only whether WireKube
+// must carry the traffic.
+// This is the observer-side half of the local-subnet bypass; the WireKube
+// interface's own connected routes must not count as "reachable without the
+// tunnel", and neither must entries in the WireKube table.
+func LocalLinkPrefixes(excludeIface string) []netip.Prefix {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil
+	}
+	nameByIndex := map[int]string{}
+	for _, l := range links {
+		nameByIndex[l.Attrs().Index] = l.Attrs().Name
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4,
+		&netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil
+	}
+	return localPrefixesFromRoutes(routes, nameByIndex, excludeIface)
+}
+
+// localPrefixesFromRoutes is the pure filtering half of LocalLinkPrefixes,
+// split out so the selection rules are unit-testable without netlink access.
+func localPrefixesFromRoutes(routes []netlink.Route, nameByIndex map[int]string, excludeIface string) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, r := range routes {
+		if r.Scope != netlink.SCOPE_LINK || r.Dst == nil {
+			continue
+		}
+		if nameByIndex[r.LinkIndex] == excludeIface {
+			continue
+		}
+		ones, bits := r.Dst.Mask.Size()
+		if bits != 32 {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(r.Dst.IP.To4())
+		if !ok {
+			continue
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, ones))
+	}
+	return prefixes
 }

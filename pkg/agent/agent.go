@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -140,6 +141,27 @@ type Agent struct {
 	// SNAT rules a previous run may have left in the kernel, so the
 	// no-gateways path scans iptables once per process instead of every sync.
 	gwRetainedRulesChecked bool
+	// localPrefixes returns the prefixes this host reaches without the
+	// tunnel; injectable for tests, defaults to kernel scope-link routes.
+	localPrefixes func() []netip.Prefix
+	// lastSuppressedRoutes remembers the previous sync's suppression set so
+	// transitions are logged once, not every tick.
+	lastSuppressedRoutes map[string]string
+	// lastRoutingSpec and lastMeshCIDR hold the most recently read mesh
+	// routing policy. A transient getMesh failure must not fail open: with a
+	// nil spec the default policy (bypass) would silently replace an explicit
+	// localSubnetPolicy=tunnel, and an empty mesh CIDR would disarm the
+	// overlay-route protection. Same pattern as relayMode, which also keeps
+	// its previous value across read failures.
+	lastRoutingSpec *wirekubev1alpha1.RoutingSpec
+	lastMeshCIDR    string
+	// endpointConfiguredAt records when this agent last changed a peer's
+	// configured WireGuard endpoint (initial config or a probe's
+	// ForceEndpoint). A handshake older than this timestamp says nothing
+	// about the current endpoint: the address was set by us, not proven by
+	// the peer. Keyed by public key.
+	endpointConfiguredAt map[string]time.Time
+	configuredEndpoints  map[string]string
 	// gwClientCache maps gateway CIDR → set of authorized client peer names.
 	// Rebuilt every sync cycle. nil means not yet built.
 	gwClientCache map[string]map[string]bool
@@ -214,6 +236,7 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		peerTrafficSnapshots: make(map[string]peerTrafficSnapshot),
 		peerMetricLabels:     make(map[string]struct{}),
 	}
+	a.localPrefixes = func() []netip.Prefix { return wireguard.LocalLinkPrefixes(wgMgr.InterfaceName()) }
 	a.pathMonitor = NewPathMonitor(log.WithName("path"), wgMgr, PathMonitorConfig{}, time.Now)
 	return a
 }
@@ -736,6 +759,8 @@ func (a *Agent) sync(ctx context.Context) error {
 	var meshCIDR string
 	if mesh, err := a.getMesh(ctx); err == nil {
 		meshCIDR = mesh.Spec.MeshCIDR
+		a.lastRoutingSpec = mesh.Spec.Routing
+		a.lastMeshCIDR = mesh.Spec.MeshCIDR
 		if mesh.Spec.Relay != nil {
 			oldMode := a.relayMode
 			newMode := mesh.Spec.Relay.Mode
@@ -941,6 +966,22 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.log.Info("own allowedIPs empty, passive mode (handshake only, no routes)")
 	}
 
+	// Track when each peer's configured endpoint changes, so route
+	// suppression can demand a handshake newer than the assignment: only an
+	// authenticated packet from the configured address keeps WireGuard's
+	// endpoint there afterwards (a relay-delivered handshake roams it to
+	// localhost), which is what upgrades an assignment into proof.
+	if a.configuredEndpoints == nil {
+		a.configuredEndpoints = map[string]string{}
+		a.endpointConfiguredAt = map[string]time.Time{}
+	}
+	for _, pc := range wgPeers {
+		if a.configuredEndpoints[pc.PublicKeyB64] != pc.Endpoint {
+			a.configuredEndpoints[pc.PublicKeyB64] = pc.Endpoint
+			a.endpointConfiguredAt[pc.PublicKeyB64] = time.Now()
+		}
+	}
+
 	if err := a.wgMgr.SyncPeers(wgPeers); err != nil {
 		return fmt.Errorf("syncing WireGuard peers: %w", err)
 	}
@@ -980,12 +1021,22 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.log.Error(err, "reasserting routing rules")
 	}
 
-	// Sync kernel routes: AllowedIPs → wg interface
+	// Sync kernel routes: AllowedIPs → wg interface. The routing policy runs
+	// only on the path that actually replaces routes, so its logs and gauge
+	// never describe a set that was not installed.
 	if a.keepRoutesUntilHandshakes {
 		a.keepRoutesUntilHandshakes = false
 		a.log.Info("keeping preserved routes through the first sync; handshakes have not re-formed yet")
-	} else if err := a.wgMgr.SyncRoutes(allRoutes); err != nil {
-		return fmt.Errorf("syncing routes: %w", err)
+	} else {
+		kept, suppressedRoutesNow := a.applyRoutingPolicy(allRoutes, routeOwners, a.lastMeshCIDR, a.lastRoutingSpec)
+		allRoutes = kept
+		if err := a.wgMgr.SyncRoutes(allRoutes); err != nil {
+			return fmt.Errorf("syncing routes: %w", err)
+		}
+		// Reported only after the kernel accepted the set: a failed sync must
+		// not record a suppression state the next retry would then treat as
+		// already-logged while the kernel still holds the previous routes.
+		a.reportSuppressedRoutes(suppressedRoutesNow)
 	}
 
 	// Process relay grace for peers upgraded to direct.
