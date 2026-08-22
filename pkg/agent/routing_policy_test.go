@@ -14,7 +14,15 @@ import (
 // policyAgent builds an agent whose local prefixes, peer stats, and gateway
 // cache are all synthetic, so every suppression decision is deterministic.
 func policyAgent(local []string, stats []wireguard.PeerStats, gatewayCIDRs ...string) *Agent {
-	fake := &fakeWGEngine{stats: stats}
+	// Peers with a live handshake also have direct-receive evidence unless a
+	// test removes it explicitly; a proof without it must never suppress.
+	lastDirect := map[string]int64{}
+	for _, s := range stats {
+		if time.Since(s.LastHandshake) < time.Minute {
+			lastDirect[s.PublicKeyB64] = time.Now().Add(-5 * time.Second).UnixNano()
+		}
+	}
+	fake := &fakeWGEngine{stats: stats, lastDirect: lastDirect}
 	a := &Agent{wgMgr: fake, log: logr.Discard(), handshakeValidWindow: 3 * time.Minute}
 	a.localPrefixes = func() []netip.Prefix {
 		var out []netip.Prefix
@@ -169,19 +177,22 @@ func TestRoutingPolicyKeepsOffSegmentPeers(t *testing.T) {
 	}
 }
 
-// An unparseable (or absent) mesh CIDR disarms overlay detection, so the
-// policy must suppress nothing at all.
-func TestRoutingPolicyFailsOpenWithoutMeshCIDR(t *testing.T) {
+// An absent mesh CIDR means manually managed AllowedIPs: there is no overlay
+// rank to protect, but explicit exclusions and proof-gated local suppression
+// keep working.
+func TestRoutingPolicyWithoutMeshCIDR(t *testing.T) {
 	a := policyAgent(
 		[]string{"10.0.0.0/24"},
 		[]wireguard.PeerStats{provenPeer("peerB", "10.0.0.203:51822")},
 	)
 	routing := &wirekubev1alpha1.RoutingSpec{ExcludeCIDRs: []string{"172.31.0.0/16"}}
-	routes := []string{"10.0.0.203/32", "172.31.9.9/32"}
+	routes := []string{"10.0.0.203/32", "172.31.9.9/32", "192.0.2.1/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, "", routing); !reflect.DeepEqual(got, routes) {
-		t.Errorf("suppressed without a mesh CIDR: got %v", got)
+	got := a.applyRoutingPolicy(routes, owners, "", routing)
+	want := []string{"192.0.2.1/32"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
 	}
 }
 
@@ -215,6 +226,24 @@ func TestRoutingPolicyBindsProofToDestination(t *testing.T) {
 
 	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("suppressed a route whose proof endpoint differs from the destination: got %v", got)
+	}
+}
+
+// An active direct probe force-sets the WireGuard endpoint to the advertised
+// address before anything has authenticated over it, while the handshake
+// timestamp still belongs to the relay leg. That combination must not count
+// as proof.
+func TestRoutingPolicyRejectsForcedEndpointWithoutDirectRX(t *testing.T) {
+	a := policyAgent(
+		[]string{"10.0.0.0/24"},
+		[]wireguard.PeerStats{provenPeer("peerB", "10.0.0.203:51822")},
+	)
+	a.wgMgr.(*fakeWGEngine).lastDirect = nil // handshake fresh, direct socket silent
+	routes := []string{"10.0.0.203/32"}
+	owners := map[string]string{"10.0.0.203/32": "peerB"}
+
+	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+		t.Errorf("suppressed on a forced endpoint with no direct traffic: got %v", got)
 	}
 }
 

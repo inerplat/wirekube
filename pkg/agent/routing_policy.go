@@ -66,15 +66,15 @@ func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]strin
 		return routes
 	}
 
-	// Without a parseable mesh CIDR the overlay routes cannot be told apart
-	// from anything else, and the one rule that must always hold is that
-	// overlay routes are never dropped. Fail open: suppress nothing.
+	// Without a parseable mesh CIDR there is no mesh-managed overlay to
+	// protect (peers run manually managed AllowedIPs), so only the overlay
+	// rank is disabled. Static exclusions are the operator's explicit intent
+	// and stay enforced, and local suppression stays proof-gated.
 	meshPrefix, meshErr := netip.ParsePrefix(meshCIDR)
-	if meshErr != nil {
-		a.reportSuppressedRoutes(nil)
-		return routes
+	meshOK := meshErr == nil
+	if meshOK {
+		meshPrefix = meshPrefix.Masked()
 	}
-	meshPrefix = meshPrefix.Masked()
 
 	var statsByKey map[string]peerDirectProof
 	proofsLoaded := false
@@ -91,7 +91,7 @@ func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]strin
 		// Overlay routes rank above everything droppable. Containment in the
 		// mesh CIDR, not a /32 check: an operator-assigned /30 inside the
 		// overlay has no main-table fallback either.
-		if prefixContains(meshPrefix, dst) {
+		if meshOK && prefixContains(meshPrefix, dst) {
 			kept = append(kept, cidr)
 			continue
 		}
@@ -128,6 +128,7 @@ func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]strin
 type peerDirectProof struct {
 	endpoint      netip.Addr
 	lastHandshake time.Time
+	lastDirectRX  time.Time
 }
 
 func (a *Agent) directProofByKey() map[string]peerDirectProof {
@@ -148,7 +149,11 @@ func (a *Agent) directProofByKey() map[string]peerDirectProof {
 		if err != nil {
 			continue
 		}
-		proofs[s.PublicKeyB64] = peerDirectProof{endpoint: addr, lastHandshake: s.LastHandshake}
+		proof := peerDirectProof{endpoint: addr, lastHandshake: s.LastHandshake}
+		if rx := a.wgMgr.LastDirectReceive(s.PublicKeyB64); rx > 0 {
+			proof.lastDirectRX = time.Unix(0, rx)
+		}
+		proofs[s.PublicKeyB64] = proof
 	}
 	return proofs
 }
@@ -181,6 +186,15 @@ func (a *Agent) provenOnSegment(dst netip.Prefix, ownerKey string, containing []
 		window = a.directConnectedWindow
 	}
 	if time.Since(proof.lastHandshake) > window {
+		return netip.Prefix{}, false
+	}
+	// The handshake alone can predate the endpoint: an active direct probe
+	// force-sets the WireGuard endpoint to the advertised address before any
+	// packet has authenticated over it, while the handshake timestamp still
+	// belongs to the relay leg. Authenticated traffic received on the direct
+	// socket is what proves this endpoint, so require it within the same
+	// window.
+	if proof.lastDirectRX.IsZero() || time.Since(proof.lastDirectRX) > window {
 		return netip.Prefix{}, false
 	}
 	for _, p := range containing {
