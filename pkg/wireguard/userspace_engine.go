@@ -255,6 +255,16 @@ func (u *UserspaceEngine) DeleteInterface() error {
 	if err != nil {
 		return nil // Already gone.
 	}
+	// The same ownership rule EnsureInterface applies on creation: only TUN
+	// devices and legacy kernel wireguard links are WireKube's to delete. A
+	// misconfigured interface name pointed at a foreign link must fail here,
+	// not take the link down — WIREKUBE_CLEAN_STATE reaches this path with no
+	// prior type check.
+	switch link.Type() {
+	case "tun", "tuntap", "wireguard":
+	default:
+		return fmt.Errorf("interface %s has link type %q, refusing to delete a foreign link", u.ifaceName, link.Type())
+	}
 	return netlink.LinkDel(link)
 }
 

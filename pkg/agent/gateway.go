@@ -49,10 +49,14 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 
 	myPeerName := a.nodeName
 	desiredSNATCIDRs := map[string]bool{}
+	allGatewayRouteCIDRs := map[string]bool{}
 	activeGateways := []string{}
 
 	for i := range gwList.Items {
 		gw := &gwList.Items[i]
+		for _, route := range gw.Spec.Routes {
+			allGatewayRouteCIDRs[route.CIDR] = true
+		}
 
 		activePeer := a.electActivePeer(ctx, gw)
 		a.log.V(1).Info("gateway election result", "gateway", gw.Name, "elected", activePeer, "me", myPeerName)
@@ -77,6 +81,17 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 
 		// Update gateway status
 		a.updateGatewayStatus(ctx, gw, activePeer)
+	}
+
+	// A route named by a gateway CR that this node does not currently serve
+	// (not elected, or SNAT disabled) may still carry the untagged rule shape
+	// an older crashed agent left behind. The CR naming the CIDR is what
+	// makes the removal attributable and safe; tagged rules for these CIDRs
+	// are handled by the kernel-seeded reconcile in syncSNATRules.
+	for cidr := range allGatewayRouteCIDRs {
+		if !desiredSNATCIDRs[cidr] {
+			removeLegacyMasqueradeRule(cidr)
+		}
 	}
 
 	if len(activeGateways) == 0 {
@@ -327,6 +342,7 @@ func addMasqueradeRule(cidr, _ string) error {
 		"-j", "MASQUERADE",
 	}
 	if err := exec.Command("iptables", args...).Run(); err == nil {
+		removeLegacyMasqueradeRule(cidr)
 		return nil
 	}
 
@@ -335,7 +351,23 @@ func addMasqueradeRule(cidr, _ string) error {
 	if err != nil {
 		return fmt.Errorf("iptables: %s: %w", strings.TrimSpace(string(out)), err)
 	}
+	// An older agent that crashed (no graceful cleanup) can have left the
+	// untagged shape of this rule behind. It would double-SNAT harmlessly but
+	// survive every tagged removal, so migrate it out whenever the tagged
+	// rule is ensured.
+	removeLegacyMasqueradeRule(cidr)
 	return nil
+}
+
+// removeLegacyMasqueradeRule deletes the pre-tag rule shape for a CIDR.
+// Bounded on purpose: legacy rules are only recognized for CIDRs named by
+// current gateway CRs, because a bare "-d CIDR -j MASQUERADE" with an unknown
+// destination cannot be attributed to WireKube safely.
+func removeLegacyMasqueradeRule(cidr string) {
+	_ = exec.Command("iptables",
+		"-t", "nat", "-D", "POSTROUTING",
+		"-d", cidr,
+		"-j", "MASQUERADE").Run()
 }
 
 // listMasqueradeRules returns the destination CIDRs of every MASQUERADE rule

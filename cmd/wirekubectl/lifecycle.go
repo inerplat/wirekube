@@ -626,7 +626,7 @@ func uninstallCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				return writeUninstallPlan(cmd, inventory, purge)
+				return writeUninstallPlan(cmd, ctx, c, inventory, purge)
 			}
 			inventory, err := installer.Uninstall(ctx, options.namespace, purge)
 			if err != nil {
@@ -646,8 +646,12 @@ func uninstallCmd() *cobra.Command {
 
 // writeUninstallPlan reports what an uninstall would remove. Preserved
 // resources are listed too: "kept" is as much a part of the decision as
-// "deleted", and CRDs move between the two depending on --purge.
-func writeUninstallPlan(cmd *cobra.Command, inventory *internalinstall.Inventory, purge bool) error {
+// "deleted", and CRDs move between the two depending on --purge. The plan is
+// not derived from the inventory alone: purge also deletes every live custom
+// resource, and every uninstall removes the inventory ConfigMap, so both are
+// read from the cluster and listed — an automation consumer of the JSON form
+// must see the full deletion set.
+func writeUninstallPlan(cmd *cobra.Command, ctx context.Context, c client.Client, inventory *internalinstall.Inventory, purge bool) error {
 	deleted := []string{}
 	kept := []string{}
 	for index := len(inventory.Resources) - 1; index >= 0; index-- {
@@ -662,11 +666,27 @@ func writeUninstallPlan(cmd *cobra.Command, inventory *internalinstall.Inventory
 			kept = append(kept, name)
 		}
 	}
+	if purge {
+		live, err := liveCustomResourceNames(ctx, c)
+		if err != nil {
+			return fmt.Errorf("listing custom resources for the purge plan: %w", err)
+		}
+		deleted = append(deleted, live...)
+	}
+	deleted = append(deleted, fmt.Sprintf("ConfigMap/%s", internalinstall.InventoryName))
+	warning := ""
+	if purge {
+		warning = "--purge permanently deletes every WireKube custom resource in the cluster"
+	}
 	if options.output == "json" {
-		return writeResult(cmd, map[string]any{
+		result := map[string]any{
 			"operation": "uninstall", "dryRun": true, "purged": purge,
 			"installationID": inventory.InstallationID, "deleted": deleted, "kept": kept,
-		}, "")
+		}
+		if warning != "" {
+			result["warnings"] = []string{warning}
+		}
+		return writeResult(cmd, result, "")
 	}
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "WireKube uninstall plan for installation %s (purge=%t)\n\n", inventory.InstallationID, purge)
@@ -679,10 +699,41 @@ func writeUninstallPlan(cmd *cobra.Command, inventory *internalinstall.Inventory
 		fmt.Fprintf(out, "  - %s\n", name)
 	}
 	fmt.Fprintf(out, "  - per-node dataplane state (WireGuard interface, routes, ip rules); run config/cleanup/cleanup-job.yaml per node when decommissioning\n")
-	if purge {
-		fmt.Fprintf(out, "\nWARNING: --purge also deletes every WireKube custom resource in the cluster\n")
+	if warning != "" {
+		fmt.Fprintf(out, "\nWARNING: %s\n", warning)
 	}
 	return nil
+}
+
+// liveCustomResourceNames lists the custom resources a purge would delete, in
+// the same order deleteCustomResources removes them.
+func liveCustomResourceNames(ctx context.Context, c client.Client) ([]string, error) {
+	names := []string{}
+	externalPeers := &wirekubev1alpha1.WireKubeExternalPeerList{}
+	if err := c.List(ctx, externalPeers); err == nil {
+		for i := range externalPeers.Items {
+			names = append(names, "WireKubeExternalPeer/"+externalPeers.Items[i].Name)
+		}
+	}
+	gateways := &wirekubev1alpha1.WireKubeGatewayList{}
+	if err := c.List(ctx, gateways); err == nil {
+		for i := range gateways.Items {
+			names = append(names, "WireKubeGateway/"+gateways.Items[i].Name)
+		}
+	}
+	peers := &wirekubev1alpha1.WireKubePeerList{}
+	if err := c.List(ctx, peers); err == nil {
+		for i := range peers.Items {
+			names = append(names, "WireKubePeer/"+peers.Items[i].Name)
+		}
+	}
+	meshes := &wirekubev1alpha1.WireKubeMeshList{}
+	if err := c.List(ctx, meshes); err == nil {
+		for i := range meshes.Items {
+			names = append(names, "WireKubeMesh/"+meshes.Items[i].Name)
+		}
+	}
+	return names, nil
 }
 
 func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
