@@ -370,7 +370,6 @@ func TestInstallConflictPreservesUnmanagedResourceAndRollsBackNewObjects(t *test
 func TestSameInstallConfigIgnoresTransientFlags(t *testing.T) {
 	left := Options{Namespace: "wirekube-system", Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", NodeAddresses: "mesh-only"}
 	right := left
-	right.Yes = true
 	right.DryRun = true
 	right.Adopt = true
 	right.Timeout = time.Minute

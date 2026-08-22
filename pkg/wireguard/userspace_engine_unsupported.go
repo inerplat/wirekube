@@ -45,10 +45,6 @@ func (u *UserspaceEngine) InterfaceExists() bool {
 	return false
 }
 
-func (u *UserspaceEngine) ConfigMatchesKey(_ *KeyPair) bool {
-	return false
-}
-
 func (u *UserspaceEngine) SyncPeers(_ []PeerConfig) error {
 	return errUserspaceEngineUnsupported
 }

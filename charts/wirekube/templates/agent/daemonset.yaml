@@ -56,9 +56,8 @@ spec:
                   # Node-scoped agent variants replace this DaemonSet on the
                   # nodes they claim; they must not run alongside it. Two agents
                   # on one node share /var/lib/wirekube and the interface name,
-                  # so they present the same public key to the relay (which
-                  # evicts each session as the other registers) and either one's
-                  # shutdown deletes the interface both were using.
+                  # so they present the same public key to the relay, which
+                  # evicts each session as the other registers.
                   - key: wirekube.io/agent-canary
                     operator: NotIn
                     values:

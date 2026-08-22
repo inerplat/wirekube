@@ -49,7 +49,7 @@ The default manifest runs the agent on every node except nodes labeled `wirekube
 9. **Relay auto-reconnect** — Exponential backoff (1s–30s) on TCP connection drops
 10. **Route management** — Adds connected peer and gateway AllowedIPs to routing table 22347
 11. **IPSec bypass** — Sets `disable_xfrm` and `disable_policy` on the WireGuard interface
-12. **State reconciliation** — Repairs routing rules during sync and removes interface state during graceful shutdown
+12. **State reconciliation** — Repairs routing rules during sync; interface state persists across restarts and is removed only by explicit cleanup
 
 ### Relay Server
 
@@ -169,4 +169,4 @@ See [NAT Traversal](nat-traversal.md) for the full strategy.
 5. **Structured direct upgrade** — Relayed peers are periodically probed; skips peers that self-report as relay-only (Symmetric NAT)
 6. **Per-node status ownership** — Each agent updates only its own `transportMode` to prevent cross-agent status flapping
 7. **IPSec coexistence** — xfrm bypass prevents conflicts with existing site-to-site tunnels
-8. **State repair** — Graceful cleanup plus periodic routing rule reconciliation
+8. **State repair** — Periodic routing rule reconciliation; dataplane state persists across agent restarts

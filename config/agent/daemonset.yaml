@@ -45,9 +45,8 @@ spec:
                   # Node-scoped agent variants replace this DaemonSet on the
                   # nodes they claim; they must not run alongside it. Two agents
                   # on one node share /var/lib/wirekube and the interface name,
-                  # so they present the same public key to the relay (which
-                  # evicts each session as the other registers) and either one's
-                  # shutdown deletes the interface both were using.
+                  # so they present the same public key to the relay, which
+                  # evicts each session as the other registers.
                   - key: wirekube.io/agent-canary
                     operator: NotIn
                     values:
@@ -99,6 +98,12 @@ spec:
             # the in-cluster Service IP before WireKube routes exist:
             # - name: WIREKUBE_KUBE_APISERVER
             #   value: "https://YOUR_KUBE_APISERVER_ENDPOINT"
+            #
+            # One-shot dataplane rebuild: the interface, routes, and rules
+            # persist across restarts; set this to tear them down once at the
+            # next start, then remove it.
+            # - name: WIREKUBE_CLEAN_STATE
+            #   value: "true"
           securityContext:
             # privileged is required to open /dev/net/tun on Ubuntu 24.04+
             # hosts where containerd's default device cgroup denies TUN

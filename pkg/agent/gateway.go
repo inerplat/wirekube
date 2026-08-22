@@ -35,15 +35,28 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 		return nil
 	}
 	if len(gwList.Items) == 0 {
+		// Shutdown no longer removes SNAT rules, so a node that stops being a
+		// gateway while its agent is down would keep masquerading forever if
+		// this path just returned. Reconcile to the empty set when there is
+		// in-process state to clear or when this process has not yet checked
+		// the kernel for rules a previous run left behind.
+		if a.gwState != nil || !a.gwRetainedRulesChecked {
+			a.cleanupGateway()
+			a.gwRetainedRulesChecked = true
+		}
 		return nil
 	}
 
 	myPeerName := a.nodeName
 	desiredSNATCIDRs := map[string]bool{}
+	allGatewayRouteCIDRs := map[string]bool{}
 	activeGateways := []string{}
 
 	for i := range gwList.Items {
 		gw := &gwList.Items[i]
+		for _, route := range gw.Spec.Routes {
+			allGatewayRouteCIDRs[route.CIDR] = true
+		}
 
 		activePeer := a.electActivePeer(ctx, gw)
 		a.log.V(1).Info("gateway election result", "gateway", gw.Name, "elected", activePeer, "me", myPeerName)
@@ -68,6 +81,17 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 
 		// Update gateway status
 		a.updateGatewayStatus(ctx, gw, activePeer)
+	}
+
+	// A route named by a gateway CR that this node does not currently serve
+	// (not elected, or SNAT disabled) may still carry the untagged rule shape
+	// an older crashed agent left behind. The CR naming the CIDR is what
+	// makes the removal attributable and safe; tagged rules for these CIDRs
+	// are handled by the kernel-seeded reconcile in syncSNATRules.
+	for cidr := range allGatewayRouteCIDRs {
+		if !desiredSNATCIDRs[cidr] {
+			removeLegacyMasqueradeRule(cidr)
+		}
 	}
 
 	if len(activeGateways) == 0 {
@@ -224,10 +248,16 @@ func (a *Agent) updateGatewayStatus(ctx context.Context, gw *wirekubev1alpha1.Wi
 // cleanupGateway removes gateway-specific configuration (SNAT rules).
 // IP forwarding is left enabled to avoid disrupting other services.
 func (a *Agent) cleanupGateway() {
-	if a.gwState == nil {
-		return
+	rules := listMasqueradeRules()
+	if rules == nil {
+		rules = map[string]bool{}
 	}
-	for cidr := range a.gwState.snatRules {
+	if a.gwState != nil {
+		for cidr := range a.gwState.snatRules {
+			rules[cidr] = true
+		}
+	}
+	for cidr := range rules {
 		removeMasqueradeRule(cidr, a.wgMgr.InterfaceName())
 	}
 	a.gwState = nil
@@ -237,7 +267,13 @@ func (a *Agent) cleanupGateway() {
 // and stale rules are removed.
 func (a *Agent) syncSNATRules(desired map[string]bool) {
 	if a.gwState == nil {
-		a.gwState = &gatewayState{snatRules: map[string]bool{}}
+		// Seed tracking from the kernel: rules installed by a previous run
+		// survive the restart now, and starting from an empty map would leave
+		// any of them that are no longer desired in place forever.
+		a.gwState = &gatewayState{snatRules: listMasqueradeRules()}
+		if a.gwState.snatRules == nil {
+			a.gwState.snatRules = map[string]bool{}
+		}
 	}
 
 	ifaceName := a.wgMgr.InterfaceName()
@@ -292,13 +328,21 @@ func enableIPForwarding() error {
 // addMasqueradeRule adds an iptables MASQUERADE rule for traffic
 // destined for the given CIDR. This ensures return traffic from the
 // target network routes back through the gateway node.
+// snatRuleComment tags the MASQUERADE rules this agent installs. The tag is
+// what makes the rules discoverable after a restart: gwState is process
+// memory, and shutdown no longer removes kernel state, so reconciliation must
+// read ownership off the kernel itself.
+const snatRuleComment = "wirekube-gw"
+
 func addMasqueradeRule(cidr, _ string) error {
 	args := []string{
 		"-t", "nat", "-C", "POSTROUTING",
 		"-d", cidr,
+		"-m", "comment", "--comment", snatRuleComment,
 		"-j", "MASQUERADE",
 	}
 	if err := exec.Command("iptables", args...).Run(); err == nil {
+		removeLegacyMasqueradeRule(cidr)
 		return nil
 	}
 
@@ -307,17 +351,74 @@ func addMasqueradeRule(cidr, _ string) error {
 	if err != nil {
 		return fmt.Errorf("iptables: %s: %w", strings.TrimSpace(string(out)), err)
 	}
+	// An older agent that crashed (no graceful cleanup) can have left the
+	// untagged shape of this rule behind. It would double-SNAT harmlessly but
+	// survive every tagged removal, so migrate it out whenever the tagged
+	// rule is ensured.
+	removeLegacyMasqueradeRule(cidr)
 	return nil
+}
+
+// removeLegacyMasqueradeRule deletes the pre-tag rule shape for a CIDR.
+// Bounded on purpose: legacy rules are only recognized for CIDRs named by
+// current gateway CRs, because a bare "-d CIDR -j MASQUERADE" with an unknown
+// destination cannot be attributed to WireKube safely.
+func removeLegacyMasqueradeRule(cidr string) {
+	_ = exec.Command("iptables",
+		"-t", "nat", "-D", "POSTROUTING",
+		"-d", cidr,
+		"-j", "MASQUERADE").Run()
+}
+
+// listMasqueradeRules returns the destination CIDRs of every MASQUERADE rule
+// carrying the wirekube comment tag, read from the kernel. Untagged rules are
+// never claimed: a bare "-d CIDR -j MASQUERADE" could belong to anyone, and
+// agents that predate the tag removed their rules in their own shutdown path.
+func listMasqueradeRules() map[string]bool {
+	out, err := exec.Command("iptables-save", "-t", "nat").Output()
+	if err != nil {
+		return nil
+	}
+	rules := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "-A POSTROUTING") ||
+			!strings.Contains(line, "--comment "+quoteIfNeeded(snatRuleComment)) ||
+			!strings.Contains(line, "-j MASQUERADE") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "-d" {
+				rules[fields[i+1]] = true
+				break
+			}
+		}
+	}
+	return rules
+}
+
+// quoteIfNeeded matches iptables-save's own quoting: comments with spaces are
+// emitted quoted, single-token comments bare.
+func quoteIfNeeded(comment string) string {
+	if strings.ContainsAny(comment, " \t") {
+		return "\"" + comment + "\""
+	}
+	return comment
 }
 
 // removeMasqueradeRule removes the iptables MASQUERADE rule.
 func removeMasqueradeRule(cidr, _ string) {
-	args := []string{
+	// Tagged shape first, then the untagged shape older agents installed, so
+	// a known-stale CIDR is cleared regardless of which generation added it.
+	_ = exec.Command("iptables",
 		"-t", "nat", "-D", "POSTROUTING",
 		"-d", cidr,
-		"-j", "MASQUERADE",
-	}
-	_ = exec.Command("iptables", args...).Run()
+		"-m", "comment", "--comment", snatRuleComment,
+		"-j", "MASQUERADE").Run()
+	_ = exec.Command("iptables",
+		"-t", "nat", "-D", "POSTROUTING",
+		"-d", cidr,
+		"-j", "MASQUERADE").Run()
 }
 
 // shouldSkipGatewayRoute decides if a given CIDR (from a remote peer's AllowedIPs)

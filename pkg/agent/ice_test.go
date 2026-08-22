@@ -33,6 +33,10 @@ type fakeWGEngine struct {
 	ensureCalls    int
 	configureCalls int
 	ensureErr      error
+	deleteCalls    int
+	closeCalls     int
+	routeFlushes   int
+	deleteErr      error
 }
 
 func (f *fakeWGEngine) EnsureInterface() error {
@@ -48,14 +52,25 @@ func (f *fakeWGEngine) Configure() error {
 	f.configureCalls++
 	return nil
 }
-func (f *fakeWGEngine) DeleteInterface() error                   { return nil }
-func (f *fakeWGEngine) Close() error                             { return nil }
-func (f *fakeWGEngine) InterfaceName() string                    { return "" }
-func (f *fakeWGEngine) ListenPort() int                          { return 0 }
-func (f *fakeWGEngine) InterfaceExists() bool                    { return !f.ifaceGone }
-func (f *fakeWGEngine) ConfigMatchesKey(*wireguard.KeyPair) bool { return true }
-func (f *fakeWGEngine) SyncPeers([]wireguard.PeerConfig) error   { return nil }
-func (f *fakeWGEngine) ForceEndpoint(string, string) error       { return nil }
+func (f *fakeWGEngine) DeleteInterface() error {
+	f.deleteCalls++
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.ifaceGone = true
+	return nil
+}
+
+func (f *fakeWGEngine) Close() error {
+	f.closeCalls++
+	return nil
+}
+
+func (f *fakeWGEngine) InterfaceName() string                  { return "" }
+func (f *fakeWGEngine) ListenPort() int                        { return 0 }
+func (f *fakeWGEngine) InterfaceExists() bool                  { return !f.ifaceGone }
+func (f *fakeWGEngine) SyncPeers([]wireguard.PeerConfig) error { return nil }
+func (f *fakeWGEngine) ForceEndpoint(string, string) error     { return nil }
 func (f *fakeWGEngine) PokeKeepalive(pubKey string) error {
 	f.poked = append(f.poked, pubKey)
 	return nil
@@ -63,10 +78,15 @@ func (f *fakeWGEngine) PokeKeepalive(pubKey string) error {
 func (f *fakeWGEngine) GetStats() ([]wireguard.PeerStats, error) { return f.stats, nil }
 func (f *fakeWGEngine) SetAddress(string) error                  { return nil }
 func (f *fakeWGEngine) SetPreferredSrc(string)                   {}
-func (f *fakeWGEngine) SyncRoutes([]string) error                { return nil }
-func (f *fakeWGEngine) EnsureRoutingRules() error                { return nil }
-func (f *fakeWGEngine) AddRoute(string) error                    { return nil }
-func (f *fakeWGEngine) DelRoute(string) error                    { return nil }
+func (f *fakeWGEngine) SyncRoutes(desired []string) error {
+	if desired == nil {
+		f.routeFlushes++
+	}
+	return nil
+}
+func (f *fakeWGEngine) EnsureRoutingRules() error { return nil }
+func (f *fakeWGEngine) AddRoute(string) error     { return nil }
+func (f *fakeWGEngine) DelRoute(string) error     { return nil }
 func (f *fakeWGEngine) SetPeerPath(_ string, mode wireguard.PathMode, _ string) error {
 	f.setPaths = append(f.setPaths, mode)
 	return nil

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -25,6 +26,12 @@ import (
 // fwmark/routing-table rules (see routes.go) so local WireGuard sockets bypass
 // the tunnel while everything else routes through it.
 type UserspaceEngine struct {
+	// preservedRoutes holds table-22347 routes captured off an adopted link
+	// before it is cycled down for device creation; Configure reinstalls them
+	// right after bringing the link back up. Admin-down flushes a link's
+	// routes, and the whole point of adoption is that they survive.
+	preservedRoutes []netlink.Route
+
 	ifaceName  string
 	listenPort int
 	mtu        int
@@ -81,7 +88,12 @@ func (u *UserspaceEngine) EnsureInterface() error {
 			if err := netlink.LinkDel(link); err != nil {
 				return fmt.Errorf("deleting kernel wireguard link %s: %w", u.ifaceName, err)
 			}
-		case "tun":
+		case "tun", "tuntap":
+			// The kernel reports IFLA_INFO_KIND "tun"; the netlink library
+			// deserializes that into its Tuntap struct, whose Type() is
+			// "tuntap". Both spellings are the same device class, and
+			// matching only "tun" made every adoption of a persisted TUN
+			// fail as a "foreign link".
 			u.linkIndex = link.Attrs().Index
 			return u.attachExistingTUN()
 		default:
@@ -102,6 +114,7 @@ func (u *UserspaceEngine) EnsureInterface() error {
 		return fmt.Errorf("creating TUN %s: %w", u.ifaceName, err)
 	}
 	u.tunDev = tunDev
+	persistTUN(tunDev, u.ifaceName)
 
 	// Look up link for routing operations.
 	link, err := netlink.LinkByName(u.ifaceName)
@@ -135,11 +148,41 @@ func (u *UserspaceEngine) EnsureInterface() error {
 // attachExistingTUN reopens an existing TUN device by name and creates a new
 // wireguard-go device on it.
 func (u *UserspaceEngine) attachExistingTUN() error {
+	// wireguard-go's TUN event reader must not observe an already-up link
+	// while the device is being created: the queued EventUp races
+	// Configure's BindUpdate sequence (see the deadlock note in
+	// EnsureInterface). The create path starts with the link down by
+	// construction; adoption has to restore that invariant. Downing the link
+	// flushes its routes, so they are captured first and reinstalled by
+	// Configure after it brings the link back up.
+	if link, err := netlink.LinkByName(u.ifaceName); err == nil {
+		if link.Attrs().Flags&net.FlagUp != 0 {
+			routes, listErr := netlink.RouteListFiltered(syscall.AF_INET,
+				&netlink.Route{Table: WKRouteTable, LinkIndex: link.Attrs().Index},
+				netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
+			if listErr == nil {
+				u.preservedRoutes = routes
+			}
+			if err := netlink.LinkSetDown(link); err != nil {
+				return fmt.Errorf("downing adopted TUN %s for device creation: %w", u.ifaceName, err)
+			}
+			log.Printf("[usp] adopted %s cycled down for device creation; %d routes preserved for reinstall", u.ifaceName, len(u.preservedRoutes))
+		}
+	}
+
 	tunDev, err := tun.CreateTUN(u.ifaceName, u.mtu)
 	if err != nil {
 		return fmt.Errorf("reattaching TUN %s: %w", u.ifaceName, err)
 	}
 	u.tunDev = tunDev
+	persistTUN(tunDev, u.ifaceName)
+
+	// Adoption is the normal restart path now, so it must reassert the same
+	// sysctls the create path sets: another component may have tightened
+	// rp_filter or reinstalled xfrm policies while the previous agent held
+	// the device, and an agent restart is the operator's self-heal for that.
+	setRpFilterForIface(u.ifaceName)
+	disableXfrmForIface(u.ifaceName)
 
 	u.bind = NewWireKubeBind()
 	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
@@ -186,6 +229,19 @@ func (u *UserspaceEngine) Configure() error {
 		return fmt.Errorf("bringing up TUN %s: %w", u.ifaceName, err)
 	}
 
+	// Reinstall the routes captured before the adopted link was cycled down.
+	// Failures are logged, not fatal: the next sync reconciles the full set.
+	if len(u.preservedRoutes) > 0 {
+		restored := 0
+		for i := range u.preservedRoutes {
+			if err := netlink.RouteReplace(&u.preservedRoutes[i]); err == nil {
+				restored++
+			}
+		}
+		log.Printf("[usp] restored %d/%d preserved routes on %s", restored, len(u.preservedRoutes), u.ifaceName)
+		u.preservedRoutes = nil
+	}
+
 	return EnsureRoutingRules()
 }
 
@@ -198,6 +254,16 @@ func (u *UserspaceEngine) DeleteInterface() error {
 	link, err := netlink.LinkByName(u.ifaceName)
 	if err != nil {
 		return nil // Already gone.
+	}
+	// The same ownership rule EnsureInterface applies on creation: only TUN
+	// devices and legacy kernel wireguard links are WireKube's to delete. A
+	// misconfigured interface name pointed at a foreign link must fail here,
+	// not take the link down — WIREKUBE_CLEAN_STATE reaches this path with no
+	// prior type check.
+	switch link.Type() {
+	case "tun", "tuntap", "wireguard":
+	default:
+		return fmt.Errorf("interface %s has link type %q, refusing to delete a foreign link", u.ifaceName, link.Type())
 	}
 	return netlink.LinkDel(link)
 }
@@ -360,11 +426,23 @@ func (u *UserspaceEngine) SetAddress(meshIP string) error {
 	}
 	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: ipnet.Mask}}
 
+	// The TUN is exclusively wirekube's, so every IPv4 address on it is ours
+	// to reconcile. Without teardown on shutdown, a mesh CIDR change while
+	// the agent was down would otherwise leave the old mesh IP alongside the
+	// new one forever.
+	present := false
 	addrs, _ := netlink.AddrList(link, syscall.AF_INET)
-	for _, a := range addrs {
-		if a.IP.Equal(ip) {
-			return nil
+	for _, existing := range addrs {
+		if existing.IP.Equal(ip) {
+			present = true
+			continue
 		}
+		if err := netlink.AddrDel(link, &existing); err != nil {
+			log.Printf("[usp] removing stale address %s from %s: %v", existing.IPNet, u.ifaceName, err)
+		}
+	}
+	if present {
+		return nil
 	}
 	return netlink.AddrAdd(link, addr)
 }
@@ -412,25 +490,34 @@ func (u *UserspaceEngine) InterfaceExists() bool {
 	return err == nil
 }
 
-// ConfigMatchesKey returns true if the wireguard-go device is configured with
-// the same private key as the provided KeyPair.
-func (u *UserspaceEngine) ConfigMatchesKey(kp *KeyPair) bool {
-	if u.wgDev == nil {
-		return false
+// persistTUN marks the TUN with TUNSETPERSIST so it outlives this process.
+// Addresses and routes then survive an agent restart and the next process
+// reattaches instead of rebuilding the dataplane. Set on reattach as well so
+// a device created by an older agent is upgraded the first time it is
+// adopted. Best effort: without persistence the restart is merely cold, so
+// failure is logged, not returned.
+func persistTUN(dev tun.Device, name string) {
+	f := dev.File()
+	if f == nil {
+		log.Printf("[usp] cannot persist %s: TUN exposes no file descriptor", name)
+		return
 	}
-	output, err := u.wgDev.IpcGet()
+	// SyscallConn keeps the fd's non-blocking registration intact; File.Fd()
+	// is the API the runtime documentation steers ioctl users away from, and
+	// wireguard-go itself uses SyscallConn for its TUN ioctls.
+	sc, err := f.SyscallConn()
 	if err != nil {
-		return false
+		log.Printf("[usp] cannot persist %s: %v", name, err)
+		return
 	}
-	wantHex := keyToHex(kp.PrivateKeyBase64())
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "private_key=") {
-			return strings.TrimPrefix(line, "private_key=") == wantHex
-		}
+	var ioctlErr error
+	if ctrlErr := sc.Control(func(fd uintptr) {
+		ioctlErr = unix.IoctlSetInt(int(fd), unix.TUNSETPERSIST, 1)
+	}); ctrlErr != nil {
+		log.Printf("[usp] TUNSETPERSIST on %s failed: %v", name, ctrlErr)
+	} else if ioctlErr != nil {
+		log.Printf("[usp] TUNSETPERSIST on %s failed: %v", name, ioctlErr)
 	}
-	return false
 }
 
 // SetPeerPath updates the Bind's pathTable atomically so that Send routes

@@ -130,6 +130,16 @@ type Agent struct {
 	// interface was reused. Used to shorten the initial relayRetry so that
 	// direct upgrade probing starts sooner after restart.
 	wasInterfacePreserved bool
+	// keepRoutesUntilHandshakes skips route replacement on the first sync
+	// after adopting a surviving interface. That sync runs before any
+	// handshake, so the connected-peer filter would empty the very route set
+	// the adoption preserved; one deferred replacement keeps them until real
+	// handshake state exists.
+	keepRoutesUntilHandshakes bool
+	// gwRetainedRulesChecked marks that this process has reconciled gateway
+	// SNAT rules a previous run may have left in the kernel, so the
+	// no-gateways path scans iptables once per process instead of every sync.
+	gwRetainedRulesChecked bool
 	// gwClientCache maps gateway CIDR → set of authorized client peer names.
 	// Rebuilt every sync cycle. nil means not yet built.
 	gwClientCache map[string]map[string]bool
@@ -228,6 +238,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	// it continues forwarding traffic during the restart window.
 	// setup() validates the config and recreates only on mismatch.
 
+	// The opt-in reset runs once per process, before the setup retry loop:
+	// inside setup it would re-fire on every transient setup failure and
+	// tear down the interface the previous attempt just rebuilt.
+	if err := a.resetDataplaneIfRequested(); err != nil {
+		return err
+	}
+
 	backoff := 2 * time.Second
 	const maxBackoff = 60 * time.Second
 	for {
@@ -273,12 +290,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// cleanup tears down all WireGuard kernel state and releases user-space
-// resources on graceful shutdown (SIGTERM). This runs on every normal pod
-// termination so that rolling updates and node removals always start with a
-// clean interface rather than inheriting stale peer/route state.
+// cleanup releases process-owned resources on graceful shutdown and leaves
+// the dataplane (TUN, addresses, routes, ip rules, gateway SNAT rules) in
+// place, the same convention CNIs follow: kernel state outliving the agent is
+// what lets a rolling update pass without route churn. The persisted TUN
+// keeps the routes valid; the next agent reattaches and reconciles. Teardown
+// is an explicit operation: WIREKUBE_CLEAN_STATE for an in-place reset, the
+// cleanup Job for decommissioning (config/cleanup/). The trade: while no
+// process reads the TUN, packets matching the preserved routes are dropped
+// rather than falling back to the underlay; the window is the pod restart.
 func (a *Agent) cleanup() {
-	a.log.Info("shutting down: tearing down WireGuard interface", "interface", a.wgMgr.InterfaceName())
+	a.log.Info("shutting down: leaving dataplane in place for the next agent", "interface", a.wgMgr.InterfaceName())
 	for name, state := range a.iceStates {
 		if state.holePunch != nil {
 			state.holePunch.Close()
@@ -286,16 +308,58 @@ func (a *Agent) cleanup() {
 		}
 		delete(a.holePunchEndpoints, name)
 	}
-	a.cleanupGateway()
 	if a.relayPool != nil {
 		a.relayPool.Close()
 	}
-	if err := a.wgMgr.SyncRoutes(nil); err != nil {
-		a.log.Error(err, "flushing routes on shutdown")
+	if err := a.wgMgr.Close(); err != nil {
+		a.log.Error(err, "closing WireGuard device on shutdown")
 	}
+}
+
+// resetDataplaneIfRequested tears the interface, routes, and rules down once
+// at startup when WIREKUBE_CLEAN_STATE=true. Since graceful shutdown no
+// longer removes kernel state, this is the supported way to rebuild a node's
+// dataplane in place; decommissioning a node uses the cleanup Job instead.
+func (a *Agent) resetDataplaneIfRequested() error {
+	raw := os.Getenv("WIREKUBE_CLEAN_STATE")
+	if raw == "" {
+		return nil
+	}
+	requested, err := strconv.ParseBool(raw)
+	if err != nil {
+		a.log.Info("ignoring unparseable WIREKUBE_CLEAN_STATE", "value", raw)
+		return nil
+	}
+	if !requested {
+		return nil
+	}
+	// Deleting the link drops its routes with it, and Configure recreates the
+	// ip rules idempotently, so the interface is the only thing to remove. A
+	// route flush here would be a no-op anyway: the engine has no link index
+	// until EnsureInterface runs.
+	a.log.Info("WIREKUBE_CLEAN_STATE: tearing down existing dataplane before setup", "interface", a.wgMgr.InterfaceName())
 	if err := a.wgMgr.DeleteInterface(); err != nil {
-		a.log.Error(err, "deleting WireGuard interface on shutdown")
+		return fmt.Errorf("clean-state reset: deleting interface: %w", err)
 	}
+	return nil
+}
+
+// adoptSurvivingInterface reuses an interface left by a previous agent,
+// unconditionally. WireGuard config lives in process memory, so nothing about
+// the previous run's key can be read off the TUN; EnsureInterface reattaches
+// (or migrates/rejects other link types) and Configure stamps the key this
+// process loaded. A key regenerated while the agent was down is therefore
+// simply applied, and remote peers pick the new public key up from the CR as
+// with any rotation. What the TUN does carry across restarts, and what this
+// preserves, is the dataplane: address, routes, and rules keep forwarding
+// decisions stable while the pod restarts.
+func (a *Agent) adoptSurvivingInterface() {
+	if !a.wgMgr.InterfaceExists() {
+		return
+	}
+	a.log.Info("existing WireGuard interface found, reusing dataplane state", "interface", a.wgMgr.InterfaceName())
+	a.wasInterfacePreserved = true
+	a.keepRoutesUntilHandshakes = true
 }
 
 // setup performs one-time initialization:
@@ -318,23 +382,7 @@ func (a *Agent) setup(ctx context.Context) error {
 		a.log.Error(err, "applying mesh defaults")
 	}
 
-	// If the WireGuard interface survives from a previous run, validate that
-	// the key matches. A mismatch (e.g. /var/lib/wirekube deleted and
-	// regenerated) requires a full teardown before reconfiguration.
-	if a.wgMgr.InterfaceExists() {
-		if a.wgMgr.ConfigMatchesKey(kp) {
-			a.log.Info("existing WireGuard interface matches key, reusing", "interface", a.wgMgr.InterfaceName())
-			a.wasInterfacePreserved = true
-		} else {
-			a.log.Info("key mismatch on existing interface, recreating")
-			if err := a.wgMgr.SyncRoutes(nil); err != nil {
-				a.log.Error(err, "clearing routes during interface recreation")
-			}
-			if err := a.wgMgr.DeleteInterface(); err != nil {
-				a.log.Error(err, "deleting interface during recreation")
-			}
-		}
-	}
+	a.adoptSurvivingInterface()
 
 	// Discover endpoint BEFORE creating WireGuard interface.
 	// STUN needs to bind the listen port, which WireGuard will claim.
@@ -656,11 +704,11 @@ func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) 
 // recovered only by restarting the pod — and nothing restarted it, because the
 // process stays healthy while every sync fails with "device closed".
 //
-// The device goes away when something outside this process removes it. A second
-// agent sharing the same interface name is one way: its cleanup() on SIGTERM
-// deletes the interface unconditionally, taking the survivor's device with it.
-// Following EnsureRoutingRules, this runs on every tick so it self-heals
-// regardless of cause.
+// The device goes away when something outside this process removes it: an
+// operator's `ip link del`, a WIREKUBE_CLEAN_STATE reset racing this pod, or,
+// before shutdown stopped tearing the dataplane down, a co-scheduled agent's
+// cleanup(). Following EnsureRoutingRules, this runs on every tick so it
+// self-heals regardless of cause.
 func (a *Agent) ensureInterfaceAlive() error {
 	if a.wgMgr.InterfaceExists() {
 		return nil
@@ -933,7 +981,10 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 
 	// Sync kernel routes: AllowedIPs → wg interface
-	if err := a.wgMgr.SyncRoutes(allRoutes); err != nil {
+	if a.keepRoutesUntilHandshakes {
+		a.keepRoutesUntilHandshakes = false
+		a.log.Info("keeping preserved routes through the first sync; handshakes have not re-formed yet")
+	} else if err := a.wgMgr.SyncRoutes(allRoutes); err != nil {
 		return fmt.Errorf("syncing routes: %w", err)
 	}
 

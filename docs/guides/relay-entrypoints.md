@@ -106,7 +106,7 @@ This forward-proxy flow is distinct from the WSS relay endpoint. CONNECT tunnels
 With easy install, create the trusted TLS Gateway or Ingress route to Service `wirekube-relay-ws` port `8081`, then select WSS explicitly:
 
 ```bash
-wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.your-domain.example/relay --mesh-cidr 100.96.0.0/11 --yes
+wirekubectl install --relay load-balancer --relay-transport wss --relay-endpoint wss://relay.your-domain.example/relay --mesh-cidr 100.96.0.0/11
 ```
 
 This installs the raw relay, the TokenReview-authenticated WebSocket gateway, and a separate UDP LoadBalancer for external WireGuard peers. The WebSocket Service remains ClusterIP because the existing HTTPS Gateway or Ingress owns the public hostname and certificate. `--relay-udp=false` disables the UDP LoadBalancer when external peers are not required.
@@ -151,7 +151,7 @@ The base DaemonSet excludes `wirekube.io/agent-canary=true` nodes and carries a 
 kubectl -n wirekube-system get pods -o wide --field-selector spec.nodeName=<node>
 ```
 
-Two agents on one node share `/var/lib/wirekube` and the interface name. They present the same public key, so the relay evicts each session as the other registers — visible as `peer registered`/`peer disconnected` for one peer id several times a second in the relay log, and `relay-client: read error: EOF` in both agents. Removing the label then stops the churn, but the departing pod's shutdown deletes the interface the surviving agent was using.
+Two agents on one node share `/var/lib/wirekube` and the interface name. They present the same public key, so the relay evicts each session as the other registers — visible as `peer registered`/`peer disconnected` for one peer id several times a second in the relay log, and `relay-client: read error: EOF` in both agents. Removing the label stops the churn; the departing pod leaves the dataplane in place, so the surviving agent keeps its interface.
 
 To roll back, remove the label first and confirm the remaining agent still holds its interface:
 
