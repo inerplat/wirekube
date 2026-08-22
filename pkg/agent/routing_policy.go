@@ -29,10 +29,9 @@ import (
 // direct endpoint sits inside the same attached prefix; a stranger holding
 // the same address in this node's VPC cannot authenticate. When the proof
 // goes stale, the next sync reinstates the route.
-func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]string, meshCIDR string, routing *wirekubev1alpha1.RoutingSpec) []string {
+func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]string, meshCIDR string, routing *wirekubev1alpha1.RoutingSpec) ([]string, map[string]string) {
 	if len(routes) == 0 {
-		a.reportSuppressedRoutes(nil)
-		return routes
+		return routes, nil
 	}
 
 	var excludes []netip.Prefix
@@ -62,8 +61,7 @@ func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]strin
 		local = a.localPrefixes()
 	}
 	if len(excludes) == 0 && len(local) == 0 {
-		a.reportSuppressedRoutes(nil)
-		return routes
+		return routes, nil
 	}
 
 	// Without a parseable mesh CIDR there is no mesh-managed overlay to
@@ -119,8 +117,7 @@ func (a *Agent) applyRoutingPolicy(routes []string, routeOwners map[string]strin
 		kept = append(kept, cidr)
 	}
 
-	a.reportSuppressedRoutes(suppressed)
-	return kept
+	return kept, suppressed
 }
 
 // peerDirectProof is the slice of WireGuard stats the suppression decision
@@ -129,6 +126,7 @@ type peerDirectProof struct {
 	endpoint      netip.Addr
 	lastHandshake time.Time
 	lastDirectRX  time.Time
+	endpointSetAt time.Time
 }
 
 func (a *Agent) directProofByKey() map[string]peerDirectProof {
@@ -149,7 +147,7 @@ func (a *Agent) directProofByKey() map[string]peerDirectProof {
 		if err != nil {
 			continue
 		}
-		proof := peerDirectProof{endpoint: addr, lastHandshake: s.LastHandshake}
+		proof := peerDirectProof{endpoint: addr, lastHandshake: s.LastHandshake, endpointSetAt: a.endpointConfiguredAt[s.PublicKeyB64]}
 		if rx := a.wgMgr.LastDirectReceive(s.PublicKeyB64); rx > 0 {
 			proof.lastDirectRX = time.Unix(0, rx)
 		}
@@ -191,9 +189,18 @@ func (a *Agent) provenOnSegment(dst netip.Prefix, ownerKey string, containing []
 	// The handshake alone can predate the endpoint: an active direct probe
 	// force-sets the WireGuard endpoint to the advertised address before any
 	// packet has authenticated over it, while the handshake timestamp still
-	// belongs to the relay leg. Authenticated traffic received on the direct
-	// socket is what proves this endpoint, so require it within the same
-	// window.
+	// belongs to the relay leg. And the bind's direct-receive watermark
+	// updates before wireguard-go authenticates, so junk UDP from a stranger
+	// at a reused address can refresh it. The signal that survives both: the
+	// handshake must postdate this agent's last endpoint assignment for the
+	// peer. WireGuard keeps the endpoint only where authenticated packets
+	// come from — a handshake completed via relay roams it to localhost and
+	// is filtered above — so endpoint==dst plus a post-assignment handshake
+	// means the peer authenticated from that address.
+	if proof.endpointSetAt.IsZero() || !proof.lastHandshake.After(proof.endpointSetAt) {
+		return netip.Prefix{}, false
+	}
+	// Direct-socket receive freshness stays as defense in depth.
 	if proof.lastDirectRX.IsZero() || time.Since(proof.lastDirectRX) > window {
 		return netip.Prefix{}, false
 	}

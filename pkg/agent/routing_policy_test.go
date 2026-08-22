@@ -24,6 +24,12 @@ func policyAgent(local []string, stats []wireguard.PeerStats, gatewayCIDRs ...st
 	}
 	fake := &fakeWGEngine{stats: stats, lastDirect: lastDirect}
 	a := &Agent{wgMgr: fake, log: logr.Discard(), handshakeValidWindow: 3 * time.Minute}
+	// Endpoint assignments predate the handshakes unless a test overrides
+	// this: a handshake older than the assignment must never count as proof.
+	a.endpointConfiguredAt = map[string]time.Time{}
+	for _, s := range stats {
+		a.endpointConfiguredAt[s.PublicKeyB64] = time.Now().Add(-time.Hour)
+	}
 	a.localPrefixes = func() []netip.Prefix {
 		var out []netip.Prefix
 		for _, c := range local {
@@ -58,7 +64,7 @@ func TestRoutingPolicySuppressesProvenLocalPeer(t *testing.T) {
 	routes := []string{"198.18.18.5/32", "198.18.20.0/30", "10.213.103.70/32", "10.213.103.96/27"}
 	owners := map[string]string{"10.213.103.70/32": "peerB"}
 
-	got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil)
+	got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil)
 	want := []string{"198.18.18.5/32", "198.18.20.0/30", "10.213.103.96/27"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v want %v", got, want)
@@ -76,7 +82,7 @@ func TestRoutingPolicyKeepsRoutesWhenProofIsOffSegment(t *testing.T) {
 	routes := []string{"10.0.0.203/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("suppressed a cross-VPC route: got %v", got)
 	}
 }
@@ -90,7 +96,7 @@ func TestRoutingPolicyRequiresProof(t *testing.T) {
 	routes := []string{"10.0.0.203/32", "10.0.0.204/32", "10.0.0.205/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB", "10.0.0.204/32": "peerC"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("suppressed without proof: got %v", got)
 	}
 }
@@ -102,13 +108,13 @@ func TestRoutingPolicyReinstatesOnStaleProof(t *testing.T) {
 	routes := []string{"10.0.0.203/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); len(got) != 0 {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); len(got) != 0 {
 		t.Fatalf("fresh proof did not suppress: %v", got)
 	}
 	stale := fresh
 	stale.LastHandshake = time.Now().Add(-10 * time.Minute)
 	a.wgMgr.(*fakeWGEngine).stats = []wireguard.PeerStats{stale}
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("stale proof did not reinstate: got %v", got)
 	}
 }
@@ -119,7 +125,7 @@ func TestRoutingPolicyExcludeCIDRs(t *testing.T) {
 	t.Run("exclude beats gateway injection and reachability", func(t *testing.T) {
 		a := policyAgent(nil, nil, "172.31.4.0/24")
 		routes := []string{"172.31.4.0/24", "172.31.9.9/32", "192.0.2.1/32"}
-		got := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, routing)
+		got, _ := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, routing)
 		want := []string{"192.0.2.1/32"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v want %v", got, want)
@@ -130,7 +136,7 @@ func TestRoutingPolicyExcludeCIDRs(t *testing.T) {
 		a := policyAgent(nil, nil)
 		wide := &wirekubev1alpha1.RoutingSpec{ExcludeCIDRs: []string{"198.18.0.0/15"}}
 		routes := []string{"198.18.18.5/32"}
-		if got := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, wide); !reflect.DeepEqual(got, routes) {
+		if got, _ := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, wide); !reflect.DeepEqual(got, routes) {
 			t.Errorf("overlay route suppressed by exclude: got %v", got)
 		}
 	})
@@ -139,7 +145,7 @@ func TestRoutingPolicyExcludeCIDRs(t *testing.T) {
 		a := policyAgent(nil, nil, "172.16.0.0/12")
 		narrow := &wirekubev1alpha1.RoutingSpec{ExcludeCIDRs: []string{"172.31.0.0/16"}}
 		routes := []string{"172.16.0.0/12"}
-		if got := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, narrow); !reflect.DeepEqual(got, routes) {
+		if got, _ := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, narrow); !reflect.DeepEqual(got, routes) {
 			t.Errorf("gateway route dropped by a contained exclude: got %v", got)
 		}
 	})
@@ -155,7 +161,7 @@ func TestRoutingPolicyTunnelKeepsEverything(t *testing.T) {
 	routes := []string{"198.18.18.5/32", "10.213.103.70/32"}
 	owners := map[string]string{"10.213.103.70/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, routing); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, routing); !reflect.DeepEqual(got, routes) {
 		t.Errorf("tunnel policy altered routes: got %v", got)
 	}
 }
@@ -170,7 +176,7 @@ func TestRoutingPolicyKeepsOffSegmentPeers(t *testing.T) {
 	routes := []string{"10.213.103.70/32", "192.0.2.7/32"}
 	owners := map[string]string{"10.213.103.70/32": "peerB", "192.0.2.7/32": "peerFar"}
 
-	got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil)
+	got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil)
 	want := []string{"192.0.2.7/32"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v want %v", got, want)
@@ -189,7 +195,7 @@ func TestRoutingPolicyWithoutMeshCIDR(t *testing.T) {
 	routes := []string{"10.0.0.203/32", "172.31.9.9/32", "192.0.2.1/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	got := a.applyRoutingPolicy(routes, owners, "", routing)
+	got, _ := a.applyRoutingPolicy(routes, owners, "", routing)
 	want := []string{"192.0.2.1/32"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v want %v", got, want)
@@ -204,11 +210,11 @@ func TestRoutingPolicyIsPerObserver(t *testing.T) {
 	stats := []wireguard.PeerStats{provenPeer("peerB", "10.213.103.70:51822")}
 
 	sameSegment := policyAgent([]string{"10.213.103.64/26"}, stats)
-	if got := sameSegment.applyRoutingPolicy(routes, owners, meshCIDR, nil); len(got) != 0 {
+	if got, _ := sameSegment.applyRoutingPolicy(routes, owners, meshCIDR, nil); len(got) != 0 {
 		t.Errorf("same-segment observer kept %v", got)
 	}
 	otherVPC := policyAgent([]string{"10.99.0.0/24"}, stats)
-	if got := otherVPC.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := otherVPC.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("off-segment observer suppressed: got %v", got)
 	}
 }
@@ -224,7 +230,7 @@ func TestRoutingPolicyBindsProofToDestination(t *testing.T) {
 	routes := []string{"10.0.0.203/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("suppressed a route whose proof endpoint differs from the destination: got %v", got)
 	}
 }
@@ -242,8 +248,28 @@ func TestRoutingPolicyRejectsForcedEndpointWithoutDirectRX(t *testing.T) {
 	routes := []string{"10.0.0.203/32"}
 	owners := map[string]string{"10.0.0.203/32": "peerB"}
 
-	if got := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("suppressed on a forced endpoint with no direct traffic: got %v", got)
+	}
+}
+
+// The bind's direct-receive watermark updates before authentication, so junk
+// UDP from a stranger at a reused address refreshes it. A handshake that
+// predates this agent's endpoint assignment therefore proves nothing about
+// the assigned address, and the route must stay.
+func TestRoutingPolicyRequiresHandshakeAfterEndpointAssignment(t *testing.T) {
+	a := policyAgent(
+		[]string{"10.0.0.0/24"},
+		[]wireguard.PeerStats{provenPeer("peerB", "10.0.0.203:51822")},
+	)
+	// Endpoint assigned five seconds ago; the handshake is ten seconds old
+	// and belongs to the relay leg. Direct RX is fresh (attacker-forgeable).
+	a.endpointConfiguredAt["peerB"] = time.Now().Add(-5 * time.Second)
+	routes := []string{"10.0.0.203/32"}
+	owners := map[string]string{"10.0.0.203/32": "peerB"}
+
+	if got, _ := a.applyRoutingPolicy(routes, owners, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+		t.Errorf("suppressed on a pre-assignment handshake: got %v", got)
 	}
 }
 
@@ -251,7 +277,7 @@ func TestRoutingPolicyRejectsForcedEndpointWithoutDirectRX(t *testing.T) {
 func TestRoutingPolicyNoopWithoutSignals(t *testing.T) {
 	a := policyAgent(nil, nil)
 	routes := []string{"192.0.2.1/32", "198.18.18.5/32"}
-	if got := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
+	if got, _ := a.applyRoutingPolicy(routes, map[string]string{}, meshCIDR, nil); !reflect.DeepEqual(got, routes) {
 		t.Errorf("noop altered routes: got %v", got)
 	}
 }
