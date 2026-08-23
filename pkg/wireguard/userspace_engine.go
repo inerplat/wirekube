@@ -233,10 +233,26 @@ func (u *UserspaceEngine) Configure() error {
 	// Failures are logged, not fatal: the next sync reconciles the full set.
 	if len(u.preservedRoutes) > 0 {
 		restored := 0
+		var firstErr error
 		for i := range u.preservedRoutes {
-			if err := netlink.RouteReplace(&u.preservedRoutes[i]); err == nil {
-				restored++
+			r := u.preservedRoutes[i]
+			// Replay only the identity of the route, not the full captured
+			// struct: RouteListFiltered fills kernel-owned fields whose
+			// replay a fresh RTM_NEWROUTE can reject.
+			clean := netlink.Route{Table: r.Table, LinkIndex: r.LinkIndex, Dst: r.Dst, Src: r.Src, Scope: r.Scope}
+			err := netlink.RouteReplace(&clean)
+			if err != nil {
+				clean.Src = nil
+				err = netlink.RouteReplace(&clean)
 			}
+			if err == nil {
+				restored++
+			} else if firstErr == nil {
+				firstErr = err
+			}
+		}
+		if firstErr != nil {
+			log.Printf("[usp] preserved route restore error (first): %v", firstErr)
 		}
 		log.Printf("[usp] restored %d/%d preserved routes on %s", restored, len(u.preservedRoutes), u.ifaceName)
 		u.preservedRoutes = nil
