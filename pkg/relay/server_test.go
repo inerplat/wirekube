@@ -137,16 +137,25 @@ func TestServer_ExternalWGListenerForwardsBySourceToken(t *testing.T) {
 	}
 	defer external.Close()
 
-	if _, err := external.WriteToUDP([]byte("wg-init"), s.externalWG.conn.LocalAddr().(*net.UDPAddr)); err != nil {
-		t.Fatalf("external WriteToUDP: %v", err)
-	}
-
-	if err := ingressClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
-	}
-	frame, err := ReadFrame(ingressClient)
-	if err != nil {
-		t.Fatalf("ReadFrame ingress: %v", err)
+	// The register frame is processed on another goroutine, so the first
+	// datagram can race the registration and be dropped ("ingress peer not
+	// connected"), which is legitimate UDP behavior: WireGuard retries its
+	// handshake initiation too. Retry the send until a frame comes back.
+	var frame Frame
+	for attempt := 0; ; attempt++ {
+		if _, werr := external.WriteToUDP([]byte("wg-init"), s.externalWG.conn.LocalAddr().(*net.UDPAddr)); werr != nil {
+			t.Fatalf("external WriteToUDP: %v", werr)
+		}
+		if derr := ingressClient.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); derr != nil {
+			t.Fatalf("SetReadDeadline: %v", derr)
+		}
+		frame, err = ReadFrame(ingressClient)
+		if err == nil {
+			break
+		}
+		if attempt >= 15 {
+			t.Fatalf("ReadFrame ingress after %d attempts: %v", attempt+1, err)
+		}
 	}
 	if frame.Type != MsgExternalData {
 		t.Fatalf("frame type = %#x, want MsgExternalData", frame.Type)
