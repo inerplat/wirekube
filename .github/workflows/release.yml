@@ -158,6 +158,12 @@ jobs:
   # CrashLoopBackOff on their own image.
   verify-pins:
     needs: publish-image
+    # Pinning the manifests and the chart to a tag is what the release-prep
+    # commit does, and it only precedes a real release. A -dev prerelease is
+    # cut straight from main, where those files still name the previous
+    # release, so this check would fail every dev tag by construction and take
+    # the rest of the release with it.
+    if: ${{ !contains(github.ref_name, '-dev.') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -203,6 +209,11 @@ jobs:
   # rejects.
   release-cli:
     needs: [publish-image, verify-pins]
+    # A skipped verify-pins must not skip the CLI with it. The binary carries
+    # no manifest pins: it renders the workloads itself and takes its default
+    # image from the digest publish-image produced, so that job is the only
+    # dependency it actually has. A failed verify-pins still stops the release.
+    if: ${{ !cancelled() && needs.publish-image.result == 'success' && needs.verify-pins.result != 'failure' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
