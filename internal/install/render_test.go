@@ -733,6 +733,29 @@ func TestPlannerRejectsExplicitMeshCIDROverlap(t *testing.T) {
 	}
 }
 
+// The free-range check asks whether a range is available to take, which only
+// applies to a mesh that does not exist yet. Keeping the range an installed
+// mesh already runs on is not that question: every member carries an overlay
+// address inside it, and occupiedPrefixes reads local interfaces, so an upgrade
+// run from a member node would see the mesh colliding with itself.
+func TestPlannerKeepsTheLiveMeshCIDRDespiteOverlap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := wirekubev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}, Spec: corev1.NodeSpec{PodCIDR: "198.18.18.0/24", PodCIDRs: []string{"198.18.18.0/24"}}},
+		&wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: "198.18.18.0/24"}},
+	).Build()
+
+	if _, _, err := (Planner{Client: c}).Build(context.Background(), Options{Image: testImage, Relay: RelayNone, MeshCIDR: "198.18.18.0/24", WireKubeVersion: "v1.0.0"}); err != nil {
+		t.Fatalf("keeping the live mesh CIDR was rejected: %v", err)
+	}
+}
+
 func TestPlannerWarnsAboutPublicLoadBalancerCost(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

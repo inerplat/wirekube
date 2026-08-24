@@ -98,12 +98,21 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 		if err != nil {
 			return Plan{}, options, fmt.Errorf("invalid --mesh-cidr %q: %w", options.MeshCIDR, err)
 		}
-		occupied, err := p.occupiedPrefixes(ctx, options.ExcludeCIDRs)
-		if err != nil {
-			return Plan{}, options, err
-		}
-		if conflicts := overlappingPrefixes(prefix.Masked(), occupied); len(conflicts) > 0 {
-			return Plan{}, options, fmt.Errorf("--mesh-cidr %s overlaps observed cluster or local network %s", prefix.Masked(), strings.Join(conflicts, ", "))
+		// The overlap check answers "is this range free to take", which is a
+		// question only a mesh that does not exist yet can be asked. A mesh
+		// already running on this range has put its overlay addresses on every
+		// member's interface, and occupiedPrefixes reads local interfaces, so
+		// re-checking on upgrade reports the mesh colliding with itself — and
+		// it does so only when the command runs from a member node, which is
+		// where an operator naturally runs it.
+		if live := p.liveMeshCIDR(ctx); live != prefix.Masked().String() {
+			occupied, err := p.occupiedPrefixes(ctx, options.ExcludeCIDRs)
+			if err != nil {
+				return Plan{}, options, err
+			}
+			if conflicts := overlappingPrefixes(prefix.Masked(), occupied); len(conflicts) > 0 {
+				return Plan{}, options, fmt.Errorf("--mesh-cidr %s overlaps observed cluster or local network %s", prefix.Masked(), strings.Join(conflicts, ", "))
+			}
 		}
 		options.MeshCIDR = prefix.Masked().String()
 	}
@@ -456,6 +465,21 @@ func overlappingPrefixes(candidate netip.Prefix, occupied []netip.Prefix) []stri
 
 // liveMeshListenPort returns the listen port of the cluster's existing
 // WireKubeMesh, or 0 when no mesh (or no CRD) is installed yet.
+// liveMeshCIDR is the range the installed mesh already runs on, or "" when no
+// mesh is readable. A request for that same range is a keep, not a choice, and
+// the caller skips the free-range check for it.
+func (p Planner) liveMeshCIDR(ctx context.Context) string {
+	mesh := &wirekubev1alpha1.WireKubeMesh{}
+	if err := p.Client.Get(ctx, client.ObjectKey{Name: "default"}, mesh); err != nil {
+		return ""
+	}
+	prefix, err := netip.ParsePrefix(mesh.Spec.MeshCIDR)
+	if err != nil {
+		return ""
+	}
+	return prefix.Masked().String()
+}
+
 func (p Planner) liveMeshListenPort(ctx context.Context) int32 {
 	mesh := &wirekubev1alpha1.WireKubeMesh{}
 	if err := p.Client.Get(ctx, client.ObjectKey{Name: "default"}, mesh); err != nil {
