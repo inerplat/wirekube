@@ -233,6 +233,36 @@ spec:
                   evidence before acting; see Agent.peerIsDormant.
                 format: date-time
                 type: string
+              linkAddresses:
+                description: |-
+                  LinkAddresses lists the addresses this node answers for on its own
+                  attached links, each with the MAC that answers ARP for it. Written by
+                  the agent that owns this peer and by nobody else, which is what makes
+                  it usable as one half of a two-sided adjacency check: an observer that
+                  resolves the same address to the same MAC in its own neighbour table is
+                  on the same segment as the keyholder. Containment in a shared private
+                  range is not enough on its own, because the range repeats across VPCs.
+                items:
+                  description: LinkAddress is one address this node answers for on
+                    an attached link.
+                  properties:
+                    address:
+                      description: Address is the IPv4 or IPv6 address, without a
+                        prefix length.
+                      type: string
+                    interface:
+                      description: Interface is the link the address is configured
+                        on, for diagnostics.
+                      type: string
+                    mac:
+                      description: MAC is the hardware address that answers for it,
+                        lowercase colon form.
+                      type: string
+                  required:
+                  - address
+                  - mac
+                  type: object
+                type: array
               natType:
                 description: |-
                   NATType indicates the NAT mapping behavior detected on this node via STUN.

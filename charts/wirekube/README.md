@@ -50,7 +50,7 @@ The agent DaemonSet runs with `hostNetwork: true`, `privileged: true`, unconfine
 | `mesh.meshCIDR` | (required) | Overlay CIDR |
 | `mesh.relay.mode` | `auto` | `auto` / `always` / `never` |
 | `mesh.relay.transport` | `tcp` | `tcp` or `wss` for the managed relay |
-| `mesh.routing.localSubnetPolicy` | `""` (CRD default `bypass`) | `bypass` keeps proven same-segment traffic on the physical link; `tunnel` encrypts it anyway |
+| `mesh.routing.localSubnetPolicy` | `""` (CRD default `tunnel`) | `bypass` keeps confirmed same-segment traffic on the physical link, unencrypted; `tunnel` routes it through WireGuard |
 | `mesh.routing.excludeCIDRs` | `[]` | Destinations no agent installs into the WireKube table (containment matching, route units) |
 
 See [values.yaml](values.yaml) for the full list.

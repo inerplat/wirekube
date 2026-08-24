@@ -186,9 +186,11 @@ mesh:
     - stun:stun.cloudflare.com:3478
     - stun:stun.l.google.com:19302
 
-  # Route installation policy for every agent. localSubnetPolicy "bypass"
-  # (the CRD default) keeps same-segment traffic on the physical link once a
-  # peer proves it is really on that segment; "tunnel" encrypts it anyway.
+  # Route installation policy for every agent. The default is "tunnel": a
+  # same-segment peer is routed through WireGuard like any other peer.
+  # "bypass" keeps that traffic on the physical link, unencrypted, for peers
+  # this node confirms are on its own segment by matching the MAC that answers
+  # for the address on the wire against the MAC the peer publishes for it.
   # excludeCIDRs lists destinations no agent may ever route into the tunnel.
   routing:
     localSubnetPolicy: ""

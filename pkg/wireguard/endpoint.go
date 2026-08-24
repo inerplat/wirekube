@@ -10,9 +10,12 @@ import (
 var _ conn.Endpoint = (*WireKubeEndpoint)(nil)
 
 // WireKubeEndpoint wraps a destination address for wireguard-go's conn.Endpoint
-// interface. It carries the remote (dst) address and an optional peer public key.
-// When peerKey is set (relay-received packets), Send() uses it directly to look
-// up the pathTable instead of going through the addrToPeer reverse map.
+// interface, carrying the remote address and, where it is known, the peer's
+// public key.
+//
+// Both relay- and direct-received packets carry the key. Send resolves the peer
+// from it rather than by reverse-resolving the destination address, which is
+// ambiguous whenever several peers share one NAT address.
 type WireKubeEndpoint struct {
 	dst netip.AddrPort
 	relayPeerKey
@@ -32,11 +35,15 @@ func (e *WireKubeEndpoint) SrcToString() string {
 	return ""
 }
 
-// DstToString returns the destination address as "ip:port".
+// DstToString returns the destination address as "ip:port" — for a
+// relay-delivered packet, the synthetic it was surfaced at.
+//
+// It reports only the real destination, never externalSource.Addr. That string
+// is whatever the relay claimed, and wireguard-go prints this value into the
+// UAPI endpoint field, where the agent reads it as a statement about where the
+// peer actually is. Replies to an external peer are routed from externalSource
+// itself inside Send, so nothing depends on it appearing here.
 func (e *WireKubeEndpoint) DstToString() string {
-	if e.externalSource.Valid && e.externalSource.Addr != "" {
-		return e.externalSource.Addr
-	}
 	return e.dst.String()
 }
 

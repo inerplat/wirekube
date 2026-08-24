@@ -42,7 +42,7 @@ spec:
 | `spec.mtu` | int | `1420` | Interface MTU (1420 accounts for WireGuard overhead) |
 | `spec.meshCIDR` | string | - | Private CIDR for the overlay. Each node is automatically assigned a stable `/32` within this range derived from `fnv32a(nodeName)`, and that IP becomes the peer's primary AllowedIPs entry. Choose a range that does not overlap with node, pod, service, VPC, proxy, or corporate networks. Leave empty to manage AllowedIPs entirely by hand. |
 | `spec.autoAllowedIPs.includeNodeInternalIP` | bool | `false` | When `true`, also append the node's **private** address to its peer entry so legacy references by node IP still tunnel. The agent never publishes a public IP even if kubelet reports one as `Node.InternalIP` (common on Oracle Cloud); set the `wirekube.io/internal-ip` annotation on the Node to force a specific private address. |
-| `spec.routing.localSubnetPolicy` | string | `bypass` | `bypass` keeps traffic to a proven same-segment peer on the physical link instead of the tunnel; `tunnel` encrypts it anyway. Suppression never fires on address containment alone — the peer must hold a live handshake at the advertised address inside the observer's attached prefix. |
+| `spec.routing.localSubnetPolicy` | string | `tunnel` | `tunnel` routes a same-segment peer through WireGuard like any other peer. `bypass` drops the tunnel host route so that traffic takes the physical link, unencrypted. A route is dropped only for a peer this node has confirmed is on its own segment: the address resolves in this node's neighbour table to the same MAC the peer publishes for the link it owns that address on. Containment in an attached prefix is never enough by itself, so VPCs that reuse one private range keep their tunnel routes. |
 | `spec.routing.excludeCIDRs` | []string | - | Destinations no agent installs into the WireKube table. Containment matching in route units; overrides gateway routes it fully contains, never mesh overlay routes. |
 | `spec.stunServers` | []string | - | STUN servers for endpoint discovery. **Minimum 2 required** for Symmetric NAT detection (RFC 5780). |
 | `spec.relay.mode` | string | `auto` | `auto`, `always`, or `never` |
@@ -57,6 +57,23 @@ spec:
 | `spec.relay.managed.port` | int | `3478` | Relay service port |
 | `spec.relay.managed.controlEndpoint` | string | - | Public `wss://HOST/PATH` URL used when the managed transport is WSS. |
 | `spec.relay.managed.transport` | string | `tcp` | Selects the managed agent transport: `tcp` or `wss`. |
+
+#### Upgrading from a `bypass` default
+
+The default changed from `bypass` to `tunnel`. A `WireKubeMesh` created while
+the old default applied has `localSubnetPolicy: bypass` stored in the object,
+and upgrading the CRD does not rewrite it, so that mesh keeps bypassing until
+the field is set explicitly. Check an existing mesh with:
+
+```bash
+kubectl get wirekubemesh default -o jsonpath='{.spec.routing.localSubnetPolicy}'
+```
+
+Meshes that stay on `bypass` also change how a peer is confirmed. Earlier
+releases accepted a live WireGuard handshake terminating at the advertised
+address; confirmation is now a neighbour-table MAC match against the peer's
+`status.linkAddresses`. Peers whose agent predates that status publish nothing
+to match, so their routes stay in the tunnel until every agent is upgraded.
 
 ### Relay Modes
 

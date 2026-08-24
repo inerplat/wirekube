@@ -342,9 +342,12 @@ func (u *UserspaceEngine) SyncPeers(peers []PeerConfig) error {
 							initialMode = PathModeRelay
 						}
 						u.bind.SetPeerPath(p.PublicKeyB64, initialMode, addr)
-					} else if existing.DirectAddr != addr {
-						existing.DirectAddr = addr
-						u.bind.addrToPeer.Store(addr.String(), p.PublicKeyB64)
+					} else if existing.DirectAddr() != addr {
+						// SetPeerPath rather than a direct field write: it
+						// releases the claim on the old address as well as
+						// recording the new one, so a peer that moves does
+						// not keep claiming an address it has left.
+						u.bind.SetPeerPath(p.PublicKeyB64, existing.Mode.Load(), addr)
 					}
 				}
 			}
@@ -353,15 +356,27 @@ func (u *UserspaceEngine) SyncPeers(peers []PeerConfig) error {
 		for _, aip := range p.AllowedIPs {
 			fmt.Fprintf(&conf, "allowed_ip=%s\n", aip)
 		}
-		if p.KeepaliveSeconds > 0 {
-			fmt.Fprintf(&conf, "persistent_keepalive_interval=%d\n", p.KeepaliveSeconds)
-		}
+		// Written on every sync, including when the desired interval is 0.
+		// PokeKeepalive and ForceEndpoint arm a 1s keepalive for probing, and
+		// this assignment is what disarms it again; omitting the zero case
+		// would leave a probed peer emitting a packet per second for good.
+		fmt.Fprintf(&conf, "persistent_keepalive_interval=%d\n", p.KeepaliveSeconds)
 	}
 
-	// Remove peers not in desired set.
+	// Remove peers not in the desired set, from the bind as well as from the
+	// device. The bind holds its own path entry and address claims per peer,
+	// and a claim left behind makes that address unresolvable for whoever
+	// holds it next.
 	for _, hexKey := range currentKeys {
 		if _, ok := desiredKeys[hexKey]; !ok {
 			fmt.Fprintf(&conf, "public_key=%s\nremove=true\n", hexKey)
+			if u.bind != nil {
+				if b64, err := hexToKeyB64(hexKey); err == nil {
+					u.bind.ForgetPeer(b64)
+				} else {
+					log.Printf("[usp] warning: cannot release bind state for removed peer %s: %v", hexKey, err)
+				}
+			}
 		}
 	}
 
@@ -371,28 +386,22 @@ func (u *UserspaceEngine) SyncPeers(peers []PeerConfig) error {
 	return u.wgDev.IpcSet(conf.String())
 }
 
-// ForceEndpoint updates a single peer's endpoint and sets a 1s keepalive to
-// trigger an immediate handshake attempt.
+// ForceEndpoint updates a single peer's endpoint and arms a 1s keepalive so an
+// outgoing packet leaves over the new endpoint immediately.
 func (u *UserspaceEngine) ForceEndpoint(pubKeyB64, endpoint string) error {
 	if u.wgDev == nil {
 		return fmt.Errorf("device not initialized")
 	}
-	pubHex := keyToHex(pubKeyB64)
-	conf := fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\npersistent_keepalive_interval=1\n",
-		pubHex, endpoint)
-	return u.wgDev.IpcSet(conf)
+	return u.wgDev.IpcSet(forceEndpointConf(keyToHex(pubKeyB64), endpoint))
 }
 
-// PokeKeepalive temporarily sets keepalive to 1s to trigger an immediate
-// outgoing WG packet without changing the endpoint.
+// PokeKeepalive arms a 1s keepalive to trigger an immediate outgoing WG packet
+// without changing the endpoint.
 func (u *UserspaceEngine) PokeKeepalive(pubKeyB64 string) error {
 	if u.wgDev == nil {
 		return fmt.Errorf("device not initialized")
 	}
-	pubHex := keyToHex(pubKeyB64)
-	conf := fmt.Sprintf("public_key=%s\nupdate_only=true\npersistent_keepalive_interval=1\n",
-		pubHex)
-	return u.wgDev.IpcSet(conf)
+	return u.wgDev.IpcSet(pokeKeepaliveConf(keyToHex(pubKeyB64)))
 }
 
 // GetStats returns per-peer statistics by parsing UAPI IpcGet output.
@@ -408,9 +417,9 @@ func (u *UserspaceEngine) GetStats() ([]PeerStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Feed wireguard-go's roamed endpoints into the bind so addrToPeer
-	// disambiguates same-NAT peers and stale source-port entries are purged
-	// as the NAT mapping drifts.
+	// Feed wireguard-go's roamed endpoints back into the bind, so its address
+	// claims can disambiguate same-NAT peers and stale source-port entries are
+	// purged as the NAT mapping drifts.
 	if u.bind != nil {
 		for _, s := range stats {
 			if s.ActualEndpoint == "" || s.PublicKeyB64 == "" {
@@ -420,10 +429,21 @@ func (u *UserspaceEngine) GetStats() ([]PeerStats, error) {
 			if err != nil {
 				continue
 			}
+			// Skip the synthetic a relay delivery leaves behind as the device
+			// endpoint. Feeding it back would overwrite the peer's learned
+			// direct address with a loopback that has no UDP destination and
+			// close the direct leg until the next probe.
+			if addr.Port() == 0 || addr.Addr().IsLoopback() {
+				continue
+			}
 			pp := u.bind.GetPeerPath(s.PublicKeyB64)
 			if pp == nil {
 				continue
 			}
+			// The device roams an endpoint only on packets that authenticate,
+			// which is what makes this address safe for the datapath to
+			// follow without corroboration.
+			u.bind.NoteAuthenticatedAddr(s.PublicKeyB64, addr)
 			u.bind.updateLearnedAddr(pp, s.PublicKeyB64, addr)
 		}
 	}
@@ -698,6 +718,19 @@ func parseUAPIStats(output string) ([]PeerStats, error) {
 		}
 	}
 	return stats, nil
+}
+
+// hexToKeyB64 converts a UAPI hex key back to the base64 form the bind and the
+// agent key their per-peer state by.
+func hexToKeyB64(hexKey string) (string, error) {
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) != 32 {
+		return "", fmt.Errorf("key is %d bytes, want 32", len(raw))
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // keyToHex converts a base64-encoded WireGuard key to hex encoding, which is
