@@ -372,10 +372,14 @@ func disableXfrmForIface(ifaceName string) {
 // This is the observer-side half of the local-subnet bypass; the WireKube
 // interface's own connected routes must not count as "reachable without the
 // tunnel", and neither must entries in the WireKube table.
-func LocalLinkPrefixes(excludeIface string) []netip.Prefix {
+// The error is returned rather than folded into an empty result so that a
+// caller can tell "this host has no attached prefixes" from "the kernel did not
+// answer". Conflated, a transient netlink failure reads as a re-cabling, and
+// the local-subnet bypass reinstates every suppressed route for that cycle.
+func LocalLinkPrefixes(excludeIface string) ([]netip.Prefix, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("listing links: %w", err)
 	}
 	nameByIndex := map[int]string{}
 	for _, l := range links {
@@ -384,9 +388,9 @@ func LocalLinkPrefixes(excludeIface string) []netip.Prefix {
 	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4,
 		&netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("listing main-table routes: %w", err)
 	}
-	return localPrefixesFromRoutes(routes, nameByIndex, excludeIface)
+	return localPrefixesFromRoutes(routes, nameByIndex, excludeIface), nil
 }
 
 // localPrefixesFromRoutes is the pure filtering half of LocalLinkPrefixes,

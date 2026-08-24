@@ -72,16 +72,34 @@ type WireKubeMeshSpec struct {
 // RoutingSpec controls route installation on every agent. The decisions are
 // made per observing node: each agent evaluates its own kernel state.
 type RoutingSpec struct {
-	// LocalSubnetPolicy decides what happens when a peer's advertised address
-	// is on a segment the observing node can already reach without the
-	// tunnel. "bypass" (default) suppresses the tunnel route so same-segment
-	// traffic stays on the physical link; the suppression additionally
-	// requires cryptographic proof that the peer really is on that segment (a
-	// live authenticated WireGuard handshake with a direct endpoint inside
-	// the same prefix), so VPCs that reuse one private range keep their
-	// tunnel routes. "tunnel" keeps today's behavior and encrypts
-	// same-segment traffic too.
-	// +kubebuilder:default=bypass
+	// LocalSubnetPolicy decides how a peer is routed when its advertised
+	// address sits on a segment this node can already reach without the
+	// tunnel. "tunnel" (default) routes that peer through WireGuard like any
+	// other, so same-segment traffic stays encrypted.
+	//
+	// "bypass" drops the tunnel host route for such a peer so the traffic
+	// takes the physical link instead, trading encryption for the latency and
+	// throughput of the wire. It affects host routes only, and only peers this
+	// node has confirmed are on one of its own segments.
+	//
+	// Confirmation is a two-sided layer-2 match, because address containment
+	// proves nothing on its own: private ranges repeat across VPCs, so a
+	// peer's address can fall inside an attached prefix while a different
+	// machine holds that address here. This node resolves the address in its
+	// own neighbour table and gets the MAC that answers for it on the wire;
+	// the peer publishes the MAC of the link it owns that address on, in a
+	// status only its own agent writes. Equal MACs mean the machine answering
+	// on this segment is the peer itself. The security trade is MAC
+	// possession in place of key possession.
+	//
+	// Both inputs are local and static, so the decision is recomputed every
+	// sync rather than latched, and it follows the wiring: a peer that stops
+	// being adjacent gets its tunnel route back on the next cycle, and a peer
+	// that joins later is confirmed on the first sync after it has published
+	// its link addresses and this node has resolved the address on the wire.
+	// Nothing depends on WireGuard transport state, so relay-only peers and
+	// restarted agents are judged the same as any other.
+	// +kubebuilder:default=tunnel
 	// +kubebuilder:validation:Enum=bypass;tunnel
 	// +optional
 	LocalSubnetPolicy string `json:"localSubnetPolicy,omitempty"`
@@ -127,7 +145,9 @@ type NATTraversalSpec struct {
 	// runs an active health probe (PokeKeepalive + re-handshake) before reverting
 	// to relay. With active probing, this can safely be set much lower than
 	// WireGuard's REKEY_AFTER_TIME (120s) — e.g. 10s for fast failure detection.
-	// Minimum: 5. Default: 180 (3 minutes).
+	// Values above 150 are clamped so DirectConnectedWindowSeconds can stay
+	// above this one and still fit under WireGuard's REJECT_AFTER_TIME (180s).
+	// Minimum: 5. Default: 150.
 	// +kubebuilder:validation:Minimum=5
 	// +optional
 	HandshakeValidWindowSeconds int32 `json:"handshakeValidWindowSeconds,omitempty"`
@@ -143,8 +163,11 @@ type NATTraversalSpec struct {
 
 	// DirectConnectedWindowSeconds is the grace period after upgrading from relay
 	// to direct. During this window, the agent uses a longer handshake validity
-	// check to allow WG to complete its first direct re-handshake. Must be >=
-	// HandshakeValidWindowSeconds + 30. Default: HandshakeValidWindowSeconds + 120.
+	// check to allow WG to complete its first direct re-handshake. It is raised
+	// to at least HandshakeValidWindowSeconds + 20 and capped at 170, because
+	// past WireGuard's REJECT_AFTER_TIME (180s) the session no longer exists.
+	// Default: 170. Auto-derived (when only HandshakeValidWindowSeconds is set):
+	// max(HandshakeValidWindowSeconds + 20, 140), capped at 170.
 	// +optional
 	DirectConnectedWindowSeconds int32 `json:"directConnectedWindowSeconds,omitempty"`
 }

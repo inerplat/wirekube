@@ -34,6 +34,19 @@ type WireKubePeerSpec struct {
 	PersistentKeepalive int32 `json:"persistentKeepalive,omitempty"`
 }
 
+// LinkAddress is one address this node answers for on an attached link.
+type LinkAddress struct {
+	// Address is the IPv4 or IPv6 address, without a prefix length.
+	Address string `json:"address"`
+
+	// MAC is the hardware address that answers for it, lowercase colon form.
+	MAC string `json:"mac"`
+
+	// Interface is the link the address is configured on, for diagnostics.
+	// +optional
+	Interface string `json:"interface,omitempty"`
+}
+
 // ICECandidate represents a connectivity candidate discovered by the agent.
 type ICECandidate struct {
 	// Type is the candidate type: "host", "srflx", "relay", "prflx".
@@ -128,6 +141,16 @@ type WireKubePeerStatus struct {
 	// "direct" or "relay". Written by the agent that owns this peer.
 	// +optional
 	Connections map[string]string `json:"connections,omitempty"`
+
+	// LinkAddresses lists the addresses this node answers for on its own
+	// attached links, each with the MAC that answers ARP for it. Written by
+	// the agent that owns this peer and by nobody else, which is what makes
+	// it usable as one half of a two-sided adjacency check: an observer that
+	// resolves the same address to the same MAC in its own neighbour table is
+	// on the same segment as the keyholder. Containment in a shared private
+	// range is not enough on its own, because the range repeats across VPCs.
+	// +optional
+	LinkAddresses []LinkAddress `json:"linkAddresses,omitempty"`
 
 	// RelayLatencyMs is the measured latency to this peer via relay, in milliseconds.
 	// Only set when TransportMode is "relay".

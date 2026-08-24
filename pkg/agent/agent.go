@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -141,9 +142,21 @@ type Agent struct {
 	// SNAT rules a previous run may have left in the kernel, so the
 	// no-gateways path scans iptables once per process instead of every sync.
 	gwRetainedRulesChecked bool
+	// neighbors reads this host's resolved neighbour table; linkAddresses
+	// reads the addresses this host answers for. They are the two halves of
+	// the local-segment adjacency check seen from one node: what this node
+	// observes on the wire, and what it publishes for other nodes to compare
+	// against. Both are function fields so tests can supply a topology
+	// without a kernel.
+	neighbors     func() ([]wireguard.NeighborEntry, error)
+	linkAddresses func() ([]wireguard.LinkAddressInfo, error)
 	// localPrefixes returns the prefixes this host reaches without the
 	// tunnel; injectable for tests, defaults to kernel scope-link routes.
-	localPrefixes func() []netip.Prefix
+	localPrefixes func() ([]netip.Prefix, error)
+	// lastLocalPrefixes is the most recent prefix set the kernel actually
+	// returned, kept so a failed read can fall back to an observation rather
+	// than to an empty set that would read as a re-cabling.
+	lastLocalPrefixes []netip.Prefix
 	// lastSuppressedRoutes remembers the previous sync's suppression set so
 	// transitions are logged once, not every tick.
 	lastSuppressedRoutes map[string]string
@@ -155,13 +168,6 @@ type Agent struct {
 	// its previous value across read failures.
 	lastRoutingSpec *wirekubev1alpha1.RoutingSpec
 	lastMeshCIDR    string
-	// endpointConfiguredAt records when this agent last changed a peer's
-	// configured WireGuard endpoint (initial config or a probe's
-	// ForceEndpoint). A handshake older than this timestamp says nothing
-	// about the current endpoint: the address was set by us, not proven by
-	// the peer. Keyed by public key.
-	endpointConfiguredAt map[string]time.Time
-	configuredEndpoints  map[string]string
 	// gwClientCache maps gateway CIDR → set of authorized client peer names.
 	// Rebuilt every sync cycle. nil means not yet built.
 	gwClientCache map[string]map[string]bool
@@ -236,7 +242,11 @@ func NewAgent(log logr.Logger, k8sClient client.Client, wgMgr wireguard.WGEngine
 		peerTrafficSnapshots: make(map[string]peerTrafficSnapshot),
 		peerMetricLabels:     make(map[string]struct{}),
 	}
-	a.localPrefixes = func() []netip.Prefix { return wireguard.LocalLinkPrefixes(wgMgr.InterfaceName()) }
+	a.localPrefixes = func() ([]netip.Prefix, error) { return wireguard.LocalLinkPrefixes(wgMgr.InterfaceName()) }
+	a.neighbors = func() ([]wireguard.NeighborEntry, error) { return wireguard.NeighborsOnLinks(wgMgr.InterfaceName()) }
+	a.linkAddresses = func() ([]wireguard.LinkAddressInfo, error) {
+		return wireguard.LocalLinkAddresses(wgMgr.InterfaceName())
+	}
 	a.pathMonitor = NewPathMonitor(log.WithName("path"), wgMgr, PathMonitorConfig{}, time.Now)
 	return a
 }
@@ -814,14 +824,14 @@ func (a *Agent) sync(ctx context.Context) error {
 	allowRoutesBeforeHandshake := map[string]bool{}
 	ownAllowedIPsSet := false
 
-	// Build stats map for relay fallback decisions
+	// Read the device once for the decisions below.
 	statsByKey := make(map[string]wireguard.PeerStats)
-	if a.relayPool != nil {
-		if stats, err := a.wgMgr.GetStats(); err == nil {
-			for _, s := range stats {
-				statsByKey[s.PublicKeyB64] = s
-			}
+	if stats, err := a.wgMgr.GetStats(); err == nil {
+		for _, s := range stats {
+			statsByKey[s.PublicKeyB64] = s
 		}
+	} else {
+		a.log.V(1).Info("device stats unavailable this sync", "err", err)
 	}
 
 	remotePeerNames := []string{}
@@ -966,22 +976,6 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.log.Info("own allowedIPs empty, passive mode (handshake only, no routes)")
 	}
 
-	// Track when each peer's configured endpoint changes, so route
-	// suppression can demand a handshake newer than the assignment: only an
-	// authenticated packet from the configured address keeps WireGuard's
-	// endpoint there afterwards (a relay-delivered handshake roams it to
-	// localhost), which is what upgrades an assignment into proof.
-	if a.configuredEndpoints == nil {
-		a.configuredEndpoints = map[string]string{}
-		a.endpointConfiguredAt = map[string]time.Time{}
-	}
-	for _, pc := range wgPeers {
-		if a.configuredEndpoints[pc.PublicKeyB64] != pc.Endpoint {
-			a.configuredEndpoints[pc.PublicKeyB64] = pc.Endpoint
-			a.endpointConfiguredAt[pc.PublicKeyB64] = time.Now()
-		}
-	}
-
 	if err := a.wgMgr.SyncPeers(wgPeers); err != nil {
 		return fmt.Errorf("syncing WireGuard peers: %w", err)
 	}
@@ -1028,7 +1022,10 @@ func (a *Agent) sync(ctx context.Context) error {
 		a.keepRoutesUntilHandshakes = false
 		a.log.Info("keeping preserved routes through the first sync; handshakes have not re-formed yet")
 	} else {
-		kept, suppressedRoutesNow := a.applyRoutingPolicy(allRoutes, routeOwners, a.lastMeshCIDR, a.lastRoutingSpec)
+		// Each peer's published link addresses are passed in rather than read
+		// inside the policy, so the whole decision runs against one consistent
+		// snapshot of the peer list this sync already fetched.
+		kept, suppressedRoutesNow := a.applyRoutingPolicy(allRoutes, routeOwners, a.lastMeshCIDR, a.lastRoutingSpec, peerLinkAddresses(remotePeers))
 		allRoutes = kept
 		if err := a.wgMgr.SyncRoutes(allRoutes); err != nil {
 			return fmt.Errorf("syncing routes: %w", err)
@@ -1231,9 +1228,46 @@ func (a *Agent) peerHadMeaningfulTrafficSinceLastSync(pubKey string, current wir
 	return deltaSent+deltaRecv > meaningfulTrafficDeltaBytes
 }
 
+// ownLinkAddresses reads this node's attached addresses and their MACs for
+// publication in the peer's status, where observers on the same segment use
+// them to complete the adjacency check.
+//
+// A failed read returns nil, which leaves the previously published set in
+// place. Addresses and MACs change only when the node is re-cabled, so a stale
+// entry is almost always still correct, while an empty one would make every
+// observer tunnel traffic that could have taken the wire.
+func (a *Agent) ownLinkAddresses() []wirekubev1alpha1.LinkAddress {
+	if a.linkAddresses == nil {
+		return nil
+	}
+	infos, err := a.linkAddresses()
+	if err != nil {
+		a.log.Error(err, "reading local link addresses; keeping the published set")
+		return nil
+	}
+	out := make([]wirekubev1alpha1.LinkAddress, 0, len(infos))
+	for _, i := range infos {
+		out = append(out, wirekubev1alpha1.LinkAddress{
+			Address:   i.Address.String(),
+			MAC:       i.MAC,
+			Interface: i.Interface,
+		})
+	}
+	sort.Slice(out, func(x, y int) bool { return out[x].Address < out[y].Address })
+	return out
+}
+
 func (a *Agent) recordPeerTrafficSnapshots(stats map[string]wireguard.PeerStats) {
 	if a.peerTrafficSnapshots == nil {
 		a.peerTrafficSnapshots = make(map[string]peerTrafficSnapshot, len(stats))
+	}
+	// Prune peers the device no longer has. A peer that returns starts its
+	// counters at zero, so a retained high-water mark would make every later
+	// delta read as "no traffic".
+	for pubKey := range a.peerTrafficSnapshots {
+		if _, ok := stats[pubKey]; !ok {
+			delete(a.peerTrafficSnapshots, pubKey)
+		}
 	}
 	for pubKey, s := range stats {
 		a.peerTrafficSnapshots[pubKey] = peerTrafficSnapshot{
@@ -1277,7 +1311,7 @@ func (a *Agent) reflectNATEndpoints(ctx context.Context, peerList *wirekubev1alp
 		if !ok || s.ActualEndpoint == "" {
 			continue
 		}
-		if time.Since(s.LastHandshake) > a.handshakeValidWindow {
+		if time.Since(s.LastHandshake) > a.effectiveHandshakeWindow() {
 			continue
 		}
 		if s.ActualEndpoint == p.Spec.Endpoint {
@@ -1444,6 +1478,14 @@ func (a *Agent) updateOwnStatus(
 	// tell "this peer's agent is alive but idle" from "nobody is home".
 	reportedAt := metav1.NewTime(time.Now())
 	peer.Status.LastReportedAt = &reportedAt
+	// Publish this node's own link addresses so observers on the same segment
+	// can complete the adjacency check. The claim carries weight because this
+	// peer's status has exactly one writer: its own agent. A node in another
+	// VPC reusing the same private range publishes a MAC that no observer here
+	// resolves for that address, so its routes stay in the tunnel.
+	if links := a.ownLinkAddresses(); links != nil {
+		peer.Status.LinkAddresses = links
+	}
 	if err := a.client.Status().Patch(ctx, peer, patch); err != nil {
 		return err
 	}
@@ -1850,28 +1892,7 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		a.relayRetry = 120 * time.Second
 	}
 
-	// Configurable handshake windows and health probe from NATTraversal spec.
-	a.handshakeValidWindow = defaultHandshakeValidWindow
-	a.directConnectedWindow = defaultDirectConnectedWindow
-	a.healthProbeTimeout = 5 * time.Second
-	if mesh.Spec.NATTraversal != nil {
-		if v := mesh.Spec.NATTraversal.HandshakeValidWindowSeconds; v >= 5 {
-			a.handshakeValidWindow = time.Duration(v) * time.Second
-		}
-		if v := mesh.Spec.NATTraversal.HealthProbeTimeoutSeconds; v >= 1 {
-			a.healthProbeTimeout = time.Duration(v) * time.Second
-		}
-		if v := mesh.Spec.NATTraversal.DirectConnectedWindowSeconds; v > 0 {
-			a.directConnectedWindow = time.Duration(v) * time.Second
-		} else if a.handshakeValidWindow != defaultHandshakeValidWindow {
-			// Auto-derive: handshakeValidWindow + 2 min grace
-			a.directConnectedWindow = a.handshakeValidWindow + 2*time.Minute
-		}
-		// Enforce minimum: directConnectedWindow >= handshakeValidWindow + 30s
-		if a.directConnectedWindow < a.handshakeValidWindow+30*time.Second {
-			a.directConnectedWindow = a.handshakeValidWindow + 30*time.Second
-		}
-	}
+	a.applyNATTraversalWindows(mesh.Spec.NATTraversal)
 
 	// After restart with a preserved interface, use a shorter initial retry
 	// so direct upgrade probing starts quickly instead of waiting the full 120s.
@@ -2365,6 +2386,67 @@ func (a *Agent) enableRelayForPeer(peer *wirekubev1alpha1.WireKubePeer) string {
 	return proxy.ListenAddr()
 }
 
+// applyNATTraversalWindows resolves the handshake and direct-connected windows
+// from the mesh's NAT-traversal settings.
+//
+// The two windows carry one invariant in both directions:
+//
+//	handshakeValidWindow < directConnectedWindow <= RejectAfterTime
+//
+// The lower bound keeps a freshly upgraded peer from looking disconnected the
+// moment it is promoted; the upper bound keeps a peer from being reported
+// direct after WireGuard has discarded the session. Both operator inputs are
+// resolved in one place because satisfying the invariant requires bounding
+// them in a fixed order, with the handshake window first.
+func (a *Agent) applyNATTraversalWindows(nt *wirekubev1alpha1.NATTraversalSpec) {
+	a.handshakeValidWindow = defaultHandshakeValidWindow
+	a.directConnectedWindow = defaultDirectConnectedWindow
+	a.healthProbeTimeout = 5 * time.Second
+	if nt != nil {
+		if v := nt.HandshakeValidWindowSeconds; v >= 5 {
+			a.handshakeValidWindow = time.Duration(v) * time.Second
+		}
+		if v := nt.HealthProbeTimeoutSeconds; v >= 1 {
+			a.healthProbeTimeout = time.Duration(v) * time.Second
+		}
+		// Bound the handshake window first, leaving room for the direct
+		// window above it. Clamping the direct window against an oversized
+		// handshake window instead would invert the invariant and leave the
+		// post-upgrade grace shorter than the steady-state window.
+		if maxHandshake := maxDirectConnectedWindow - 20*time.Second; a.handshakeValidWindow > maxHandshake {
+			a.log.Info("clamping handshakeValidWindow so the direct window can stay above it",
+				"requested", a.handshakeValidWindow, "clamped", maxHandshake)
+			a.handshakeValidWindow = maxHandshake
+		}
+		if v := nt.DirectConnectedWindowSeconds; v > 0 {
+			a.directConnectedWindow = time.Duration(v) * time.Second
+		} else if a.handshakeValidWindow != defaultHandshakeValidWindow {
+			// Derive from the handshake window, with a floor at what a
+			// post-upgrade re-handshake actually needs: the first direct
+			// handshake can be RekeyAfterTime (120s) after the last relayed
+			// one, which a short handshake window plus a fixed increment
+			// would not reach.
+			derived := a.handshakeValidWindow + 20*time.Second
+			if derived < minDirectConnectedWindow {
+				derived = minDirectConnectedWindow
+			}
+			a.directConnectedWindow = derived
+		}
+		// Enforce minimum: directConnectedWindow >= handshakeValidWindow + 20s
+		if a.directConnectedWindow < a.handshakeValidWindow+20*time.Second {
+			a.directConnectedWindow = a.handshakeValidWindow + 20*time.Second
+		}
+		// Cap at RejectAfterTime: past it WireGuard has discarded the
+		// session, so a peer still reported as direct on handshake age alone
+		// would be describing a tunnel that no longer exists.
+		if a.directConnectedWindow > maxDirectConnectedWindow {
+			a.log.Info("clamping directConnectedWindow below WireGuard RejectAfterTime",
+				"requested", a.directConnectedWindow, "clamped", maxDirectConnectedWindow)
+			a.directConnectedWindow = maxDirectConnectedWindow
+		}
+	}
+}
+
 // prewarmAllPeerRelays ensures a relay proxy exists for every remote peer,
 // even peers currently on a direct path. The proxy sits idle in standby
 // mode but is immediately available if the direct path fails, providing
@@ -2460,7 +2542,7 @@ func (a *Agent) recoverICEStateFromWG() {
 
 	recovered := 0
 	for _, s := range stats {
-		if s.LastHandshake.IsZero() || time.Since(s.LastHandshake) > a.handshakeValidWindow {
+		if s.LastHandshake.IsZero() || time.Since(s.LastHandshake) > a.effectiveHandshakeWindow() {
 			continue
 		}
 		if s.ActualEndpoint == "" || isLocalhostEndpoint(s.ActualEndpoint) {

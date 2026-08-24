@@ -38,7 +38,16 @@ const (
 
 // Timing constants for ICE probe evaluation and handshake validation.
 const (
-	defaultHandshakeValidWindow = 3 * time.Minute
+	// defaultHandshakeValidWindow is the maximum LastHandshake age that still
+	// counts as a live session.
+	//
+	// WireGuard's own constants bound it: a rekey comes due at RekeyAfterTime
+	// (120s), and the session is discarded at RejectAfterTime (180s). A
+	// keepalived-but-idle peer rekeys on its first send past 120s, so within
+	// one keepalive interval (25s) of it. 150s covers that worst case while
+	// staying short of the point where a peer would be called healthy on a
+	// session whose rekey is already failing.
+	defaultHandshakeValidWindow = 150 * time.Second
 	activeProbeWait             = 8 * time.Second
 	passiveProbeTimeout         = 60 * time.Second
 	iceCheckTimeout             = 90 * time.Second
@@ -47,21 +56,26 @@ const (
 	// were relayed before the restart.
 	restartRelayRetry = 15 * time.Second
 
-	// directConnectedWindow is the maximum age of a WireGuard LastHandshake that
-	// still indicates a live direct connection. Must exceed handshakeValidWindow
-	// (3 min, which equals WG's REKEY_AFTER_TIME) to bridge the gap between:
-	//   a) the last relay-mediated handshake (before the relay→direct upgrade), and
-	//   b) the first WG re-handshake on the direct path (3 min after (a)).
-	//
-	// Without this buffer, isDirectConnected fails immediately after upgrade when
-	// the preserved WG session's LastHandshake is near the 3-min boundary, causing
-	// a flip-flop: upgrade → detected-as-disconnected → revert-to-relay → repeat.
-	//
-	// 5 min = 3 min (REKEY_AFTER_TIME) + 2 min (probe timing + re-handshake grace).
-	// After the first successful direct re-handshake, LastHandshake is fresh and
-	// the normal 3-min window applies on subsequent cycles.
-	defaultDirectConnectedWindow = 5 * time.Minute
-	directFailoverProbeCooldown  = 15 * time.Second
+	// defaultDirectConnectedWindow is the handshake age a peer is judged
+	// against for a grace period after being upgraded from relay to direct.
+	// It is wider than the steady-state window because it has to span the gap
+	// between the last relay-mediated handshake and the first one on the new
+	// direct path; judged against the steady-state window, a peer would look
+	// disconnected the moment it was promoted and be demoted straight back.
+	defaultDirectConnectedWindow = maxDirectConnectedWindow
+
+	// maxDirectConnectedWindow is the ceiling on any direct window, derived or
+	// operator-supplied. WireGuard discards a session at RejectAfterTime
+	// (180s), so a peer judged healthy past that has no tunnel behind the
+	// verdict; the 10s of margin keeps the decision inside the session's life.
+	maxDirectConnectedWindow = 170 * time.Second
+
+	// minDirectConnectedWindow is the floor on a derived direct window. The
+	// first direct re-handshake can fall RekeyAfterTime (120s) after the last
+	// relayed one, so a shorter grace cannot span the upgrade.
+	minDirectConnectedWindow = 140 * time.Second
+
+	directFailoverProbeCooldown = 15 * time.Second
 )
 
 // Relay mode constants matching WireKubeMesh.spec.relay.mode values.
@@ -867,7 +881,7 @@ func (a *Agent) evaluateICECheck(ctx context.Context, peer *wirekubev1alpha1.Wir
 
 		// Check if WG learned a non-localhost endpoint (peer initiated direct).
 		if hasStats && !s.LastHandshake.IsZero() &&
-			time.Since(s.LastHandshake) < a.handshakeValidWindow &&
+			time.Since(s.LastHandshake) < a.effectiveHandshakeWindow() &&
 			s.ActualEndpoint != "" && !isLocalhostEndpoint(s.ActualEndpoint) {
 
 			delete(a.passiveProbing, peer.Name)
@@ -1243,7 +1257,7 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 	state := a.getICEState(peer.Name)
 
 	// Cooldown: skip if a recent probe already confirmed health.
-	if !state.LastHealthProbeOK.IsZero() && time.Since(state.LastHealthProbeOK) < a.handshakeValidWindow {
+	if !state.LastHealthProbeOK.IsZero() && time.Since(state.LastHealthProbeOK) < a.effectiveHandshakeWindow() {
 		return true
 	}
 
@@ -1311,14 +1325,14 @@ func (a *Agent) probeDirectHealth(peer *wirekubev1alpha1.WireKubePeer) bool {
 
 func (a *Agent) directHandshakeWindow(state *peerICEState, s wireguard.PeerStats) time.Duration {
 	window := a.handshakeValidWindow
-	if !state.UpgradedAt.IsZero() && time.Since(state.UpgradedAt) < a.directConnectedWindow {
-		return a.directConnectedWindow
+	if !state.UpgradedAt.IsZero() && time.Since(state.UpgradedAt) < a.effectiveDirectConnectedWindow() {
+		return a.effectiveDirectConnectedWindow()
 	}
 
-	// Preserved-interface restart recovery has no direct-RX history yet, but the
-	// surviving WG session can remain healthy until the next normal re-handshake.
-	// Keep the legacy 3-minute handshake window in this specific state even when
-	// tests tighten handshakeValidWindow to 10s for faster steady-state failover.
+	// A restart that preserved the interface inherits a live WireGuard session
+	// but no direct-receive history to judge it by. Until the session rekeys
+	// on its own, the packaged window is the only bound that describes it, so
+	// it applies here even where the configured window is tighter.
 	if a.wasInterfacePreserved &&
 		state.State == iceStateConnected &&
 		state.UpgradedAt.IsZero() &&
@@ -1593,4 +1607,29 @@ func isPublicCandidateEndpoint(endpoint string) bool {
 		return false
 	}
 	return true
+}
+
+// effectiveHandshakeWindow is handshakeValidWindow with the packaged default
+// substituted when it is unset.
+//
+// The field is populated only while reading the mesh's relay settings, which a
+// mesh with relay.mode=never or no relay spec at all never reaches. Reading the
+// raw field there would compare every handshake against a zero window and call
+// every session expired.
+func (a *Agent) effectiveHandshakeWindow() time.Duration {
+	if a.handshakeValidWindow > 0 {
+		return a.handshakeValidWindow
+	}
+	return defaultHandshakeValidWindow
+}
+
+// effectiveDirectConnectedWindow is directConnectedWindow with the packaged
+// default substituted when it is unset, for the same reason as
+// effectiveHandshakeWindow: on a mesh without relay settings the raw field is
+// zero, which would collapse the post-upgrade grace entirely.
+func (a *Agent) effectiveDirectConnectedWindow() time.Duration {
+	if a.directConnectedWindow > 0 {
+		return a.directConnectedWindow
+	}
+	return defaultDirectConnectedWindow
 }

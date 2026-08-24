@@ -125,8 +125,12 @@ func TestBindExternalSourceRelayRoundTrip(t *testing.T) {
 	if n != 1 || string(packets[0][:sizes[0]]) != "external-handshake" {
 		t.Fatalf("received n=%d payload=%q", n, string(packets[0][:sizes[0]]))
 	}
-	if eps[0].DstToString() != "203.0.113.20:51820" {
-		t.Fatalf("endpoint DstToString = %q", eps[0].DstToString())
+	// The address the relay claimed is deliberately NOT used as the endpoint:
+	// it let a relay nominate any address it liked for a peer, including one on
+	// the observer's own segment, which the route bypass reads as proof. Replies
+	// ride on RelayAddr+Token instead, asserted below.
+	if eps[0].DstToString() != "127.0.0.1:0" {
+		t.Fatalf("endpoint DstToString = %q, want the relay synthetic", eps[0].DstToString())
 	}
 
 	if err := b.Send([][]byte{[]byte("handshake-response")}, eps[0]); err != nil {
@@ -181,8 +185,8 @@ func TestBindPathTable(t *testing.T) {
 	if pp.Mode.Load() != PathModeDirect {
 		t.Errorf("mode = %d, want PathModeDirect(%d)", pp.Mode.Load(), PathModeDirect)
 	}
-	if pp.DirectAddr != addr {
-		t.Errorf("addr = %v, want %v", pp.DirectAddr, addr)
+	if pp.DirectAddr() != addr {
+		t.Errorf("addr = %v, want %v", pp.DirectAddr(), addr)
 	}
 
 	// Switch to relay
@@ -477,8 +481,8 @@ func TestBindLearnsReboundDirectAddrByIP(t *testing.T) {
 	if got := pp.DirectHealth.LastSeen.Load(); got == 0 {
 		t.Fatal("DirectHealth.LastSeen was not updated for rebound direct source port")
 	}
-	if _, ok := b.addrToPeer.Load(sender.LocalAddr().String()); !ok {
-		t.Fatalf("addrToPeer did not learn rebound sender addr %s", sender.LocalAddr().String())
+	if _, ok := b.peerForAddr(sender.LocalAddr().String()); !ok {
+		t.Fatalf("bind did not learn rebound sender addr %s", sender.LocalAddr().String())
 	}
 }
 

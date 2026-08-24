@@ -93,13 +93,24 @@ func (ph *PathHealth) IsHealthy() bool {
 // DirectHealth.LastSeen / RelayHealth.LastSeen are the watermarks the agent
 // uses to detect a stalled leg and demote the mode.
 type PeerPath struct {
-	DirectAddr   netip.AddrPort
+	// directAddr is the bootstrap address the agent supplies through
+	// SetPeerPath. Both datapath directions read it — receive attribution and
+	// Send — while the sync goroutine rewrites it every cycle, hence the
+	// atomic.
+	directAddr   atomic.Pointer[netip.AddrPort]
 	DirectHealth PathHealth   // observed health of the direct UDP path
 	RelayHealth  PathHealth   // observed health of the relay TCP path
 	Mode         atomic.Int32 // one of PathModeDirect | PathModeWarm | PathModeRelay
 
+	// authAddr is where the peer's last authenticated packet came from, fed
+	// back from the device's own roamed endpoint. The device moves that
+	// endpoint only for packets that pass the crypto, so unlike learnedAddr
+	// this address cannot be steered by an unauthenticated sender. Send
+	// prefers it for that reason.
+	authAddr atomic.Pointer[netip.AddrPort]
+
 	// learnedAddrMu serializes updates to learnedAddr and the corresponding
-	// addrToPeer entry so the reverse map cannot leak stale keys.
+	// address claim so the reverse map cannot leak stale keys.
 	learnedAddrMu sync.Mutex
 	// learnedAddr is the NAT-mapped source we have observed for this peer
 	// (updated on direct UDP receive and from UAPI stats). DirectAddr stays
@@ -109,6 +120,12 @@ type PeerPath struct {
 
 	hintedUntilNs  atomic.Int64
 	lastHintSentNs atomic.Int64
+
+	// forgotten marks a peer whose claims ForgetPeer is releasing, so that a
+	// receive already holding this PeerPath cannot record a new claim behind
+	// the teardown. Such a claim would have no path entry to release it later
+	// and would leave the address permanently contested for its next holder.
+	forgotten atomic.Bool
 }
 
 // WireKubeBind implements conn.Bind using a single UDP socket for direct P2P
@@ -122,10 +139,18 @@ type WireKubeBind struct {
 	// Consulted by Send to route via direct UDP or relay.
 	pathTable sync.Map
 
-	// addrToPeer maps netip.AddrPort string to peer public key (base64).
-	// Updated by SetPeerPath; used by Send to look up the peer key from
-	// the endpoint's destination address.
-	addrToPeer sync.Map
+	// addrOwners maps an addr:port to the set of peer public keys (base64)
+	// claiming it. An address resolves to a peer only while exactly one peer
+	// claims it.
+	//
+	// A set rather than a single owner because peers behind one NAT advertise
+	// the same public addr:port. With one owner per address the last writer
+	// wins, which attributes packets to the wrong peer and lets one peer's
+	// address change delete an entry the others still rely on. A contested
+	// address instead resolves to nothing and takes the same path as an
+	// address that was never registered.
+	addrMu     sync.Mutex
+	addrOwners map[string]map[string]struct{}
 
 	// Relay transport fields. relay is nil when no relay is configured.
 	relay      RelayTransport
@@ -216,32 +241,85 @@ func (b *WireKubeBind) makeReceiveFunc(udpConn *net.UDPConn) conn.ReceiveFunc {
 		// this is the loudest line in the agent log and has no operational
 		// value (LastSeen watermark is observable via Prometheus). Only
 		// flag unmatched control frames, which is genuinely abnormal.
-		if pubKey, path, ok := b.lookupPeerByDirectAddr(addr); ok {
+		var srcKey [32]byte
+		if pubKey, path, ok, exact := b.lookupPeerByDirectAddr(addr); ok {
 			path.DirectHealth.LastSeen.Store(time.Now().UnixNano())
 			b.updateLearnedAddr(path, pubKey, addr)
+			// Only an exact addr:port match puts a key on the endpoint. An
+			// IP-only match is a guess between peers that share a NAT
+			// address, and wireguard-go keeps this endpoint object after
+			// authenticating the packet as the real peer: a wrong key here
+			// would misdirect every later Send for that peer, whose relay
+			// copies the recipient then drops on the MAC1 check.
+			if exact {
+				if raw, err := base64.StdEncoding.DecodeString(pubKey); err == nil && len(raw) == 32 {
+					copy(srcKey[:], raw)
+				}
+			}
 		} else if isWireGuardControlPacket(packets[0][:n]) {
 			log.Printf("[bind] direct receive unmatched control src=%s len=%d", addr.String(), n)
 		}
 
-		// Conditional endpoint virtualization for relay mode:
-		// When PathModeRelay is active, virtualize direct packets as 127.0.0.1:0
-		// with peerKey set so that Send() routes them via relay only.
-		// For other modes, deliver with real address to enable endpoint learning.
 		sizes[0] = n
-		// Always deliver direct packets with real endpoints, even in relay mode.
-		// This enables WireGuard to learn actual peer addresses and supports seamless
-		// dual-path switching. The bind's Send() method handles routing to relay via
-		// pathTable lookup, independent of the receive-side endpoint.
-		eps[0] = &WireKubeEndpoint{dst: addr}
+		// Direct packets keep their real source address in every mode. Since
+		// wireguard-go roams a peer's endpoint to whatever the bind surfaces,
+		// that address is what makes the device endpoint a truthful record of
+		// which leg the peer's last authenticated packet arrived on. The relay
+		// side surfaces a synthetic instead, for the same reason
+		// (makeRelayReceiveFunc).
+		//
+		// The peer key rides along so that Send can resolve the peer from the
+		// endpoint directly, rather than reverse-resolving an address that
+		// several peers behind one NAT may share.
+		eps[0] = &WireKubeEndpoint{dst: addr, relayPeerKey: relayPeerKey{peerKey: srcKey}}
 		return 1, nil
 	}
 }
 
-func (b *WireKubeBind) lookupPeerByDirectAddr(addr netip.AddrPort) (string, *PeerPath, bool) {
-	if v, ok := b.addrToPeer.Load(addr.String()); ok {
-		pubKeyB64 := v.(string)
+// DirectAddr returns the bootstrap address for this peer, or the zero value.
+func (p *PeerPath) DirectAddr() netip.AddrPort {
+	if v := p.directAddr.Load(); v != nil {
+		return *v
+	}
+	return netip.AddrPort{}
+}
+
+func (p *PeerPath) setDirectAddr(addr netip.AddrPort) {
+	p.directAddr.Store(&addr)
+}
+
+// AuthAddr returns the address the peer last authenticated from, or the zero
+// value if nothing has been confirmed by the device yet.
+func (p *PeerPath) AuthAddr() netip.AddrPort {
+	if v := p.authAddr.Load(); v != nil {
+		return *v
+	}
+	return netip.AddrPort{}
+}
+
+// NoteAuthenticatedAddr records an address the device roamed a peer to. The
+// device roams only on packets that authenticate, making this the one address
+// the datapath can follow without corroboration.
+func (b *WireKubeBind) NoteAuthenticatedAddr(pubKeyB64 string, addr netip.AddrPort) {
+	if !addr.IsValid() || addr.Port() == 0 || addr.Addr().IsLoopback() {
+		return
+	}
+	if pp := b.GetPeerPath(pubKeyB64); pp != nil {
+		pp.authAddr.Store(&addr)
+	}
+}
+
+// lookupPeerByDirectAddr resolves a source address to a peer, falling back to
+// an IP-only match when no peer claims the exact addr:port — which is how a
+// peer whose NAT rebound its source port is recognised again.
+//
+// The final result separates the two: it is true only for an exact match by a
+// single claimant. An IP-only match identifies the peer well enough to update
+// its health watermark, but not well enough to stamp a key onto the endpoint.
+func (b *WireKubeBind) lookupPeerByDirectAddr(addr netip.AddrPort) (string, *PeerPath, bool, bool) {
+	if pubKeyB64, ok := b.peerForAddr(addr.String()); ok {
 		if pp := b.GetPeerPath(pubKeyB64); pp != nil {
-			return pubKeyB64, pp, true
+			return pubKeyB64, pp, true, true
 		}
 	}
 
@@ -254,7 +332,8 @@ func (b *WireKubeBind) lookupPeerByDirectAddr(addr netip.AddrPort) (string, *Pee
 	ambiguous := false
 	b.pathTable.Range(func(key, value any) bool {
 		pp := value.(*PeerPath)
-		if !pp.DirectAddr.IsValid() || pp.DirectAddr.Addr() != addr.Addr() {
+		direct := pp.DirectAddr()
+		if !direct.IsValid() || direct.Addr() != addr.Addr() {
 			return true
 		}
 		if matchedPP != nil {
@@ -266,12 +345,13 @@ func (b *WireKubeBind) lookupPeerByDirectAddr(addr netip.AddrPort) (string, *Pee
 		return true
 	})
 	if ambiguous || matchedPP == nil {
-		return "", nil, false
+		return "", nil, false, false
 	}
-	b.addrToPeer.Store(addr.String(), matchedKey)
-	log.Printf("[bind] learned rebound direct addr peer=%s src=%s expected=%s",
-		shortKey(matchedKey), addr.String(), matchedPP.DirectAddr.String())
-	return matchedKey, matchedPP, true
+	if b.claimAddrFor(matchedPP, addr.String(), matchedKey) {
+		log.Printf("[bind] learned rebound direct addr peer=%s src=%s expected=%s",
+			shortKey(matchedKey), addr.String(), matchedPP.DirectAddr().String())
+	}
+	return matchedKey, matchedPP, true, false
 }
 
 // Close closes the UDP socket and relay channel. After Close, all ReceiveFuncs
@@ -382,17 +462,32 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	var pp *PeerPath
 	var peerKeyBytes [32]byte
 	var hasPeerKey bool
+	// contestedKeys is populated only when several peers claim the
+	// destination address, and holds the ones the relay leg fans out to.
+	var contestedKeys [][32]byte
 
 	var zeroKey [32]byte
 	if wkep.peerKey != zeroKey {
+		// A keyed endpoint keeps its key regardless of what the address says.
+		// The relay leg is addressed by key, and relay-delivered packets carry
+		// a loopback synthetic that resolves to no peer, so the key is the
+		// only handle those frames have.
 		peerKeyBytes = wkep.peerKey
 		hasPeerKey = true
 		pubKeyB64 := base64.StdEncoding.EncodeToString(peerKeyBytes[:])
 		if pp = b.GetPeerPath(pubKeyB64); pp != nil {
 			mode = pp.Mode.Load()
+		} else if addrKey, unique := b.peerForAddr(wkep.dst.String()); unique {
+			// No path entry under that key: the peer was removed and re-added,
+			// or the endpoint predates a resync. The destination's own claim
+			// still describes the mode, which keeps a relay-only peer from
+			// being sent direct-only.
+			if p := b.GetPeerPath(addrKey); p != nil {
+				pp = p
+				mode = p.Mode.Load()
+			}
 		}
-	} else if v, ok := b.addrToPeer.Load(wkep.dst.String()); ok {
-		pubKeyB64 := v.(string)
+	} else if pubKeyB64, unique := b.peerForAddr(wkep.dst.String()); unique {
 		if pp = b.GetPeerPath(pubKeyB64); pp != nil {
 			mode = pp.Mode.Load()
 		}
@@ -400,14 +495,62 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			copy(peerKeyBytes[:], raw)
 			hasPeerKey = true
 		}
+	} else if owners := b.peersForAddr(wkep.dst.String()); len(owners) > 1 {
+		// Several peers claim this destination, as happens when they sit
+		// behind one NAT and share its public addr:port. Picking one would
+		// apply another peer's mode and address relay copies to the wrong
+		// key, and dropping the relay leg would strand whoever depends on it.
+		// The frame therefore goes out under the most conservative mode among
+		// the claimants, duplicated to each of them; MAC1 sorts out which one
+		// it was for.
+		for _, k := range owners {
+			if p := b.GetPeerPath(k); p != nil {
+				if m := p.Mode.Load(); m > mode {
+					mode = m
+				}
+			}
+		}
+		// Warm, not Relay, is the conservative choice: it keeps both legs
+		// open, so one relay-only claimant cannot close the direct leg for
+		// every healthy peer sharing the address. Both legs also compensate
+		// for the per-peer safety nets that cannot run while no single
+		// PeerPath is resolved.
+		if mode == PathModeRelay {
+			mode = PathModeWarm
+		}
+		// Fan out to the claimants that need the relay, which is everyone
+		// except peers already committed to direct. The filter is by
+		// recipient rather than by frame type so that a co-resident peer
+		// reachable only over the relay receives its transport data and not
+		// just handshakes. Amplification is bounded by the number of
+		// relay-needing claimants on one address.
+		contestedKeys = make([][32]byte, 0, len(owners))
+		for _, k := range owners {
+			p := b.GetPeerPath(k)
+			if p != nil && p.Mode.Load() == PathModeDirect {
+				continue
+			}
+			raw, err := base64.StdEncoding.DecodeString(k)
+			if err != nil || len(raw) != 32 {
+				continue
+			}
+			var kb [32]byte
+			copy(kb[:], raw)
+			contestedKeys = append(contestedKeys, kb)
+		}
 	}
 
-	if bindDebug && pp == nil {
+	// A destination that resolves to no peer leaves the frame direct-only:
+	// without a key there is no relay leg to fall back on, whatever mode the
+	// agent chose. It means the device roamed to an address the bind never
+	// claimed, which is worth reporting outside debug builds — rate-limited,
+	// since this is the send path.
+	if pp == nil && !hasPeerKey {
 		nowNsLog := time.Now().UnixNano()
 		last := lastLogNoPeerNs.Load()
 		if nowNsLog-last > sendDiagLogIntervalNs &&
 			lastLogNoPeerNs.CompareAndSwap(last, nowNsLog) {
-			log.Printf("[bind] debug send no-peer dst=%s", wkep.dst.String())
+			log.Printf("[bind] send resolved no peer, relay leg unavailable dst=%s", wkep.dst.String())
 		}
 	}
 
@@ -463,13 +606,32 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 	}
 
-	// Synthetic endpoint → relay only (no usable UDP destination).
-	if wkep.peerKey != zeroKey && wkep.dst.Port() == 0 {
+	// The direct leg's destination comes from the agent-owned path table
+	// rather than from the endpoint wireguard-go handed back. That endpoint
+	// follows the last packet received, which for a peer in Warm mode is as
+	// likely to have been the relay copy; taking it literally would drop the
+	// direct leg until the next sync rewrote it.
+	dst := wkep.dst
+	if dst.Port() == 0 && pp != nil {
+		// authAddr first: it comes from the device's roamed endpoint, which
+		// only an authenticated packet can move. learnedAddr is stamped on
+		// the receive path before any crypto and can rest on an IP-only
+		// match, so a host spoofing the peer's source IP could steer the
+		// direct leg with it.
+		if auth := pp.AuthAddr(); auth.IsValid() && auth.Port() != 0 {
+			dst = auth
+		} else if direct := pp.DirectAddr(); direct.IsValid() && direct.Port() != 0 {
+			dst = direct
+		}
+	}
+
+	// Still no usable UDP destination → relay only.
+	if wkep.peerKey != zeroKey && dst.Port() == 0 {
 		sendDirect = false
 		sendRelay = true
 	}
 
-	relayAvailable := relay != nil && hasPeerKey
+	relayAvailable := relay != nil && (hasPeerKey || len(contestedKeys) > 0)
 	if sendRelay && !relayAvailable {
 		sendRelay = false
 	}
@@ -498,7 +660,7 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return syscall.ENOTCONN
 	}
 
-	addr := net.UDPAddrFromAddrPort(wkep.dst)
+	addr := net.UDPAddrFromAddrPort(dst)
 
 	for _, buf := range bufs {
 		// Send on every enabled leg. Errors on one leg do NOT suppress the other;
@@ -511,8 +673,22 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			}
 		}
 		if sendRelay {
-			if err := relay.SendToPeer(peerKeyBytes, buf); err != nil {
-				relayErr = err
+			switch {
+			case len(contestedKeys) > 0:
+				// Success means the relay accepted the frame for at least one
+				// claimant, not that any of them received it. That is the same
+				// guarantee the single-key path gives: neither can see the far
+				// side.
+				relayErr = syscall.ENOTCONN
+				for _, k := range contestedKeys {
+					if err := relay.SendToPeer(k, buf); err == nil {
+						relayErr = nil
+					}
+				}
+			default:
+				if err := relay.SendToPeer(peerKeyBytes, buf); err != nil {
+					relayErr = err
+				}
 			}
 		}
 
@@ -561,9 +737,146 @@ func (pp *PeerPath) LearnedAddr() netip.AddrPort {
 	return pp.learnedAddr
 }
 
-// updateLearnedAddr records a NAT-mapped source address and atomically rewires
-// the bind's addrToPeer reverse map so stale entries cannot accumulate as the
-// peer's source port drifts.
+// learnedAddrSnapshot reads learnedAddr under its mutex.
+func (pp *PeerPath) learnedAddrSnapshot() netip.AddrPort {
+	pp.learnedAddrMu.Lock()
+	defer pp.learnedAddrMu.Unlock()
+	return pp.learnedAddr
+}
+
+// claimAddr records that pubKeyB64 expects traffic from addr. An address held
+// by more than one peer stops resolving until the extra claims are released.
+//
+// The return value reports whether the claim is new, which lets a caller on the
+// datapath log a newly learned address once rather than on every packet.
+func (b *WireKubeBind) claimAddr(addr, pubKeyB64 string) bool {
+	return b.claimAddrFor(nil, addr, pubKeyB64)
+}
+
+// claimAddrFor is claimAddr with the peer's path entry in hand, so that the
+// forgotten check and the claim happen under one mutex. Checked separately,
+// a claim could land just after ForgetPeer released the peer's others and
+// strand an owner that no longer has a path entry to release it.
+func (b *WireKubeBind) claimAddrFor(pp *PeerPath, addr, pubKeyB64 string) bool {
+	if addr == "" || pubKeyB64 == "" {
+		return false
+	}
+	b.addrMu.Lock()
+	defer b.addrMu.Unlock()
+	if pp != nil && pp.forgotten.Load() {
+		return false
+	}
+	if b.addrOwners == nil {
+		b.addrOwners = make(map[string]map[string]struct{})
+	}
+	owners := b.addrOwners[addr]
+	if owners == nil {
+		owners = make(map[string]struct{}, 1)
+		b.addrOwners[addr] = owners
+	}
+	if _, dup := owners[pubKeyB64]; dup {
+		return false
+	}
+	owners[pubKeyB64] = struct{}{}
+	return true
+}
+
+// releaseAddr drops one peer's claim on addr and leaves the others intact.
+// Dropping the second-to-last claim leaves a single owner, so the address
+// starts resolving again for the peer that remains.
+func (b *WireKubeBind) releaseAddr(addr, pubKeyB64 string) {
+	if addr == "" {
+		return
+	}
+	b.addrMu.Lock()
+	defer b.addrMu.Unlock()
+	owners := b.addrOwners[addr]
+	if owners == nil {
+		return
+	}
+	delete(owners, pubKeyB64)
+	if len(owners) == 0 {
+		delete(b.addrOwners, addr)
+	}
+}
+
+// peerForAddr resolves addr to a peer public key while exactly one peer claims
+// it, and to nothing otherwise. A shared address attributed to whichever peer
+// registered last would be worse than no attribution: it names a specific wrong
+// peer, and the callers act on that name.
+func (b *WireKubeBind) peerForAddr(addr string) (string, bool) {
+	b.addrMu.Lock()
+	defer b.addrMu.Unlock()
+	owners := b.addrOwners[addr]
+	if len(owners) != 1 {
+		return "", false
+	}
+	for k := range owners {
+		return k, true
+	}
+	return "", false
+}
+
+// peersForAddr returns every peer claiming addr. Send needs the full set
+// because a contested address still has to carry the relay leg, and which
+// claimant a frame belongs to is settled by the receiver's MAC1 check rather
+// than here.
+func (b *WireKubeBind) peersForAddr(addr string) []string {
+	b.addrMu.Lock()
+	defer b.addrMu.Unlock()
+	owners := b.addrOwners[addr]
+	if len(owners) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(owners))
+	for k := range owners {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// ForgetPeer drops a peer's path entry along with every address it claimed.
+// Claims outlive the device's peer list otherwise, and a departed peer holding
+// its last address forever would leave the next legitimate holder of that
+// addr:port permanently contested — ordinary LAN address reuse on a segment is
+// enough to hit it.
+func (b *WireKubeBind) ForgetPeer(pubKeyB64 string) {
+	v, ok := b.pathTable.Load(pubKeyB64)
+	if !ok {
+		return
+	}
+	pp := v.(*PeerPath)
+	pp.forgotten.Store(true)
+	pp.learnedAddrMu.Lock()
+	learned := pp.learnedAddr
+	pp.learnedAddr = netip.AddrPort{}
+	pp.learnedAddrMu.Unlock()
+	if learned.IsValid() {
+		b.releaseAddr(learned.String(), pubKeyB64)
+	}
+	if direct := pp.DirectAddr(); direct.IsValid() {
+		b.releaseAddr(direct.String(), pubKeyB64)
+	}
+	// A claim the receive path published between reading the two addresses
+	// above and this point is on neither of them, so sweep every owner set.
+	// The forgotten flag closes the window going forward; this closes it
+	// backwards.
+	b.addrMu.Lock()
+	for addr, owners := range b.addrOwners {
+		if _, ok := owners[pubKeyB64]; ok {
+			delete(owners, pubKeyB64)
+			if len(owners) == 0 {
+				delete(b.addrOwners, addr)
+			}
+		}
+	}
+	b.addrMu.Unlock()
+	b.pathTable.Delete(pubKeyB64)
+}
+
+// updateLearnedAddr records a NAT-mapped source address for a peer and moves
+// its address claim to match, so that claims do not accumulate as the peer's
+// source port drifts.
 func (b *WireKubeBind) updateLearnedAddr(pp *PeerPath, pubKeyB64 string, newAddr netip.AddrPort) {
 	if !newAddr.IsValid() {
 		return
@@ -573,30 +886,51 @@ func (b *WireKubeBind) updateLearnedAddr(pp *PeerPath, pubKeyB64 string, newAddr
 	if pp.learnedAddr == newAddr {
 		return
 	}
-	if pp.learnedAddr.IsValid() {
-		b.addrToPeer.Delete(pp.learnedAddr.String())
+	if pp.forgotten.Load() {
+		return
+	}
+	// The old address is left claimed when it is also the configured
+	// DirectAddr. Claims are a set rather than a refcount, so one release
+	// would drop the SetPeerPath claim along with this one and hand the
+	// address to a co-resident peer until the next sync re-claimed it.
+	if pp.learnedAddr.IsValid() && pp.learnedAddr != pp.DirectAddr() {
+		b.releaseAddr(pp.learnedAddr.String(), pubKeyB64)
 	}
 	pp.learnedAddr = newAddr
-	b.addrToPeer.Store(newAddr.String(), pubKeyB64)
+	b.claimAddrFor(pp, newAddr.String(), pubKeyB64)
 }
 
 // SetPeerPath updates the path table entry for a peer identified by its base64
-// public key. Also maintains the addrToPeer reverse map used by Send().
+// public key. Also maintains the address claims used by Send().
 func (b *WireKubeBind) SetPeerPath(pubKeyB64 string, mode int32, directAddr netip.AddrPort) {
-	v, loaded := b.pathTable.LoadOrStore(pubKeyB64, &PeerPath{
-		DirectAddr: directAddr,
-	})
+	v, loaded := b.pathTable.LoadOrStore(pubKeyB64, &PeerPath{})
 	pp := v.(*PeerPath)
 	pp.Mode.Store(mode)
 	if loaded {
-		// Remove old address mapping if the direct address changed.
-		if pp.DirectAddr != directAddr {
-			b.addrToPeer.Delete(pp.DirectAddr.String())
+		if prev := pp.DirectAddr(); prev != directAddr {
+			// Release the previous direct address, unless the learned address
+			// still points at it. Symmetric to updateLearnedAddr: claims are a
+			// set rather than a refcount, so releasing it there would drop the
+			// claim this peer is actively receiving on.
+			if prev.IsValid() && prev != pp.learnedAddrSnapshot() {
+				b.releaseAddr(prev.String(), pubKeyB64)
+			}
+			// Drop the confirmed address along with it. It records where the
+			// peer authenticated under the endpoint the agent chose before,
+			// and says nothing about the one it is choosing now. Kept, it
+			// would outrank the new address in Send from the first relay copy
+			// onwards — the device endpoint roams to the synthetic, Send falls
+			// back to the confirmed address, and the address the agent moved
+			// to never carries the traffic that would confirm it.
+			pp.authAddr.Store(nil)
 		}
-		pp.DirectAddr = directAddr
 	}
+	// Stored for a new entry too, not only on change: the datapath resolves a
+	// peer's direct destination from this field, so a peer skipped on first
+	// registration would be addressable only from the second call onwards.
+	pp.setDirectAddr(directAddr)
 	if directAddr.IsValid() {
-		b.addrToPeer.Store(directAddr.String(), pubKeyB64)
+		b.claimAddr(directAddr.String(), pubKeyB64)
 	}
 	// Only log the *initial* registration of a new peer path, not every
 	// sync cycle's reconfirmation. driveTransportMode commits SetPeerPath
@@ -657,14 +991,43 @@ func (b *WireKubeBind) DeliverRelayPacket(pkt RelayPacket) {
 	}
 }
 
+// relaySyntheticAddr is the endpoint an unattributed relay delivery is surfaced
+// at. The zero port marks it as having no UDP destination, and the loopback
+// address carries no claim about where the peer might be.
+func relaySyntheticAddr() netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
+}
+
+// relaySyntheticAddrFor derives a per-peer address inside 127.0.0.0/8 from the
+// peer's public key.
+//
+// The address is per-peer because wireguard-go keys two things on it alone,
+// ignoring the peer identity the endpoint also carries: the mac2 cookie
+// (blake2s(secret, DstToBytes)) and the handshake rate limiter
+// (limiter.Allow(DstIP())). One shared loopback address would make a single
+// cookie valid for every relay-delivered peer and put them all in one
+// 20-per-second bucket, which is exactly the wrong behaviour during the mass
+// re-handshake that follows a relay restart.
+//
+// The last octet is forced non-zero so the result is never 127.x.y.0, and the
+// port stays zero so Send still treats it as having no UDP destination.
+func relaySyntheticAddrFor(peerKey [32]byte) netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, peerKey[0], peerKey[1], peerKey[2] | 0x01}), 0)
+}
+
 // makeRelayReceiveFunc creates a ReceiveFunc that reads packets from the relay
-// channel. wireguard-go roams peer endpoints to whatever address we surface on
-// receive, so we must hand it the best-known direct address: the peer's
-// NAT-mapped source learned from direct UDP traffic (LearnedAddr) takes
-// priority over the CR-supplied DirectAddr, which for symmetric-NAT peers is
-// only a placeholder and would clobber the roamed port. Fall back to a
-// loopback synthetic when nothing has been learned yet; Send detects the zero
-// port and routes via relay.
+// channel and surfaces each one at a synthetic loopback address.
+//
+// wireguard-go roams a peer's endpoint to whatever address the bind surfaces on
+// receive, so surfacing a real address here would make the device endpoint
+// assert a direct path on the strength of a packet that arrived over the relay.
+// The local-subnet bypass and the transport FSM both read that endpoint, so the
+// synthetic is what keeps it an honest record of which leg the peer's last
+// authenticated packet came in on.
+//
+// Nothing is lost on the send side: Send takes the direct destination from the
+// agent-owned path table, so a peer sitting at the synthetic still sends on both
+// legs while in Warm.
 func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		select {
@@ -672,12 +1035,13 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 			n := copy(packets[0], pkt.Payload)
 			sizes[0] = n
 			if pkt.ExternalSource.Valid {
-				dst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
-				if addr, err := netip.ParseAddrPort(pkt.ExternalSource.Addr); err == nil {
-					dst = addr
-				}
+				// The address in the frame is only what the relay claims it
+				// is, so it is dropped rather than surfaced: honouring it
+				// would let a relay nominate any endpoint it liked for a
+				// peer. Replies do not need it, being routed by the
+				// RelayAddr and Token carried in externalSource.
 				eps[0] = &WireKubeEndpoint{
-					dst:            dst,
+					dst:            relaySyntheticAddr(),
 					externalSource: pkt.ExternalSource,
 				}
 				if bindDebug {
@@ -687,20 +1051,11 @@ func (b *WireKubeBind) makeRelayReceiveFunc() conn.ReceiveFunc {
 				return 1, nil
 			}
 			pubKeyB64 := base64.StdEncoding.EncodeToString(pkt.SrcKey[:])
-			var dst netip.AddrPort
 			if pp := b.GetPeerPath(pubKeyB64); pp != nil {
 				pp.RelayHealth.LastSeen.Store(time.Now().UnixNano())
-				if learned := pp.LearnedAddr(); learned.IsValid() {
-					dst = learned
-				} else if pp.DirectAddr.IsValid() {
-					dst = pp.DirectAddr
-				}
-			}
-			if !dst.IsValid() {
-				dst = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
 			}
 			eps[0] = &WireKubeEndpoint{
-				dst:          dst,
+				dst:          relaySyntheticAddrFor(pkt.SrcKey),
 				relayPeerKey: relayPeerKey{peerKey: pkt.SrcKey},
 			}
 			return 1, nil
