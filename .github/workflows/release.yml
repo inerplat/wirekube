@@ -145,9 +145,10 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.IMAGE_NAME }}:latest
+          # latest follows real releases only. A -dev prerelease publishes its
+          # own tag and nothing else; repointing latest at a dev build is how
+          # the tag once drifted behind the actual newest release.
+          tags: ${{ contains(github.ref_name, '-dev.') && format('{0}:{1}', env.IMAGE_NAME, github.ref_name) || format('{0}:{1},{0}:latest', env.IMAGE_NAME, github.ref_name) }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
