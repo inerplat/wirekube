@@ -36,7 +36,7 @@ wirekubectl upgrade --kubeconfig ~/.kube/config --context my-cluster
 Release assets contain standalone `wirekubectl` binaries for macOS and Linux on AMD64 and ARM64. Download the binary and checksum file for the version you want from the [GitHub Releases](https://github.com/inerplat/wirekube/releases) page, verify the checksum, and place the binary on your `PATH`. Each release also includes `wirekube-release.json` with the immutable container image digest embedded in that CLI.
 
 ```bash
-VERSION=v0.0.18
+VERSION=v0.0.19
 curl -fLO "https://github.com/inerplat/wirekube/releases/download/${VERSION}/wirekubectl-linux-amd64"
 curl -fLO "https://github.com/inerplat/wirekube/releases/download/${VERSION}/wirekubectl-checksums.txt"
 sha256sum --check --ignore-missing wirekubectl-checksums.txt
