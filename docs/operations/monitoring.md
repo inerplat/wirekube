@@ -88,6 +88,8 @@ The agent exposes Prometheus metrics on `:9090/metrics`. The provided Service se
 | `wirekube_peer_transport_mode` | Gauge | source, peer | Transport (1=direct, 2=relay) |
 | `wirekube_peer_last_handshake_seconds` | Gauge | source, peer | Seconds since last WireGuard handshake |
 | `wirekube_suppressed_routes` | Gauge | source, reason | Routes withheld from the WireKube table by routing policy (`local`, `excluded`) |
+| `wirekube_peer_direct_rx_age_seconds` | Gauge | source, peer | Seconds since the last packet from this peer on the direct UDP socket (the watermark PathMonitor demotes on) |
+| `wirekube_peer_endpoint_type` | Gauge | source, peer | Where the WG endpoint points (0=none, 1=direct address, 2=relay loopback proxy) |
 | `wirekube_node_nat_type` | Gauge | node | NAT type (0=unknown, 1=cone, 2=symmetric, 3=port-restricted-cone, 4=open) |
 | `wirekube_peers_total` | Gauge | — | Total WireKubePeer count |
 | `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |
@@ -103,6 +105,7 @@ It includes:
 - **Peer Latency**: time-series graph with per-peer ICMP RTT
 - **Transport Mode**: color-coded table (direct=green, relay=red, mixed=yellow)
 - **Traffic**: send/receive byte rates per peer
+- **Path Diagnostics**: direct-socket receive age, endpoint type (direct vs relay proxy), and bypass route suppression per node
 - **Handshake & Health**: last handshake age and connection state timeline
 
 ### ServiceMonitor Setup

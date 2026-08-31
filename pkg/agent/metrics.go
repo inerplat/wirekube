@@ -52,6 +52,18 @@ var (
 		Help:      "Seconds since the last WireGuard handshake.",
 	}, []string{"source", "peer"})
 
+	peerDirectRxAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_direct_rx_age_seconds",
+		Help:      "Seconds since the last packet arrived from this peer on the direct UDP socket. The watermark PathMonitor demotes on, exported to make warm flapping diagnosable.",
+	}, []string{"source", "peer"})
+
+	peerEndpointType = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_endpoint_type",
+		Help:      "Where WireGuard's endpoint for this peer currently points (0=none, 1=direct address, 2=relay loopback proxy).",
+	}, []string{"source", "peer"})
+
 	suppressedRoutes = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "suppressed_routes",
@@ -117,6 +129,8 @@ func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
 		peerTransport.DeletePartialMatch(labels)
 		peerLastHandshake.DeletePartialMatch(labels)
 		peerICEStateMetric.DeletePartialMatch(labels)
+		peerDirectRxAge.DeletePartialMatch(labels)
+		peerEndpointType.DeletePartialMatch(labels)
 	}
 	a.peerMetricLabels = currentPeers
 }
@@ -191,6 +205,30 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			connected = 1
 		}
 		peerConnected.WithLabelValues(me, p.Name, p.Status.NATType).Set(connected)
+
+		// Diagnostics for warm flapping: the direct-socket receive watermark
+		// PathMonitor acts on, and where the WG endpoint currently points.
+		// Together they answer "why did this pair leave direct" without log
+		// archaeology: a rising rx age with endpoint_type=1 is a quiet direct
+		// wire; endpoint_type=2 means keepalives are riding the relay leg.
+		// A gauge left behind freezes at its last value, and a frozen "12s
+		// ago" is worse than no data: the watermark resets to zero when the
+		// peer's key or the bind's path entry is recreated, so the series is
+		// deleted rather than left stale.
+		if rx := a.wgMgr.LastDirectReceive(p.Spec.PublicKey); rx > 0 {
+			peerDirectRxAge.WithLabelValues(me, p.Name).Set(time.Since(time.Unix(0, rx)).Seconds())
+		} else {
+			peerDirectRxAge.DeleteLabelValues(me, p.Name)
+		}
+		epType := float64(0)
+		if ok && s.endpoint != "" {
+			if isLocalhostEndpoint(s.endpoint) {
+				epType = 2
+			} else {
+				epType = 1
+			}
+		}
+		peerEndpointType.WithLabelValues(me, p.Name).Set(epType)
 
 		transport := float64(1)
 		if isRelayed {
