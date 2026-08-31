@@ -138,3 +138,28 @@ func TestMigrateDefaultKeepalive(t *testing.T) {
 		}
 	}
 }
+
+// One-way keepalive settling: receive re-arms WireGuard's keepalive timer, so
+// a pair can stabilize with one silent side, and the other side's watermark
+// then grows to the warm threshold on a healthy path. Solicitation fires only
+// for direct pairs past two keepalive intervals of silence.
+func TestShouldElicitDirectRX(t *testing.T) {
+	if elicitDirectRXAfter >= 30*time.Second {
+		t.Fatalf("elicit threshold %v must stay below the 30s warm stall", elicitDirectRXAfter)
+	}
+	cases := []struct {
+		mode PathMode
+		age  time.Duration
+		want bool
+	}{
+		{PathModeDirect, 25 * time.Second, true},
+		{PathModeDirect, 15 * time.Second, false},
+		{PathModeRelay, 300 * time.Second, false},
+		{PathModeWarm, 25 * time.Second, false},
+	}
+	for _, c := range cases {
+		if got := shouldElicitDirectRX(c.mode, c.age); got != c.want {
+			t.Errorf("elicit(%v, %v) = %v, want %v", c.mode, c.age, got, c.want)
+		}
+	}
+}
