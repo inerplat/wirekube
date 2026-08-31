@@ -580,7 +580,7 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 			Spec: wirekubev1alpha1.WireKubePeerSpec{
 				PublicKey:           pubKey,
 				Endpoint:            endpoint,
-				PersistentKeepalive: 25,
+				PersistentKeepalive: defaultPeerKeepaliveSeconds,
 			},
 		}
 		applyMeshIP(a.log, mesh, name, &peer.Spec)
@@ -611,6 +611,7 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	}
 	applyMeshIP(a.log, mesh, name, &existing.Spec)
 	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
+	existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
 		return fmt.Errorf("patching own WireKubePeer: %w", patchErr)
 	}
@@ -2602,6 +2603,34 @@ func (a *Agent) findPeerNameByKey(pubKeyB64 string) string {
 		}
 	}
 	return ""
+}
+
+// defaultPeerKeepaliveSeconds is what each agent writes into its own peer CR.
+//
+// The value must satisfy 2×keepalive < PathMonitor's warm-stall threshold
+// (30s). WireGuard's persistent-keepalive timer re-arms on packets in EITHER
+// direction, so two idle peers with the same interval fall into an alternating
+// ping-pong: each side receives only every 2×interval. The previous default
+// of 25s produced 50-68s receive gaps on the direct socket, tripping the 30s
+// stall threshold and cycling every idle pair through Warm a few times per
+// hour. 10s keeps the worst-case receive gap at ~20s; the cost is one 32-byte
+// datagram per peer per 10s.
+const defaultPeerKeepaliveSeconds = 10
+
+// legacyPeerKeepaliveSeconds is the old hardcoded default that predates the
+// warm-stall analysis; existing CRs carrying it are migrated on the next
+// own-peer patch.
+const legacyPeerKeepaliveSeconds = 25
+
+// migrateDefaultKeepalive moves the old hardcoded default (and the unset zero
+// value) to the current default, while leaving any other value alone: a
+// different number was set by an operator on purpose and is not ours to
+// change.
+func migrateDefaultKeepalive(current int32) int32 {
+	if current == 0 || current == legacyPeerKeepaliveSeconds {
+		return defaultPeerKeepaliveSeconds
+	}
+	return current
 }
 
 // keepaliveForPeer honours the peer CR's PersistentKeepalive, but shortens

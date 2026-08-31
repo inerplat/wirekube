@@ -121,3 +121,20 @@ func TestResetDataplaneIfRequested(t *testing.T) {
 		}
 	})
 }
+
+// Two idle peers with equal keepalive intervals ping-pong: WireGuard re-arms
+// the timer on receive too, so each side hears from the other only every
+// 2×interval. The default must keep that below PathMonitor's 30s warm-stall
+// threshold, and CRs still carrying the old 25s default (or nothing) migrate,
+// while operator-chosen values survive.
+func TestMigrateDefaultKeepalive(t *testing.T) {
+	if got := 2 * defaultPeerKeepaliveSeconds; got >= 30 {
+		t.Fatalf("2×default keepalive = %ds reaches the 30s warm-stall threshold", got)
+	}
+	cases := map[int32]int32{0: 10, 25: 10, 10: 10, 7: 7, 60: 60}
+	for in, want := range cases {
+		if got := migrateDefaultKeepalive(in); got != want {
+			t.Errorf("migrate(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
