@@ -21,8 +21,10 @@ type PathMode int
 const (
 	// PathUnknown means the monitor has not yet observed this peer.
 	PathUnknown PathMode = iota
-	// PathModeRelay: relay-only. Used as the safe default for new peers and
-	// as the terminal state for peers whose direct path has proven unusable.
+	// PathModeRelay: relay-only. The terminal state for peers whose direct
+	// path has proven unusable (or was pinned via MarkNeverDirect). Not the
+	// default for new peers: with no relay configured this mode cannot send
+	// at all, so first sight starts on Warm instead.
 	PathModeRelay
 	// PathModeWarm: packets go on BOTH the direct UDP leg and the relay leg.
 	// This is the transitional state used when promoting from Relay toward
@@ -76,9 +78,12 @@ type directReceiver interface {
 // The design intent — borrowed directly from Tailscale's addrForSendLocked
 // + trustBestAddrUntil (wgengine/magicsock/endpoint.go) — is:
 //
-//  1. Relay is always hot. The relay pool maintains a persistent TCP
-//     connection at all times; that is a property of pkg/agent/relay,
-//     not of this FSM. From this FSM's perspective, relay is "free".
+//  1. Relay is hot whenever it exists. The relay pool maintains a
+//     persistent TCP connection at all times; that is a property of
+//     pkg/agent/relay, not of this FSM. From this FSM's perspective,
+//     relay is "free" — but it is not guaranteed to exist (relay-less
+//     meshes, restart windows before the relay reconnects), which is why
+//     no state that depends on the relay leg alone is ever a default.
 //  2. Direct is an opportunistic overlay on top of relay. Whenever the
 //     direct path is unproven or unreliable, we run in Warm (bimodal
 //     send) so the receiver has already accepted the relay copy of
@@ -140,20 +145,20 @@ type pathEntry struct {
 type PathMonitorConfig struct {
 	// WarmStall is how long the direct receive watermark is allowed to go
 	// without updating before Direct is demoted to Warm. Default: 30s.
-	// Must exceed WireGuard's persistentKeepalive (25s) so an idle peer
-	// whose only traffic is the periodic keepalive doesn't oscillate
-	// between Direct and Warm every 25-second cycle. The datapath's
-	// directTrustWindow (3s, in bind.go) governs actual failover
-	// latency independently of this value.
+	// Must exceed 2× WireGuard's persistentKeepalive (10s by default,
+	// defaultPeerKeepaliveSeconds): receive also re-arms the keepalive
+	// timer, so an idle pair ping-pongs and each side hears from the other
+	// only every 2×interval. The datapath's directTrustWindow (3s, in
+	// bind.go) governs actual failover latency independently of this value.
 	WarmStall time.Duration
 	// RelayStall is the additional time the entry can stay in Warm without
-	// any direct receive before being demoted to Relay. Default: 30s.
+	// any direct receive before being demoted to Relay. Default: 60s.
 	RelayStall time.Duration
 	// PromoteAge is the maximum age of a direct receive watermark for it
 	// to count as "fresh evidence" when considering Warm → Direct.
-	// Default: 30s. Lined up with WireGuard keepalive so a single
-	// keepalive arrival during the Warm probe window is enough to
-	// promote, instead of requiring a burst within 1.5s.
+	// Default: 30s — wide enough that a single keepalive arrival (10s
+	// interval, up to 2× between receives on an idle ping-ponging pair)
+	// during the Warm probe window promotes, instead of requiring a burst.
 	PromoteAge time.Duration
 	// RelayRetry is the minimum wallclock gap between successive
 	// Relay → Warm opportunistic probes. Default: 30s.
@@ -355,25 +360,30 @@ func (m *PathMonitor) Evaluate(peerName, pubKey string, forceProbe bool) PathMod
 
 	e, ok := m.entries[peerName]
 	if !ok {
-		// First sight of a peer: start on Relay and treat the first backoff
-		// window (relayRetry) as elapsed from *now*, not from epoch zero.
-		// That ensures a fresh peer does not auto-probe before the backoff
-		// deadline — the sync loop may call Evaluate many times per second,
-		// and we do not want every one of those calls to fire a new probe.
-		// Out-of-band signals from the ICE layer still get through via the
-		// forceProbe argument.
+		// First sight of a peer: start on Warm, not Relay. Relay-first rests
+		// on the premise that a relay leg exists; the Bind breaks that
+		// premise when no relay is configured (Send returns ENOTCONN in
+		// Relay mode with no relay), and after an agent restart it pinned
+		// every peer's traffic to the relay hairpin for a full relayRetry
+		// window on a healthy direct path. Warm degrades safely in both
+		// directions: with no relay it sends direct-only, with no direct
+		// endpoint it sends relay-only, and an unusable direct path demotes
+		// to Relay after relayStall. Peers that must never go direct are
+		// pinned via MarkNeverDirect, which creates or demotes the entry to
+		// Relay and wins over this default regardless of ordering.
 		e = &pathEntry{
 			pubKey:         pubKey,
-			mode:           PathModeRelay,
+			mode:           PathModeWarm,
 			modeEnteredAt:  now,
 			lastDirectSeen: lastDirect,
 			lastProbeAt:    now,
 		}
 		m.entries[peerName] = e
-		m.log.V(1).Info("path monitor: new peer, starting on relay", "peer", peerName)
-		// Fall through into the switch: force-probe should take effect on
-		// first sight too (and for non-force calls, the backoff we just
-		// set to `now` suppresses an accidental probe).
+		m.log.V(1).Info("path monitor: new peer, starting on warm", "peer", peerName)
+		// Fall through into the switch: the fresh entry lands in the Warm
+		// case, where forceProbe is a no-op and modeEnteredAt==now keeps
+		// the relayStall demotion far away. lastProbeAt only becomes
+		// meaningful after a later demotion to Relay.
 	}
 
 	// pubKey can change if the peer CRD is recreated; refresh it so

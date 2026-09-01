@@ -611,6 +611,54 @@ func TestBindSendWarmModeDuplicatesPackets(t *testing.T) {
 	}
 }
 
+// TestBindSendWarmModeNoRelaySendsDirect asserts Warm's degradation
+// contract: with no relay transport at all, Warm collapses to direct-only
+// instead of failing. This is why PathMonitor's first-sight default is Warm
+// — Relay mode without a relay returns ENOTCONN and blackholes every send,
+// which after an agent restart meant a full relayRetry window of TX
+// blackout on relay-less meshes.
+func TestBindSendWarmModeNoRelaySendsDirect(t *testing.T) {
+	rcv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer rcv.Close()
+
+	b := NewWireKubeBind() // no SetRelayTransport: relay is nil
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer b.Close()
+
+	pubKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	addr := netip.MustParseAddrPort(rcv.LocalAddr().String())
+	b.SetPeerPath(pubKey, PathModeWarm, addr)
+
+	payload := []byte("warm-no-relay")
+	if err := b.Send([][]byte{payload}, &WireKubeEndpoint{dst: addr}); err != nil {
+		t.Fatalf("Send in Warm with no relay: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	if err := rcv.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, _, err := rcv.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("direct leg never delivered: %v", err)
+	}
+	if string(buf[:n]) != string(payload) {
+		t.Fatalf("direct payload = %q, want %q", buf[:n], payload)
+	}
+
+	// The contrast that motivates the Warm default: the same bind in Relay
+	// mode has no leg to send on and refuses the packet outright.
+	b.SetPeerPath(pubKey, PathModeRelay, addr)
+	if err := b.Send([][]byte{payload}, &WireKubeEndpoint{dst: addr}); err == nil {
+		t.Fatal("Send in Relay with no relay succeeded, want error (ENOTCONN)")
+	}
+}
+
 // TestBindSendDirectModeSkipsRelayWhenFresh verifies the bandwidth-saving
 // property of PathModeDirect: when the direct receive watermark is fresh
 // (within directTrustWindow), Send uses the UDP leg only. The relay stays

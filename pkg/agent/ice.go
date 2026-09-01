@@ -843,6 +843,15 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	if err := a.wgMgr.SetPeerPath(peer.Spec.PublicKey, wireguard.PathWarm, directEp); err != nil {
 		a.log.Error(err, "SetPeerPath(Warm) failed", "peer", peer.Name)
 	}
+	// PathMonitor is authoritative: driveTransportMode re-commits its mode at
+	// the end of every sync tick, so a probe decision written only to the
+	// Bind is reverted before the next packet leaves. Force-probing the
+	// monitor moves a Relay entry to Warm in step with the Bind (Warm and
+	// Direct entries are unaffected); neverDirect pins still win inside
+	// Evaluate.
+	if a.pathMonitor != nil {
+		a.pathMonitor.Evaluate(peer.Name, peer.Spec.PublicKey, true)
+	}
 }
 
 // processRelayGrace marks peers as non-relayed after upgrading to direct.

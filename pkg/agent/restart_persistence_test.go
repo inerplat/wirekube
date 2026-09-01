@@ -6,6 +6,10 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 // Graceful shutdown must leave the dataplane for the next agent: no route
@@ -137,6 +141,93 @@ func TestMigrateDefaultKeepalive(t *testing.T) {
 		if got := migrateDefaultKeepalive(in); got != want {
 			t.Errorf("migrate(%d) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// After a restart the FSM is empty (it lives in process memory), so the
+// first driveTransportMode of the new process is every peer's first sight.
+// This is the incident contract: no peer may come out of that call pinned
+// to Relay — the old Relay-first default hairpinned all traffic through the
+// relay (or, with no relay, blackholed TX) for a full relayRetry window.
+func TestDriveTransportModeAfterRestartPinsNoPeerToRelay(t *testing.T) {
+	fake := &fakeWGEngine{lastDirect: map[string]int64{}}
+	pm := NewPathMonitor(logr.Discard(), fake, PathMonitorConfig{}, time.Now)
+	a := &Agent{
+		wgMgr:           fake,
+		log:             logr.Discard(),
+		pathMonitor:     pm,
+		directEndpoints: map[string]string{},
+		relayedPeers:    map[string]bool{},
+		startedAt:       time.Now(),
+	}
+	now := metav1.Now()
+	peers := map[string]*wirekubev1alpha1.WireKubePeer{}
+	names := []string{"peer-a", "peer-b"}
+	for _, name := range names {
+		p := &wirekubev1alpha1.WireKubePeer{}
+		p.Name = name
+		p.Spec.PublicKey = name + "-key"
+		p.Spec.Endpoint = "192.0.2.1:51820"
+		p.Status.LastReportedAt = &now
+		peers[name] = p
+	}
+
+	a.driveTransportMode(names, peers, nil)
+
+	for i, mode := range fake.setPaths {
+		if mode == wireguard.PathRelay {
+			t.Errorf("SetPeerPath call %d pinned a peer to Relay on first sight", i)
+		}
+	}
+	if len(fake.setPaths) != len(names) {
+		t.Fatalf("SetPeerPath calls = %d, want %d", len(fake.setPaths), len(names))
+	}
+	for _, name := range names {
+		if a.relayedPeers[name] {
+			t.Errorf("peer %s marked relayed after first sight", name)
+		}
+	}
+}
+
+// probeDirectEndpoint's Warm decision must reach PathMonitor, not only the
+// Bind: driveTransportMode re-commits PathMonitor's mode at the end of the
+// same sync tick, so a Bind-only write is reverted before the next packet.
+func TestProbeDirectEndpointForcesPathMonitorWarm(t *testing.T) {
+	fake := &fakeWGEngine{lastDirect: map[string]int64{}}
+	pm := NewPathMonitor(logr.Discard(), fake, PathMonitorConfig{}, time.Now)
+	a := &Agent{
+		wgMgr:           fake,
+		log:             logr.Discard(),
+		pathMonitor:     pm,
+		directEndpoints: map[string]string{},
+		directProbing:   map[string]bool{},
+	}
+	seedRelay(t, pm, "p1", "p1-key")
+
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	peer.Name = "p1"
+	peer.Spec.PublicKey = "p1-key"
+	peer.Spec.Endpoint = "192.0.2.1:51820"
+	a.probeDirectEndpoint(peer)
+
+	if got := pm.ModeFor("p1"); got != PathModeWarm {
+		t.Fatalf("PathMonitor mode after probe = %v, want PathModeWarm", got)
+	}
+	if n := len(fake.setPaths); n == 0 || fake.setPaths[n-1] != wireguard.PathWarm {
+		t.Fatalf("Bind path after probe = %v, want trailing PathWarm", fake.setPaths)
+	}
+
+	// The incident's failure mode end to end: driveTransportMode runs after
+	// the ICE layer in the same sync tick and re-commits PathMonitor's mode
+	// to the Bind. Before the Evaluate(force) notification it re-pinned the
+	// peer to Relay here, reverting the probe's Warm before the next packet.
+	a.relayedPeers = map[string]bool{}
+	a.startedAt = time.Now()
+	now := metav1.Now()
+	peer.Status.LastReportedAt = &now
+	a.driveTransportMode([]string{"p1"}, map[string]*wirekubev1alpha1.WireKubePeer{"p1": peer}, nil)
+	if n := len(fake.setPaths); fake.setPaths[n-1] != wireguard.PathWarm {
+		t.Fatalf("Bind path after same-tick driveTransportMode = %v, want trailing PathWarm", fake.setPaths)
 	}
 }
 

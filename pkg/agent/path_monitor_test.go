@@ -45,12 +45,47 @@ func newMonitor(t *testing.T) (*PathMonitor, *fakeRX, *fakeClock) {
 	return pm, rx, clk
 }
 
-// TestFirstSightStartsOnRelay asserts the safe default: a peer that has
-// never been evaluated enters the FSM in Relay.
-func TestFirstSightStartsOnRelay(t *testing.T) {
+// seedRelay puts a peer into Relay the way production reaches it (a pin or
+// a demotion), now that first sight starts on Warm. MarkNeverDirect creates
+// or demotes the entry to Relay with lastProbeAt=now; ClearNeverDirect then
+// re-enables probing. Note the entry's lastDirectSeen stays zero — the RX
+// watermark is captured by the first Evaluate after seeding, not here.
+func seedRelay(t *testing.T, pm *PathMonitor, name, key string) {
+	t.Helper()
+	pm.MarkNeverDirect(name, key)
+	pm.ClearNeverDirect(name)
+}
+
+// TestFirstSightStartsOnWarm asserts the default for a never-evaluated
+// peer: Warm, so both legs carry traffic while the path is unproven.
+// Relay-first was the old default and pinned every peer to the relay
+// hairpin (or, with no relay, to ENOTCONN) for a full relayRetry window
+// after each agent restart — the FSM lives in process memory only.
+func TestFirstSightStartsOnWarm(t *testing.T) {
 	pm, _, _ := newMonitor(t)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("first Evaluate = %v, want PathModeWarm", got)
+	}
+}
+
+// TestFirstSightWarmSurvivesReEvaluate asserts that the Warm entry a first
+// sight creates is not demoted by follow-up Evaluate calls before
+// relayStall: the authoritative driveTransportMode call runs later in the
+// same sync tick (and again every tick after), and must not undo the
+// default while the direct path is still being proven.
+func TestFirstSightWarmSurvivesReEvaluate(t *testing.T) {
+	pm, _, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", false)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("same-tick re-Evaluate = %v, want PathModeWarm", got)
+	}
+	clk.advance(400 * time.Millisecond) // < relayStall (500ms)
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("re-Evaluate before relayStall = %v, want PathModeWarm", got)
+	}
+	clk.advance(150 * time.Millisecond) // total 550ms > relayStall
 	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
-		t.Fatalf("first Evaluate = %v, want PathModeRelay", got)
+		t.Fatalf("unproven direct past relayStall = %v, want PathModeRelay", got)
 	}
 }
 
@@ -58,7 +93,7 @@ func TestFirstSightStartsOnRelay(t *testing.T) {
 // (e.g. ICE saw a NAT-matched candidate) skips the backoff check.
 func TestRelayToWarmOnForceProbe(t *testing.T) {
 	pm, _, _ := newMonitor(t)
-	pm.Evaluate("p1", "key1", false) // entry exists, mode=Relay
+	seedRelay(t, pm, "p1", "key1")
 	if got := pm.Evaluate("p1", "key1", true); got != PathModeWarm {
 		t.Fatalf("force-probe from Relay = %v, want PathModeWarm", got)
 	}
@@ -69,7 +104,7 @@ func TestRelayToWarmOnForceProbe(t *testing.T) {
 // does not fire a probe every cycle.
 func TestRelayToWarmHonoursBackoff(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false) // Relay, lastProbeAt=now
+	seedRelay(t, pm, "p1", "key1") // Relay, lastProbeAt=now
 
 	clk.advance(100 * time.Millisecond) // < relayRetry (200ms)
 	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
@@ -171,9 +206,9 @@ func TestForgetClearsEntry(t *testing.T) {
 	if got := pm.ModeFor("p1"); got != PathUnknown {
 		t.Fatalf("ModeFor after Forget = %v, want PathUnknown", got)
 	}
-	// Next Evaluate should restart on Relay.
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
-		t.Fatalf("first Evaluate after Forget = %v, want PathModeRelay", got)
+	// Next Evaluate rebuilds the entry under the first-sight rule (Warm).
+	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+		t.Fatalf("first Evaluate after Forget = %v, want PathModeWarm", got)
 	}
 }
 
@@ -216,6 +251,7 @@ func TestStaleWatermarkIsNotFreshEvidence(t *testing.T) {
 	pm, rx, clk := newMonitor(t)
 	// Put a non-zero RX watermark from before Evaluate ever runs.
 	rx.last["key1"] = clk.now().UnixNano()
+	seedRelay(t, pm, "p1", "key1")
 	pm.Evaluate("p1", "key1", false) // Relay; lastDirectSeen captured
 
 	clk.advance(250 * time.Millisecond) // past relayRetry
