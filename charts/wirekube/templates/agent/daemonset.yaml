@@ -17,6 +17,9 @@ spec:
     rollingUpdate:
       {{- toYaml .Values.agent.updateStrategy.rollingUpdate | nindent 6 }}
     {{- end }}
+  {{- with .Values.agent.minReadySeconds }}
+  minReadySeconds: {{ . }}
+  {{- end }}
   template:
     metadata:
       labels:

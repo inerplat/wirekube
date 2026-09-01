@@ -16,6 +16,13 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 1
+  # The agent has no readiness gate yet (/healthz is unconditional), so the
+  # pod counts as available the moment the container starts — long before the
+  # mesh has re-converged on that node. Without this delay a rolling update
+  # marches on immediately and takes several nodes through their convergence
+  # window at once, which is what lets distributed workloads riding the mesh
+  # (e.g. storage replication) lose multiple replicas simultaneously.
+  minReadySeconds: 90
   template:
     metadata:
       labels:

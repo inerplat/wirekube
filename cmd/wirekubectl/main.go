@@ -88,7 +88,10 @@ func newRootCommand() *cobra.Command {
 	root.PersistentFlags().StringVar(&options.kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
 	root.PersistentFlags().StringVar(&options.context, "context", "", "kubeconfig context to use")
 	root.PersistentFlags().StringVar(&options.namespace, "namespace", "wirekube-system", "namespace for WireKube workloads")
-	root.PersistentFlags().DurationVar(&options.timeout, "timeout", 5*time.Minute, "timeout for Kubernetes operations")
+	// The agent DaemonSet paces rolling updates with minReadySeconds (90s per
+	// node, maxUnavailable 1), so an upgrade's readiness wait scales with the
+	// node count; 5 minutes covered fewer than four nodes.
+	root.PersistentFlags().DurationVar(&options.timeout, "timeout", 20*time.Minute, "timeout for Kubernetes operations (rolling agent updates take ~90s per node)")
 	root.PersistentFlags().StringVar(&options.output, "output", "text", "output format: text or json")
 
 	root.AddCommand(

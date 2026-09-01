@@ -36,6 +36,12 @@ agent:
     rollingUpdate:
       maxUnavailable: 1
 
+  # The agent has no readiness gate, so a pod counts as available the moment
+  # its container starts, well before the mesh has re-converged on the node.
+  # This delay keeps a rolling update from taking several nodes through their
+  # convergence window at once.
+  minReadySeconds: 90
+
   tolerations:
     - operator: Exists
 

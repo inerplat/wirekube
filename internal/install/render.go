@@ -178,6 +178,11 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 		Spec: appsv1.DaemonSetSpec{
 			Selector:       &metav1.LabelSelector{MatchLabels: selectorLabels},
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1))}},
+			// No readiness gate exists (/healthz is unconditional), so a pod is
+			// available at container start, before the mesh re-converges on the
+			// node. The delay keeps a rolling update from taking several nodes
+			// through their convergence window at once.
+			MinReadySeconds: 90,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: map[string]string{"wirekube.io/relay-config-revision": relayConfigRevision(options)}},
 				Spec: corev1.PodSpec{
