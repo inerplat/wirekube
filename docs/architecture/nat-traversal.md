@@ -250,16 +250,23 @@ direct-receive watermark:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Relay : first sight (safe default)
-    Relay --> Warm : backoff elapsed / force probe
-    Warm --> Direct : fresh direct RX (<1.5s)
-    Warm --> Relay : no direct RX for 30s
-    Direct --> Warm : RX stall >3s (aggressive)
+    [*] --> Warm : first sight (bimodal until proven)
+    Relay --> Warm : backoff elapsed (30s) / force probe
+    Warm --> Direct : fresh direct RX (within 30s)
+    Warm --> Relay : no direct RX for 60s
+    Direct --> Warm : RX watermark stalls 30s (aggressive)
 ```
 
+First sight starts on Warm, not Relay: the FSM lives in process memory, so
+after an agent restart every peer is a first sight, and a Relay start would
+hairpin all traffic through the relay (or, on a relay-less mesh, blackhole
+TX outright) until the first backoff elapsed. Warm degrades safely instead:
+no relay means direct-only, no direct endpoint means relay-only.
+
 `Warm → Direct` is conservative, `Direct → Warm` is aggressive. `Warm →
-Relay` (30s) is the only slow transition, and bimodal send keeps the
-datapath working the entire time.
+Relay` (60s) is the only slow transition, and bimodal send keeps the
+datapath working the entire time. The datapath additionally protects Direct
+with its own 3s trust window in the Bind, independent of this FSM.
 
 ### Stage 3: Relay Fallback
 

@@ -67,7 +67,7 @@ Key log messages:
 | `[stun] symmetric NAT detected` | STUN servers observed endpoint-dependent port mappings |
 | `relay connected` | Agent initialized a relay pool endpoint |
 | `relay-client: connected to` | A relay TCP client connected and registered |
-| `path monitor: new peer, starting on relay` | New peer entered the safe relay-first path |
+| `path monitor: new peer, starting on warm` | New peer entered Warm (both legs) while the direct path is unproven |
 | `upgraded to direct (relay proxy in standby)` | A direct path was proven and promoted |
 | `active probe failed, reverting to relay` | Direct probing failed and relay remained active |
 | `relay-client: reconnect failed` | Relay reconnect is backing off after a failure |
