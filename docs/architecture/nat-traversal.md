@@ -197,19 +197,31 @@ runs every peer in one of three modes:
 
 | Mode | Direct UDP | Relay TCP | When it applies |
 |------|-----------|-----------|-----------------|
-| `PathModeDirect` | ✓ | auto (stale >3s) | Fresh receive evidence within the trust window |
-| `PathModeWarm` | ✓ | ✓ (every packet) | Probing, demoting, or hinted by peer |
+| `PathModeDirect` | ✓ | auto (evidence stale >3s) | Fresh evidence within the trust window |
+| `PathModeWarm` | ✓ | while direct is unproven | Probing, demoting, or hinted by peer |
 | `PathModeRelay` | — | ✓ | Explicit give-up on direct (symmetric↔PRC etc.) |
 
 Key properties:
 
-- **Warm duplicates every packet** on both legs. WireGuard's replay window
-  dedupes on the receiver, so bimodal send is correctness-free.
-- **Direct auto-upgrades to dual-send on stale receive**. Inside `Send()`,
-  if the peer is in `PathModeDirect` but `DirectHealth.LastSeen` is older
-  than `directTrustWindow` (3s), this packet is also sent on the relay
-  leg. The failover blackout is thus bounded by the trust window, not by
-  the agent's sync interval.
+- **The relay leg follows the evidence, not the mode.** `Send()` computes
+  `evidence = max(DirectHealth.LastSeen, lastPong)` and duplicates onto the
+  relay whenever that is older than `directTrustWindow` (3s), missing
+  entirely, or vetoed by a stale MTU probe. Direct and Warm therefore behave
+  identically on the datapath; they differ in what the agent publishes and in
+  the Warm→Relay countdown. WireGuard's replay window dedupes the duplicate on
+  the receiver, so bimodal send is correctness-free.
+- **Evidence comes from the peer's data or from a heartbeat pong.** The Bind
+  pings the peer's current send address once a second while a session is
+  active and treats a matching, authenticated pong as proof the path carries a
+  round trip. Without it, an idle or one-way pair settles with one silent side
+  (WireGuard re-arms persistent keepalive on receive as well as send), and its
+  partner mirrors healthy traffic onto the relay indefinitely.
+- **A pong proves the path, not the session.** The responder sits in the Bind,
+  below wireguard-go, so PathMonitor discounts pong evidence for a peer whose
+  last handshake is older than the reject window; only data evidence can hold
+  such a pair in `direct`.
+- **The failover blackout is bounded by the trust window**, not by the agent's
+  sync interval.
 - **Error-based fallback is intentionally absent**. UDP `WriteToUDP` only
   errors on local socket failures; using it as a reachability signal
   would actively mask the inbound-only blackhole case that hints fix.
