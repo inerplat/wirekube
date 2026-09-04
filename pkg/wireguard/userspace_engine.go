@@ -140,6 +140,7 @@ func (u *UserspaceEngine) EnsureInterface() error {
 
 	// Create wireguard-go device on the TUN (link stays down until Configure).
 	u.bind = NewWireKubeBind()
+	u.bind.SetHeartbeatConfig(u.keyPair, u.mtu)
 	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
 
 	return nil
@@ -185,6 +186,7 @@ func (u *UserspaceEngine) attachExistingTUN() error {
 	disableXfrmForIface(u.ifaceName)
 
 	u.bind = NewWireKubeBind()
+	u.bind.SetHeartbeatConfig(u.keyPair, u.mtu)
 	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
 	return nil
 }
@@ -625,6 +627,23 @@ func (u *UserspaceEngine) LastRelayReceive(pubKey string) int64 {
 		return 0
 	}
 	return pp.RelayHealth.LastSeen.Load()
+}
+
+// LastDirectPong returns the unix nano timestamp of the last heartbeat pong
+// from a peer, or 0 if none has arrived.
+func (u *UserspaceEngine) LastDirectPong(pubKey string) int64 {
+	if u.bind == nil {
+		return 0
+	}
+	return u.bind.LastDirectPong(pubKey)
+}
+
+// PeerPathStats returns the bind's per-peer path accounting snapshot.
+func (u *UserspaceEngine) PeerPathStats(pubKey string) (PathStats, bool) {
+	if u.bind == nil {
+		return PathStats{}, false
+	}
+	return u.bind.PeerPathStats(pubKey)
 }
 
 // DeliverRelayPacket pushes a relay-received packet into the bind's relay

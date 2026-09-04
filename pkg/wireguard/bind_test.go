@@ -575,12 +575,12 @@ func TestBindSendDoesNotUpdateReceiveEvidence(t *testing.T) {
 	}
 }
 
-// TestBindSendWarmModeDuplicatesPackets verifies that PathModeWarm sends
-// each outgoing packet on BOTH the UDP leg and the relay leg (Tailscale
-// DERP-style duplicate send). This is the correctness contract that makes
-// direct→relay failover blackout-free: if the direct leg stops working,
-// the receiver has already accepted the relay copy of every packet in
-// flight at the moment trust expired.
+// TestBindSendWarmModeDuplicatesPackets verifies Warm's evidence-based
+// contract. With no direct evidence, every outgoing packet goes on BOTH the
+// UDP leg and the relay leg regardless of packet type (Tailscale DERP-style
+// duplicate send), which is what makes direct→relay failover blackout-free
+// while a path is unproven. Once a heartbeat pong has proven the direct path
+// the relay leg is dropped, and the MTU-probe veto puts it back.
 func TestBindSendWarmModeDuplicatesPackets(t *testing.T) {
 	relay := &mockRelayTransport{connected: true}
 	b := NewWireKubeBind()
@@ -594,20 +594,46 @@ func TestBindSendWarmModeDuplicatesPackets(t *testing.T) {
 	pubKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	addr := netip.MustParseAddrPort("127.0.0.1:59997")
 	b.SetPeerPath(pubKey, PathModeWarm, addr)
+	pp := b.GetPeerPath(pubKey)
+	if pp == nil {
+		t.Fatal("GetPeerPath() returned nil")
+	}
 
+	relaySends := func() int {
+		relay.mu.Lock()
+		defer relay.mu.Unlock()
+		return len(relay.sent)
+	}
 	ep := &WireKubeEndpoint{dst: addr}
-	// Mix control (type 1) and data (type 4) packets to verify the mode
-	// does not split by packet type — warm sends every packet on every leg.
+	// Mix control (type 1) and data (type 4) packets to verify the decision
+	// does not split by packet type.
 	payloads := [][]byte{{1, 0, 0, 0, 0}, {4, 0, 0, 0, 0}}
+
+	// Warm + no evidence: both legs, one relay copy per packet.
 	if err := b.Send(payloads, ep); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
+	if got := relaySends(); got != len(payloads) {
+		t.Fatalf("relay received %d sends with no evidence, want %d (one per outgoing packet regardless of type)",
+			got, len(payloads))
+	}
 
-	relay.mu.Lock()
-	defer relay.mu.Unlock()
-	if len(relay.sent) != len(payloads) {
-		t.Fatalf("relay received %d sends, want %d (one per outgoing packet regardless of type)",
-			len(relay.sent), len(payloads))
+	// Warm + fresh pong: the direct path is proven, direct only.
+	pp.lastPongNs.Store(time.Now().UnixNano())
+	if err := b.Send(payloads, ep); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := relaySends(); got != len(payloads) {
+		t.Fatalf("relay received %d sends in total after a fresh pong, want still %d (direct only)", got, len(payloads))
+	}
+
+	// Warm + fresh pong + MTU-probe veto: both legs again.
+	pp.mtuStale.Store(true)
+	if err := b.Send(payloads, ep); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := relaySends(); got != 2*len(payloads) {
+		t.Fatalf("relay received %d sends in total under the MTU veto, want %d", got, 2*len(payloads))
 	}
 }
 

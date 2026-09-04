@@ -97,4 +97,12 @@ func (u *UserspaceEngine) LastRelayReceive(_ string) int64 {
 	return 0
 }
 
+func (u *UserspaceEngine) LastDirectPong(_ string) int64 {
+	return 0
+}
+
+func (u *UserspaceEngine) PeerPathStats(_ string) (PathStats, bool) {
+	return PathStats{}, false
+}
+
 func (u *UserspaceEngine) MarkBimodalHint(_ [32]byte) {}
