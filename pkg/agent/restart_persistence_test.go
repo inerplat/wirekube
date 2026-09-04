@@ -231,27 +231,76 @@ func TestProbeDirectEndpointForcesPathMonitorWarm(t *testing.T) {
 	}
 }
 
-// One-way keepalive settling: receive re-arms WireGuard's keepalive timer, so
-// a pair can stabilize with one silent side, and the other side's watermark
-// then grows to the warm threshold on a healthy path. Solicitation fires only
-// for direct pairs past two keepalive intervals of silence.
-func TestShouldElicitDirectRX(t *testing.T) {
-	if elicitDirectRXAfter >= 30*time.Second {
-		t.Fatalf("elicit threshold %v must stay below the 30s warm stall", elicitDirectRXAfter)
+// A peer whose stats are missing must not be gated: GetStats failing leaves an
+// empty map, and demoting the whole mesh on a transient UAPI error is far
+// worse than trusting a pong for one cycle.
+func TestDriveTransportModeFailsOpenWithoutStats(t *testing.T) {
+	now := time.Now()
+	fake := &fakeWGEngine{
+		lastDirect: map[string]int64{},
+		lastPong:   map[string]int64{"p1-key": now.UnixNano()},
 	}
-	cases := []struct {
-		mode PathMode
-		age  time.Duration
-		want bool
-	}{
-		{PathModeDirect, 25 * time.Second, true},
-		{PathModeDirect, 15 * time.Second, false},
-		{PathModeRelay, 300 * time.Second, false},
-		{PathModeWarm, 25 * time.Second, false},
+	pm := NewPathMonitor(logr.Discard(), fake, PathMonitorConfig{}, time.Now)
+	a := &Agent{
+		wgMgr:           fake,
+		log:             logr.Discard(),
+		pathMonitor:     pm,
+		directEndpoints: map[string]string{},
+		relayedPeers:    map[string]bool{},
+		startedAt:       now,
 	}
-	for _, c := range cases {
-		if got := shouldElicitDirectRX(c.mode, c.age); got != c.want {
-			t.Errorf("elicit(%v, %v) = %v, want %v", c.mode, c.age, got, c.want)
-		}
+	reported := metav1.Now()
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	peer.Name = "p1"
+	peer.Spec.PublicKey = "p1-key"
+	peer.Spec.Endpoint = "192.0.2.1:51820"
+	peer.Status.LastReportedAt = &reported
+	peers := map[string]*wirekubev1alpha1.WireKubePeer{"p1": peer}
+
+	// First sight is Warm and seeds the watermark; the next pong is what
+	// promotes, and only if the gate let it through.
+	a.driveTransportMode([]string{"p1"}, peers, nil)
+	fake.lastPong["p1-key"] = time.Now().UnixNano()
+	a.driveTransportMode([]string{"p1"}, peers, nil)
+
+	if got := pm.ModeFor("p1"); got != PathModeDirect {
+		t.Fatalf("mode with no stats entry = %v, want PathModeDirect (gate must fail open)", got)
+	}
+}
+
+// A handshake older than the reject window means the session is gone, so the
+// pong that the Bind still answers must not hold the peer in Direct.
+func TestDriveTransportModeGatesStaleHandshake(t *testing.T) {
+	now := time.Now()
+	fake := &fakeWGEngine{
+		lastDirect: map[string]int64{},
+		lastPong:   map[string]int64{"p1-key": now.UnixNano()},
+	}
+	pm := NewPathMonitor(logr.Discard(), fake, PathMonitorConfig{}, time.Now)
+	a := &Agent{
+		wgMgr:           fake,
+		log:             logr.Discard(),
+		pathMonitor:     pm,
+		directEndpoints: map[string]string{},
+		relayedPeers:    map[string]bool{},
+		startedAt:       now,
+	}
+	reported := metav1.Now()
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	peer.Name = "p1"
+	peer.Spec.PublicKey = "p1-key"
+	peer.Spec.Endpoint = "192.0.2.1:51820"
+	peer.Status.LastReportedAt = &reported
+	peers := map[string]*wirekubev1alpha1.WireKubePeer{"p1": peer}
+	stats := map[string]wireguard.PeerStats{
+		"p1-key": {LastHandshake: now.Add(-wgSessionAliveWindow - time.Minute)},
+	}
+
+	a.driveTransportMode([]string{"p1"}, peers, stats)
+	fake.lastPong["p1-key"] = time.Now().UnixNano()
+	a.driveTransportMode([]string{"p1"}, peers, stats)
+
+	if got := pm.ModeFor("p1"); got == PathModeDirect {
+		t.Fatal("a pong held the peer in Direct although its handshake is past the reject window")
 	}
 }

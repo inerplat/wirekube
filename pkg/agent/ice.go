@@ -833,10 +833,11 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	if err := a.wgMgr.ForceEndpoint(peer.Spec.PublicKey, directEp); err != nil {
 		a.log.Error(err, "ForceEndpoint failed", "peer", peer.Name, "endpoint", directEp)
 	}
-	// Warm mode: every outgoing packet is duplicated to both UDP and relay.
-	// If the direct path works, WireGuard accepts the first copy and discards
-	// the second via replay-window dedup; if it doesn't, the relay copy still
-	// lands. This collapses the previous Probing/RelayProbe distinction:
+	// Warm mode: both legs carry traffic until the direct path is proven.
+	// While it is unproven the packet is duplicated to UDP and relay, so
+	// WireGuard accepts whichever copy arrives first and discards the other
+	// via replay-window dedup; a heartbeat pong mid-probe proves the path and
+	// closes the relay leg. This collapses the previous Probing/RelayProbe distinction:
 	// whether or not the peer has been direct before, we want both legs
 	// carrying traffic during the probe so the blackout is zero regardless
 	// of which side of the direct path happens to be broken.
@@ -850,7 +851,9 @@ func (a *Agent) probeDirectEndpoint(peer *wirekubev1alpha1.WireKubePeer) {
 	// Direct entries are unaffected); neverDirect pins still win inside
 	// Evaluate.
 	if a.pathMonitor != nil {
-		a.pathMonitor.Evaluate(peer.Name, peer.Spec.PublicKey, true)
+		// wgAlive=true: this call only lifts a Relay entry to Warm, and the
+		// probe's own verdict still rests on data evidence (evaluateICECheck).
+		a.pathMonitor.Evaluate(peer.Name, peer.Spec.PublicKey, true, true)
 	}
 }
 

@@ -1123,15 +1123,10 @@ func (a *Agent) sync(ctx context.Context) error {
 	// Update Prometheus metrics.
 	a.updateMetrics(ctx, peerList)
 
-	// Break one-way keepalive settling before PathMonitor reads it as a
-	// stall. WireGuard's persistent keepalive re-arms on receive as well as
-	// send, so a pair can settle into one side sending every interval while
-	// the other side, kept quiet by those very packets, never transmits. The
-	// silent side's peer then watches its direct-receive watermark grow to
-	// the warm threshold and demotes a healthy path. An ICMP echo through the
-	// tunnel forces a reply, which the peer sends on its current (direct)
-	// path, refreshing the watermark within one RTT.
-	a.elicitQuietDirectPeers(peerList)
+	// One-way keepalive settling (a pair stabilising with one silent side,
+	// whose partner then watches a healthy path's watermark age out) is
+	// handled by the Bind's heartbeat, not here: pongs refresh the watermark
+	// every second without depending on the peer choosing to send.
 
 	// Measure peer latency every 5th sync cycle (~2.5 min) to avoid overhead.
 	a.latencyCycle++
@@ -1590,11 +1585,23 @@ func (a *Agent) driveTransportMode(
 		if peer == nil || peer.Spec.PublicKey == "" {
 			continue
 		}
+		// Heartbeat pongs prove the path, not the session: the Bind answers
+		// them below wireguard-go, so a peer whose device is wedged or whose
+		// keys no longer match still replies. Gate that evidence on a recent
+		// handshake so a dead session cannot be published as direct. A peer
+		// with no stats entry is not gated: the read may simply have failed
+		// (an empty map on error, agent.go GetStats callers), and demoting the
+		// whole mesh on a transient UAPI error would be far worse than
+		// trusting a pong for one cycle.
+		wgAlive := true
+		if s, ok := statsByKey[peer.Spec.PublicKey]; ok && !s.LastHandshake.IsZero() {
+			wgAlive = now.Sub(s.LastHandshake) < wgSessionAliveWindow
+		}
 		var mode PathMode
 		if a.relayMode == relayModeAlways {
-			mode = a.pathMonitor.ForceRelay(name, peer.Spec.PublicKey)
+			mode = a.pathMonitor.ForceRelay(name, peer.Spec.PublicKey, wgAlive)
 		} else {
-			mode = a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false)
+			mode = a.pathMonitor.Evaluate(name, peer.Spec.PublicKey, false, wgAlive)
 		}
 		directAddr := peer.Spec.Endpoint
 		if ep, ok := a.directEndpoints[name]; ok && ep != "" {
@@ -1645,6 +1652,13 @@ func (a *Agent) driveTransportMode(
 // this allows ten missed heartbeats — long enough that a slow status write,
 // a brief apiserver outage, or an agent restart never trips it.
 const dormantPeerThreshold = 5 * time.Minute
+
+// wgSessionAliveWindow is how old a peer's last handshake may be before its
+// heartbeat pongs stop counting as evidence of a usable direct path. WireGuard
+// rejects a keypair after RejectAfterTime (180s) and re-keys well before that
+// whenever anything is sent, keepalives included, so a live pair's handshake
+// age cycles far below this.
+const wgSessionAliveWindow = 190 * time.Second
 
 // peerIsDormant reports whether a peer looks abandoned rather than merely
 // unreachable.
@@ -2641,50 +2655,6 @@ func migrateDefaultKeepalive(current int32) int32 {
 		return defaultPeerKeepaliveSeconds
 	}
 	return current
-}
-
-// elicitDirectRXAfter is how quiet the direct receive watermark may go before
-// the agent solicits a reply. Two full keepalive intervals: a healthy mutual
-// exchange refreshes within one, the one-way settling never refreshes at all,
-// and the margin below PathMonitor's 30s warm threshold (plus its 30s tick)
-// leaves the elicited reply time to land before a demotion is considered.
-const elicitDirectRXAfter = 2 * defaultPeerKeepaliveSeconds * time.Second
-
-// shouldElicitDirectRX decides whether a peer's quiet direct wire warrants an
-// active solicitation: only pairs the datapath still treats as direct, and
-// only once the silence exceeds what mutual keepalives can explain.
-func shouldElicitDirectRX(mode PathMode, rxAge time.Duration) bool {
-	return mode == PathModeDirect && rxAge > elicitDirectRXAfter
-}
-
-// elicitQuietDirectPeers pings the overlay address of every direct peer whose
-// inbound direct traffic has gone quiet. Fire-and-forget: the reply itself is
-// the payload, refreshing the bind's receive watermark.
-func (a *Agent) elicitQuietDirectPeers(peerList *wirekubev1alpha1.WireKubePeerList) {
-	if a.pathMonitor == nil {
-		return
-	}
-	now := time.Now()
-	for i := range peerList.Items {
-		p := &peerList.Items[i]
-		if p.Name == a.nodeName || p.Spec.PublicKey == "" || len(p.Spec.AllowedIPs) == 0 {
-			continue
-		}
-		rx := a.wgMgr.LastDirectReceive(p.Spec.PublicKey)
-		if rx <= 0 {
-			continue
-		}
-		age := now.Sub(time.Unix(0, rx))
-		if !shouldElicitDirectRX(a.pathMonitor.ModeFor(p.Name), age) {
-			continue
-		}
-		ip, _, err := net.ParseCIDR(p.Spec.AllowedIPs[0])
-		if err != nil || ip == nil {
-			continue
-		}
-		a.log.Info("eliciting direct traffic from quiet peer", "peer", p.Name, "rxAge", age.Round(time.Second).String())
-		go pingHost(ip.String())
-	}
 }
 
 // keepaliveForPeer honours the peer CR's PersistentKeepalive, but shortens

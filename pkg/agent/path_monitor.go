@@ -69,6 +69,26 @@ func (m PathMode) toWireguardPathMode() wireguard.PathMode {
 // Abstracted so unit tests can drive the FSM with deterministic timestamps.
 type directReceiver interface {
 	LastDirectReceive(pubKey string) int64
+	// LastDirectPong is the heartbeat watermark: the last authenticated
+	// pong the Bind matched on the direct leg. It proves the path carries a
+	// round trip at data frame size, which is what the FSM wants to know,
+	// but not that the peer's WireGuard device is alive — the pong responder
+	// sits below it. Callers gate it on handshake freshness (wgAlive).
+	LastDirectPong(pubKey string) int64
+}
+
+// directEvidence is the watermark the FSM runs on: WireGuard data received on
+// the direct leg, or the newer heartbeat pong when the session is alive.
+// Callers hold m.mu.
+func (m *PathMonitor) directEvidence(pubKey string, wgAlive bool) int64 {
+	data := m.rx.LastDirectReceive(pubKey)
+	if !wgAlive {
+		return data
+	}
+	if pong := m.rx.LastDirectPong(pubKey); pong > data {
+		return pong
+	}
+	return data
 }
 
 // PathMonitor is a per-mesh finite state machine that chooses the transport
@@ -220,12 +240,12 @@ func (m *PathMonitor) Forget(peerName string) {
 // ForceRelay makes relay the authoritative path without permanently disabling
 // future direct probes. Callers may invoke it on every sync while an external
 // policy such as relay.mode=always is active.
-func (m *PathMonitor) ForceRelay(peerName, pubKey string) PathMode {
+func (m *PathMonitor) ForceRelay(peerName, pubKey string, wgAlive bool) PathMode {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := m.now()
-	lastDirect := m.rx.LastDirectReceive(pubKey)
+	lastDirect := m.directEvidence(pubKey, wgAlive)
 	e, ok := m.entries[peerName]
 	if !ok {
 		e = &pathEntry{
@@ -351,12 +371,17 @@ func (m *PathMonitor) ForgetMissing(alive []string) {
 // `forceProbe`, when true, shortcuts the Relay→Warm backoff check so a
 // caller (e.g. the ICE layer detecting a new direct handshake attempt)
 // can request an opportunistic probe out of band.
-func (m *PathMonitor) Evaluate(peerName, pubKey string, forceProbe bool) PathMode {
+//
+// `wgAlive` says whether the peer's WireGuard session is currently proven by
+// a recent handshake. It gates the heartbeat evidence only: a path that
+// answers pings while the session behind it is dead must not be published as
+// direct, but data that actually decrypted is proof of both regardless.
+func (m *PathMonitor) Evaluate(peerName, pubKey string, forceProbe, wgAlive bool) PathMode {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := m.now()
-	lastDirect := m.rx.LastDirectReceive(pubKey)
+	lastDirect := m.directEvidence(pubKey, wgAlive)
 
 	e, ok := m.entries[peerName]
 	if !ok {

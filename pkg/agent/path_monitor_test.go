@@ -12,10 +12,17 @@ import (
 // Evaluate calls to simulate packet arrivals.
 type fakeRX struct {
 	last map[string]int64
+	// pong is the heartbeat watermark, kept separate so a test can assert
+	// that data evidence and pong evidence are treated differently.
+	pong map[string]int64
 }
 
 func (f *fakeRX) LastDirectReceive(pubKey string) int64 {
 	return f.last[pubKey]
+}
+
+func (f *fakeRX) LastDirectPong(pubKey string) int64 {
+	return f.pong[pubKey]
 }
 
 // fakeClock returns a time.Time that the test can advance between
@@ -34,7 +41,7 @@ func (c *fakeClock) now() time.Time          { return c.t }
 // individual tests advance the clock in obvious units.
 func newMonitor(t *testing.T) (*PathMonitor, *fakeRX, *fakeClock) {
 	t.Helper()
-	rx := &fakeRX{last: map[string]int64{}}
+	rx := &fakeRX{last: map[string]int64{}, pong: map[string]int64{}}
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	pm := NewPathMonitor(testr.New(t), rx, PathMonitorConfig{
 		WarmStall:  100 * time.Millisecond,
@@ -63,7 +70,7 @@ func seedRelay(t *testing.T, pm *PathMonitor, name, key string) {
 // after each agent restart — the FSM lives in process memory only.
 func TestFirstSightStartsOnWarm(t *testing.T) {
 	pm, _, _ := newMonitor(t)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("first Evaluate = %v, want PathModeWarm", got)
 	}
 }
@@ -75,16 +82,16 @@ func TestFirstSightStartsOnWarm(t *testing.T) {
 // default while the direct path is still being proven.
 func TestFirstSightWarmSurvivesReEvaluate(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	pm.Evaluate("p1", "key1", false, true)
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("same-tick re-Evaluate = %v, want PathModeWarm", got)
 	}
 	clk.advance(400 * time.Millisecond) // < relayStall (500ms)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("re-Evaluate before relayStall = %v, want PathModeWarm", got)
 	}
 	clk.advance(150 * time.Millisecond) // total 550ms > relayStall
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("unproven direct past relayStall = %v, want PathModeRelay", got)
 	}
 }
@@ -94,7 +101,7 @@ func TestFirstSightWarmSurvivesReEvaluate(t *testing.T) {
 func TestRelayToWarmOnForceProbe(t *testing.T) {
 	pm, _, _ := newMonitor(t)
 	seedRelay(t, pm, "p1", "key1")
-	if got := pm.Evaluate("p1", "key1", true); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", true, true); got != PathModeWarm {
 		t.Fatalf("force-probe from Relay = %v, want PathModeWarm", got)
 	}
 }
@@ -107,12 +114,12 @@ func TestRelayToWarmHonoursBackoff(t *testing.T) {
 	seedRelay(t, pm, "p1", "key1") // Relay, lastProbeAt=now
 
 	clk.advance(100 * time.Millisecond) // < relayRetry (200ms)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("Evaluate before backoff elapsed = %v, want PathModeRelay", got)
 	}
 
 	clk.advance(150 * time.Millisecond) // total 250ms > 200ms
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after backoff elapsed = %v, want PathModeWarm", got)
 	}
 }
@@ -122,13 +129,13 @@ func TestRelayToWarmHonoursBackoff(t *testing.T) {
 // to Direct on the next Evaluate.
 func TestWarmToDirectOnFreshReceive(t *testing.T) {
 	pm, rx, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", true) // Warm
+	pm.Evaluate("p1", "key1", true, true) // Warm
 
 	// Simulate a direct packet arriving 10ms later.
 	clk.advance(10 * time.Millisecond)
 	rx.last["key1"] = clk.now().UnixNano()
 
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
 		t.Fatalf("Evaluate with fresh RX = %v, want PathModeDirect", got)
 	}
 }
@@ -139,15 +146,15 @@ func TestWarmToDirectOnFreshReceive(t *testing.T) {
 // slow transition in the FSM.
 func TestWarmToRelayAfterStallTimeout(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", true) // Warm at t=0
+	pm.Evaluate("p1", "key1", true, true) // Warm at t=0
 
 	clk.advance(400 * time.Millisecond) // < relayStall
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate before relayStall = %v, want PathModeWarm", got)
 	}
 
 	clk.advance(200 * time.Millisecond) // total 600ms > relayStall=500ms
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("Evaluate after relayStall = %v, want PathModeRelay", got)
 	}
 }
@@ -159,17 +166,17 @@ func TestWarmToRelayAfterStallTimeout(t *testing.T) {
 func TestDirectToWarmOnStall(t *testing.T) {
 	pm, rx, clk := newMonitor(t)
 	// Drive the peer to Direct first.
-	pm.Evaluate("p1", "key1", true) // Warm
+	pm.Evaluate("p1", "key1", true, true) // Warm
 	clk.advance(10 * time.Millisecond)
 	rx.last["key1"] = clk.now().UnixNano()
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
 		t.Fatalf("setup: want Direct, got %v", got)
 	}
 
 	// Advance past warmStall without updating the RX watermark — simulates
 	// the remote's return path being dropped (iptables INPUT DROP in e2e).
 	clk.advance(200 * time.Millisecond) // > warmStall (100ms)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after direct stall = %v, want PathModeWarm", got)
 	}
 }
@@ -179,10 +186,10 @@ func TestDirectToWarmOnStall(t *testing.T) {
 // back to Warm.
 func TestDirectStaysDirectOnContinuousReceive(t *testing.T) {
 	pm, rx, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", true)
+	pm.Evaluate("p1", "key1", true, true)
 	clk.advance(10 * time.Millisecond)
 	rx.last["key1"] = clk.now().UnixNano()
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
 		t.Fatalf("setup: want Direct, got %v", got)
 	}
 
@@ -191,7 +198,7 @@ func TestDirectStaysDirectOnContinuousReceive(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		clk.advance(30 * time.Millisecond)
 		rx.last["key1"] = clk.now().UnixNano()
-		if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+		if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
 			t.Fatalf("iteration %d: want Direct, got %v", i, got)
 		}
 	}
@@ -201,27 +208,27 @@ func TestDirectStaysDirectOnContinuousReceive(t *testing.T) {
 // state so re-adding the same name rebuilds the FSM from scratch.
 func TestForgetClearsEntry(t *testing.T) {
 	pm, _, _ := newMonitor(t)
-	pm.Evaluate("p1", "key1", true) // Warm
+	pm.Evaluate("p1", "key1", true, true) // Warm
 	pm.Forget("p1")
 	if got := pm.ModeFor("p1"); got != PathUnknown {
 		t.Fatalf("ModeFor after Forget = %v, want PathUnknown", got)
 	}
 	// Next Evaluate rebuilds the entry under the first-sight rule (Warm).
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("first Evaluate after Forget = %v, want PathModeWarm", got)
 	}
 }
 
 func TestForceRelayOverridesDirectWithoutDisablingFutureProbes(t *testing.T) {
 	pm, rx, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", true)
+	pm.Evaluate("p1", "key1", true, true)
 	clk.advance(10 * time.Millisecond)
 	rx.last["key1"] = clk.now().UnixNano()
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeDirect {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
 		t.Fatalf("setup: want Direct, got %v", got)
 	}
 
-	if got := pm.ForceRelay("p1", "key1"); got != PathModeRelay {
+	if got := pm.ForceRelay("p1", "key1", true); got != PathModeRelay {
 		t.Fatalf("ForceRelay from Direct = %v, want PathModeRelay", got)
 	}
 	if got := pm.ModeFor("p1"); got != PathModeRelay {
@@ -229,15 +236,15 @@ func TestForceRelayOverridesDirectWithoutDisablingFutureProbes(t *testing.T) {
 	}
 
 	clk.advance(100 * time.Millisecond)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("Evaluate before relay retry = %v, want PathModeRelay", got)
 	}
 	clk.advance(150 * time.Millisecond)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after relay retry = %v, want PathModeWarm", got)
 	}
 	clk.advance(10 * time.Millisecond)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("stale direct watermark after ForceRelay = %v, want PathModeWarm", got)
 	}
 }
@@ -252,18 +259,18 @@ func TestStaleWatermarkIsNotFreshEvidence(t *testing.T) {
 	// Put a non-zero RX watermark from before Evaluate ever runs.
 	rx.last["key1"] = clk.now().UnixNano()
 	seedRelay(t, pm, "p1", "key1")
-	pm.Evaluate("p1", "key1", false) // Relay; lastDirectSeen captured
+	pm.Evaluate("p1", "key1", false, true) // Relay; lastDirectSeen captured
 
 	clk.advance(250 * time.Millisecond) // past relayRetry
 	// No new RX packet has arrived; watermark is identical to the one
 	// captured on the first Evaluate.
-	got := pm.Evaluate("p1", "key1", false)
+	got := pm.Evaluate("p1", "key1", false, true)
 	if got != PathModeWarm {
 		t.Fatalf("second Evaluate = %v, want PathModeWarm (probe triggered)", got)
 	}
 	// Third Evaluate: still no new RX. Stays in Warm, does NOT promote.
 	clk.advance(10 * time.Millisecond)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("stale watermark promoted to Direct (should not): got %v", got)
 	}
 }
@@ -274,12 +281,12 @@ func TestStaleWatermarkIsNotFreshEvidence(t *testing.T) {
 // disabled or already failed) stop oscillating between modes.
 func TestMarkNeverDirectSuppressesProbe(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false) // Relay
+	pm.Evaluate("p1", "key1", false, true) // Relay
 	pm.MarkNeverDirect("p1", "key1")
 
 	// Backoff timer elapsed: would normally probe Relay→Warm.
 	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("Evaluate after timer with neverDirect = %v, want PathModeRelay", got)
 	}
 
@@ -287,7 +294,7 @@ func TestMarkNeverDirectSuppressesProbe(t *testing.T) {
 	// that lets the agent durably pin a peer to relay even if other
 	// signals (e.g. ICE detected an inbound direct packet via relay
 	// keepalive proxying) would normally trigger a probe.
-	if got := pm.Evaluate("p1", "key1", true); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", true, true); got != PathModeRelay {
 		t.Fatalf("Evaluate with forceProbe and neverDirect = %v, want PathModeRelay", got)
 	}
 }
@@ -298,7 +305,7 @@ func TestMarkNeverDirectSuppressesProbe(t *testing.T) {
 // Relay rather than waiting out relayStall.
 func TestMarkNeverDirectFromWarmDemotes(t *testing.T) {
 	pm, _, _ := newMonitor(t)
-	pm.Evaluate("p1", "key1", true) // Warm
+	pm.Evaluate("p1", "key1", true, true) // Warm
 	pm.MarkNeverDirect("p1", "key1")
 	if got := pm.ModeFor("p1"); got != PathModeRelay {
 		t.Fatalf("ModeFor after MarkNeverDirect from Warm = %v, want PathModeRelay", got)
@@ -316,7 +323,7 @@ func TestMarkNeverDirectCreatesEntry(t *testing.T) {
 		t.Fatalf("ModeFor after MarkNeverDirect on missing entry = %v, want PathModeRelay", got)
 	}
 	clk.advance(time.Hour) // way past any timer
-	if got := pm.Evaluate("p1", "key1", true); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", true, true); got != PathModeRelay {
 		t.Fatalf("Evaluate after MarkNeverDirect on missing entry = %v, want PathModeRelay", got)
 	}
 }
@@ -327,11 +334,11 @@ func TestMarkNeverDirectCreatesEntry(t *testing.T) {
 // timer fire again on the next backoff window.
 func TestClearNeverDirectRestoresProbing(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false) // Relay, lastProbeAt = now
+	pm.Evaluate("p1", "key1", false, true) // Relay, lastProbeAt = now
 	pm.MarkNeverDirect("p1", "key1")
 
 	clk.advance(300 * time.Millisecond)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("setup: still pinned, got %v", got)
 	}
 
@@ -339,45 +346,97 @@ func TestClearNeverDirectRestoresProbing(t *testing.T) {
 	// neverDirect is cleared but lastProbeAt was anchored when the entry
 	// was created, and the clock has already moved past relayRetry. The
 	// next Evaluate should now fire the deferred probe.
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after ClearNeverDirect = %v, want PathModeWarm", got)
 	}
 }
 
 func TestBackoffDirectProbeUntilSuppressesTimerProbe(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false) // Relay, lastProbeAt = now
+	pm.Evaluate("p1", "key1", false, true) // Relay, lastProbeAt = now
 
 	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
 	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeRelay {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeRelay {
 		t.Fatalf("Evaluate during probe backoff = %v, want PathModeRelay", got)
 	}
 
 	clk.advance(time.Second)
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after probe backoff = %v, want PathModeWarm", got)
 	}
 }
 
 func TestForceProbeOverridesTemporaryBackoff(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false)
+	pm.Evaluate("p1", "key1", false, true)
 	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
 
-	if got := pm.Evaluate("p1", "key1", true); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", true, true); got != PathModeWarm {
 		t.Fatalf("forced Evaluate during probe backoff = %v, want PathModeWarm", got)
 	}
 }
 
 func TestClearProbeBackoffRestoresTimerProbe(t *testing.T) {
 	pm, _, clk := newMonitor(t)
-	pm.Evaluate("p1", "key1", false)
+	pm.Evaluate("p1", "key1", false, true)
 	pm.BackoffDirectProbeUntil("p1", "key1", clk.now().Add(time.Second))
 
 	clk.advance(300 * time.Millisecond) // > relayRetry (200ms)
 	pm.ClearProbeBackoff("p1")
-	if got := pm.Evaluate("p1", "key1", false); got != PathModeWarm {
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeWarm {
 		t.Fatalf("Evaluate after ClearProbeBackoff = %v, want PathModeWarm", got)
+	}
+}
+
+// A heartbeat pong is evidence the path carries a round trip, so an idle pair
+// whose only traffic is the heartbeat stays Direct instead of flapping to Warm
+// every warmStall.
+func TestPongEvidenceKeepsDirect(t *testing.T) {
+	pm, rx, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", true, true) // Warm
+	clk.advance(10 * time.Millisecond)
+	rx.last["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
+		t.Fatalf("setup: want Direct, got %v", got)
+	}
+
+	// Data goes quiet; only pongs keep arriving.
+	clk.advance(200 * time.Millisecond) // > warmStall
+	rx.pong["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
+		t.Fatalf("Evaluate with a fresh pong = %v, want PathModeDirect", got)
+	}
+}
+
+// The pong responder lives in the Bind, below wireguard-go, so it answers even
+// when the peer's session is dead. Without the liveness gate that would hold a
+// zombie pair in Direct forever and publish it as connected.
+func TestPongEvidenceIgnoredWhenSessionDead(t *testing.T) {
+	pm, rx, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", true, true)
+	clk.advance(10 * time.Millisecond)
+	rx.last["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false, true); got != PathModeDirect {
+		t.Fatalf("setup: want Direct, got %v", got)
+	}
+
+	clk.advance(200 * time.Millisecond) // > warmStall
+	rx.pong["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false, false); got != PathModeWarm {
+		t.Fatalf("Evaluate with wgAlive=false = %v, want PathModeWarm", got)
+	}
+}
+
+// Data evidence is proof of both the path and the session, so the gate must
+// not suppress it: a pair that is still decrypting packets stays Direct even
+// while the handshake age says otherwise.
+func TestDataEvidenceSurvivesLivenessGate(t *testing.T) {
+	pm, rx, clk := newMonitor(t)
+	pm.Evaluate("p1", "key1", true, false)
+	clk.advance(10 * time.Millisecond)
+	rx.last["key1"] = clk.now().UnixNano()
+	if got := pm.Evaluate("p1", "key1", false, false); got != PathModeDirect {
+		t.Fatalf("Evaluate with fresh data and wgAlive=false = %v, want PathModeDirect", got)
 	}
 }
