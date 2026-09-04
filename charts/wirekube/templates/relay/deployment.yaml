@@ -68,6 +68,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Set through the environment rather than --metrics-addr so an
+            # older pinned image ignores it instead of rejecting an unknown
+            # flag. Empty disables the endpoint.
+            - name: WIREKUBE_RELAY_METRICS_ADDR
+              value: {{ ternary (printf ":%v" .Values.relay.metrics.port) "" .Values.relay.metrics.enabled | quote }}
           ports:
             - name: relay-tcp
               containerPort: {{ .Values.relay.port }}
@@ -78,6 +83,11 @@ spec:
             {{- if .Values.relay.clusterKube }}
             - name: relay-cluster
               containerPort: {{ .Values.relay.clusterPort }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.relay.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.relay.metrics.port }}
               protocol: TCP
             {{- end }}
           readinessProbe:

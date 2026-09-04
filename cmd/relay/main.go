@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -25,11 +27,13 @@ func main() {
 	relayID := flag.String("relay-id", "", "unique replica identity for clustering; defaults to the hostname")
 	clusterKube := flag.Bool("cluster-kube", false, "join other relay replicas through a Kubernetes-lease peer registry")
 	clusterAddr := flag.String("cluster-addr", ":3479", "TCP listen address for replica-to-replica forwarding (requires --cluster-kube)")
+	metricsAddr := flag.String("metrics-addr", ":9091", "HTTP listen address for Prometheus /metrics and /healthz; empty disables")
 	flag.Parse()
 
 	if envAddr := os.Getenv("WIREKUBE_RELAY_ADDR"); envAddr != "" {
 		*addr = envAddr
 	}
+	*metricsAddr = resolveMetricsAddr(*metricsAddr, os.LookupEnv)
 	if v := os.Getenv("WIREKUBE_FORWARDER_PORT_LOW"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			*fwLow = n
@@ -77,9 +81,47 @@ func main() {
 			log.Fatalf("enable external WG listener: %v", err)
 		}
 	}
+	if *metricsAddr != "" {
+		go serveMetrics(*metricsAddr)
+	} else {
+		log.Printf("wirekube-relay metrics endpoint disabled")
+	}
 	if err := srv.ListenAndServe(*addr); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
+}
+
+// resolveMetricsAddr applies the environment override for the metrics
+// endpoint. LookupEnv rather than the non-empty check the other variables use:
+// an explicitly empty value must be able to disable the endpoint, because the
+// manifests set this through the environment so an older pinned image ignores
+// it instead of rejecting an unknown flag.
+func resolveMetricsAddr(flagVal string, lookup func(string) (string, bool)) string {
+	if v, ok := lookup("WIREKUBE_RELAY_METRICS_ADDR"); ok {
+		return v
+	}
+	return flagVal
+}
+
+// serveMetrics exposes Prometheus metrics and a trivial health check. A bind
+// failure is logged, not fatal: the data plane does not depend on it, and
+// the manifests keep this port on a cluster-local Service, never on the
+// public LoadBalancer, because the per-destination labels reveal peer key
+// prefixes and traffic shape.
+func serveMetrics(addr string) {
+	log.Printf("wirekube-relay metrics on %s", addr)
+	if err := http.ListenAndServe(addr, newMetricsMux()); err != nil {
+		log.Printf("wirekube-relay metrics server failed: %v", err)
+	}
+}
+
+func newMetricsMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
 }
 
 // enableKubeCluster wires the server into the replica mesh: an in-cluster

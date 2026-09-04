@@ -16,7 +16,7 @@ func TestClientConnWriteFrameNeverBlocksOnStalledPeer(t *testing.T) {
 	defer clientSide.Close()
 
 	// No reader on clientSide and no writeLoop started, so nothing can ever
-	// drain sendQ. Every write past the queue depth must still return at once.
+	// drain dataQ. Every write past the queue depth must still return at once.
 	cc := newClientConn(pubkey(1), serverSide)
 
 	start := time.Now()
