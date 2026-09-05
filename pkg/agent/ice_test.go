@@ -21,6 +21,8 @@ import (
 
 type fakeWGEngine struct {
 	lastDirect map[string]int64
+	lastPong   map[string]int64
+	pathStats  map[string]wireguard.PathStats
 	lastRelay  map[string]int64
 	stats      []wireguard.PeerStats
 	setPaths   []wireguard.PathMode
@@ -94,7 +96,12 @@ func (f *fakeWGEngine) SetPeerPath(_ string, mode wireguard.PathMode, _ string) 
 func (f *fakeWGEngine) SetRelayTransport(wireguard.RelayTransport) {}
 func (f *fakeWGEngine) LastDirectReceive(pubKey string) int64      { return f.lastDirect[pubKey] }
 func (f *fakeWGEngine) LastRelayReceive(pubKey string) int64       { return f.lastRelay[pubKey] }
-func (f *fakeWGEngine) MarkBimodalHint([32]byte)                   {}
+func (f *fakeWGEngine) LastDirectPong(pubKey string) int64         { return f.lastPong[pubKey] }
+func (f *fakeWGEngine) PeerPathStats(pubKey string) (wireguard.PathStats, bool) {
+	st, ok := f.pathStats[pubKey]
+	return st, ok
+}
+func (f *fakeWGEngine) MarkBimodalHint([32]byte) {}
 
 func TestIsPortRestrictedSymmetricPair(t *testing.T) {
 	prc := string(nat.NATPortRestrictedCone)
@@ -347,10 +354,10 @@ func TestPublishedTransportForPeerReadsPathMonitor(t *testing.T) {
 	// PathModeDirect: forced probe → Warm, then fresh direct RX promotes to Direct.
 	t.Run("direct reports direct", func(t *testing.T) {
 		pm, rx, clk := newMon()
-		pm.Evaluate("p", "k", true) // Relay → Warm
+		pm.Evaluate("p", "k", true, true) // Relay → Warm
 		rx.last["k"] = clk.now().UnixNano()
 		clk.advance(10 * time.Millisecond) // still within promoteAge
-		if got := pm.Evaluate("p", "k", false); got != PathModeDirect {
+		if got := pm.Evaluate("p", "k", false, true); got != PathModeDirect {
 			t.Fatalf("precondition: mode = %s, want Direct", got)
 		}
 		assertTransport(t, pm, "p", "k", "direct")
@@ -359,7 +366,7 @@ func TestPublishedTransportForPeerReadsPathMonitor(t *testing.T) {
 	// PathModeWarm: forced probe enters Warm; assert before any promotion.
 	t.Run("warm reports relay", func(t *testing.T) {
 		pm, _, _ := newMon()
-		if got := pm.Evaluate("p", "k", true); got != PathModeWarm {
+		if got := pm.Evaluate("p", "k", true, true); got != PathModeWarm {
 			t.Fatalf("precondition: mode = %s, want Warm", got)
 		}
 		assertTransport(t, pm, "p", "k", "relay")
@@ -368,9 +375,9 @@ func TestPublishedTransportForPeerReadsPathMonitor(t *testing.T) {
 	// PathModeRelay: Warm → Relay after the stall window with no direct RX.
 	t.Run("relay reports relay", func(t *testing.T) {
 		pm, _, clk := newMon()
-		pm.Evaluate("p", "k", true) // Relay → Warm
+		pm.Evaluate("p", "k", true, true) // Relay → Warm
 		clk.advance(200 * time.Millisecond)
-		if got := pm.Evaluate("p", "k", false); got != PathModeRelay { // Warm → Relay
+		if got := pm.Evaluate("p", "k", false, true); got != PathModeRelay { // Warm → Relay
 			t.Fatalf("precondition: mode = %s, want Relay", got)
 		}
 		assertTransport(t, pm, "p", "k", "relay")

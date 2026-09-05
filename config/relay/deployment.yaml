@@ -191,6 +191,11 @@ spec:
             - name: relay-cluster
               containerPort: 3479
               protocol: TCP
+            # Prometheus /metrics (binary default --metrics-addr=:9091). Not
+            # passed as a flag so an older pinned image keeps starting.
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
           readinessProbe:
             exec:
               command: ["sh", "-c", "nc -z 127.0.0.1 3478"]
@@ -281,3 +286,26 @@ spec:
       port: 3478
       targetPort: 3478
       protocol: UDP
+---
+# Cluster-local scrape endpoint for the relay's Prometheus metrics. This is a
+# separate Service on purpose: the per-destination labels reveal peer key
+# prefixes and traffic shape, so the port must never be added to the
+# LoadBalancer Service above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay-metrics
+  namespace: wirekube-system
+  labels:
+    app.kubernetes.io/name: wirekube-relay
+    app.kubernetes.io/component: relay-metrics
+    app.kubernetes.io/part-of: wirekube
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wirekube-relay
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: metrics
+      protocol: TCP

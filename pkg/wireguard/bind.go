@@ -4,6 +4,7 @@ package wireguard
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -26,21 +27,54 @@ var _ conn.Bind = (*WireKubeBind)(nil)
 // stored as int32 so they can live in a lock-free atomic.
 const (
 	PathModeDirect int32 = 0 // UDP only (auto-upgrades to dual-send if direct stalls — see directTrustWindow)
-	PathModeWarm   int32 = 1 // UDP + relay duplicate send
+	PathModeWarm   int32 = 1 // UDP, plus relay while direct evidence is missing or stale
 	PathModeRelay  int32 = 2 // relay only
 )
 
-// directTrustWindow is how long PathModeDirect trusts the direct leg on its
-// own. After this many nanoseconds without a direct receive, Send() behaves
-// as if the peer were in PathModeWarm for the current packet — duplicating
-// to the relay leg so the receiver is reachable regardless of which side of
-// the direct path is currently broken.
+// directTrustWindow is how long Send trusts the direct leg on the strength of
+// its last evidence. Evidence is the newer of the direct data watermark
+// (DirectHealth.LastSeen) and the last heartbeat pong (lastPongNs). After this
+// many nanoseconds without either, Send duplicates the packet to the relay leg
+// so the receiver is reachable regardless of which side of the direct path is
+// currently broken.
 //
 // This is Tailscale's trustBestAddrUntil mechanism (wgengine/magicsock):
 // the direct-vs-bimodal decision lives in the datapath, not in a control
 // loop, so failover blackout is bounded by this window rather than by the
-// agent's sync cadence.
+// agent's sync cadence. The heartbeat (heartbeatTickNs) refreshes trust on a
+// healthy path well inside the window, so an idle pair no longer lapses.
 const directTrustWindowNs = int64(3 * time.Second)
+
+// Heartbeat scheduler parameters (see runHeartbeat).
+const (
+	// heartbeatTickNs is the scheduler period: one small ping per active
+	// direct peer per tick.
+	heartbeatTickNs = int64(1 * time.Second)
+	// heartbeatMTUProbeEvery makes every Nth tick an MTU-sized probe.
+	heartbeatMTUProbeEvery = 10
+	// heartbeatSessionActiveNs is how recently Send must have written to a
+	// peer for the scheduler to keep probing it (Tailscale's sessionActiveTimeout).
+	heartbeatSessionActiveNs = int64(45 * time.Second)
+	// heartbeatSendDstMaxAgeNs bounds how long the address of the last direct
+	// write is preferred over AuthAddr/DirectAddr as the probe target.
+	heartbeatSendDstMaxAgeNs = int64(60 * time.Second)
+	// heartbeatPendingTTLNs is how long a ping's txid stays answerable. A pong
+	// arriving later is counted as a replay drop, not as evidence.
+	heartbeatPendingTTLNs = int64(3 * time.Second)
+	// heartbeatSentAtSkewNs is the tolerated |now - sent_at| on an inbound
+	// ping; ordinary clock skew fits, a replayed capture does not.
+	heartbeatSentAtSkewNs = int64(60 * time.Second)
+	// heartbeatMTUMissLimit consecutive unanswered MTU probes (while small
+	// pongs stay fresh) set the mtuStale veto.
+	heartbeatMTUMissLimit = 3
+	// heartbeatPendingRing is the number of outstanding pings kept per peer.
+	heartbeatPendingRing = 4
+
+	// Pong reply rate limits: per peer and for the whole bind.
+	heartbeatPongPeerRate  = 4.0
+	heartbeatPongPeerBurst = 8.0
+	heartbeatPongGlobalCap = 1000.0
+)
 
 // bimodalHintWindowNs is how long an inbound hint forces dual-send on the
 // receiving side. Long enough for the remote peer to re-converge on direct
@@ -126,6 +160,96 @@ type PeerPath struct {
 	// the teardown. Such a claim would have no path entry to release it later
 	// and would leave the address permanently contested for its next holder.
 	forgotten atomic.Bool
+
+	// hbKey is the heartbeat pair key (k_pair), derived once from the static
+	// keys in SetPeerPath / MarkBimodalHint and never on the receive path.
+	// nil while the bind has no key pair or the peer key is not a valid
+	// X25519 point; heartbeats are then disabled for this peer.
+	hbKey atomic.Pointer[[32]byte]
+
+	// Per-peer send accounting. Leg counters are incremented by len(bufs)
+	// after every override in Send, so they reflect the legs actually used.
+	sentDirectOnly atomic.Uint64
+	sentDual       atomic.Uint64
+	sentRelayOnly  atomic.Uint64
+	pingsSent      atomic.Uint64
+	pongsRecv      atomic.Uint64
+	authFail       atomic.Uint64
+	replayDrop     atomic.Uint64
+
+	// lastSendNs is the last Send for this peer on any leg; it gates the
+	// heartbeat (session active within heartbeatSessionActiveNs). Heartbeat
+	// frames themselves never touch it.
+	lastSendNs atomic.Int64
+	// lastPongNs is the second trust watermark next to DirectHealth.LastSeen:
+	// the last heartbeat pong, proving a UDP round trip to the probed address.
+	// Inbound pings do not refresh it (they prove peer→us only).
+	lastPongNs    atomic.Int64
+	lastMTUPongNs atomic.Int64
+	rttNs         atomic.Int64
+	// lastSendDst is the address the last direct write actually went to, i.e.
+	// the device's current roamed endpoint. The heartbeat probes it so the
+	// probed address equals the sending address even for symmetric-NAT peers
+	// whose port drifts ahead of AuthAddr.
+	lastSendDst   atomic.Pointer[netip.AddrPort]
+	lastSendDstNs atomic.Int64
+	// mtuStale is the MTU-probe veto: heartbeatMTUMissLimit MTU probes went
+	// unanswered while small pongs stayed fresh, so the path is passing small
+	// frames and blackholing large ones. Send treats it as directStale.
+	mtuStale atomic.Bool
+
+	// pendingMu guards the outstanding-ping ring and the MTU miss counter.
+	pendingMu sync.Mutex
+	pending   [heartbeatPendingRing]pendingPing
+	// mtuMissed counts consecutive MTU probes that expired unanswered.
+	mtuMissed int
+
+	// pongBucket rate-limits pong replies to this peer.
+	pongBucket tokenBucket
+}
+
+// pendingPing is one outstanding heartbeat ping awaiting its pong.
+type pendingPing struct {
+	valid    bool
+	mtuProbe bool
+	txid     [12]byte
+	sentAtNs int64
+	frameLen uint16
+}
+
+// tokenBucket is a small rate limiter for pong replies. Callers pass the
+// rate and burst so one type serves the per-peer and global limits.
+type tokenBucket struct {
+	mu     sync.Mutex
+	tokens float64
+	lastNs int64
+}
+
+// allow takes one token if available, refilling at rate tokens/s up to burst.
+func (tb *tokenBucket) allow(nowNs int64, rate, burst float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.lastNs == 0 {
+		tb.tokens = burst
+	} else if elapsed := nowNs - tb.lastNs; elapsed > 0 {
+		tb.tokens += float64(elapsed) / float64(time.Second) * rate
+		if tb.tokens > burst {
+			tb.tokens = burst
+		}
+	}
+	tb.lastNs = nowNs
+	if tb.tokens < 1 {
+		return false
+	}
+	tb.tokens--
+	return true
+}
+
+// heartbeatConfig is the local identity and mesh MTU the heartbeat needs,
+// installed once by SetHeartbeatConfig.
+type heartbeatConfig struct {
+	kp  *KeyPair
+	mtu int
 }
 
 // WireKubeBind implements conn.Bind using a single UDP socket for direct P2P
@@ -156,11 +280,38 @@ type WireKubeBind struct {
 	relay      RelayTransport
 	relayCh    chan RelayPacket
 	relayClose chan struct{}
+
+	// Heartbeat state. hbConfig is read lock-free by the receive path and the
+	// scheduler; hbStop/hbDone belong to the current socket generation and
+	// are handed off under b.mu, but the scheduler itself never takes b.mu
+	// because Close holds it while closing the socket.
+	hbConfig atomic.Pointer[heartbeatConfig]
+	hbStop   chan struct{}
+	hbDone   chan struct{}
+	hbTicks  atomic.Uint64
+	// pongGlobal caps pong replies across all peers.
+	pongGlobal tokenBucket
+
+	// nowNs is the clock; nil means time.Now. Tests inject one so trust
+	// windows and the pending TTL can be driven without sleeping.
+	nowNs func() int64
+	// hbTickOverride, when set before Open, replaces the 1s ticker so tests
+	// drive ticks by hand through heartbeatTick.
+	hbTickOverride <-chan time.Time
 }
 
 // NewWireKubeBind creates a new unbound WireKubeBind.
 func NewWireKubeBind() *WireKubeBind {
 	return &WireKubeBind{}
+}
+
+// clockNs returns the current unix time in nanoseconds from the injected
+// clock, or the wall clock when none is set.
+func (b *WireKubeBind) clockNs() int64 {
+	if b.nowNs != nil {
+		return b.nowNs()
+	}
+	return time.Now().UnixNano()
 }
 
 // SetRelayTransport injects a relay transport into the bind. Must be called
@@ -169,6 +320,46 @@ func (b *WireKubeBind) SetRelayTransport(rt RelayTransport) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.relay = rt
+}
+
+// SetHeartbeatConfig gives the bind the local key pair and mesh MTU the
+// heartbeat needs: the key pair to derive per-peer heartbeat keys, the MTU to
+// size the MTU probe. The engine calls it right after constructing the bind.
+// Without it no heartbeat frames are sent or answered and Send falls back to
+// data-only evidence. Peers already registered get their key derived here so
+// call order against SetPeerPath does not matter.
+func (b *WireKubeBind) SetHeartbeatConfig(kp *KeyPair, mtu int) {
+	if kp == nil {
+		b.hbConfig.Store(nil)
+		return
+	}
+	cfg := &heartbeatConfig{kp: kp, mtu: mtu}
+	b.hbConfig.Store(cfg)
+	b.pathTable.Range(func(key, value any) bool {
+		b.deriveHeartbeatKey(cfg, key.(string), value.(*PeerPath))
+		return true
+	})
+}
+
+// deriveHeartbeatKey computes and caches k_pair for one peer if it is not set
+// yet. Called from SetPeerPath and MarkBimodalHint only, never on the receive
+// path.
+func (b *WireKubeBind) deriveHeartbeatKey(cfg *heartbeatConfig, pubKeyB64 string, pp *PeerPath) {
+	if cfg == nil || pp.hbKey.Load() != nil {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(pubKeyB64)
+	if err != nil || len(raw) != 32 {
+		return
+	}
+	var peerPub [32]byte
+	copy(peerPub[:], raw)
+	key, err := deriveHeartbeatKey(cfg.kp.Private, cfg.kp.Public, peerPub)
+	if err != nil {
+		log.Printf("[bind] heartbeat key derivation failed peer=%s: %v", shortKey(pubKeyB64), err)
+		return
+	}
+	pp.hbKey.Store(key)
 }
 
 // Open puts the Bind into a listening state on the given port. Passing zero
@@ -222,6 +413,17 @@ func (b *WireKubeBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		log.Printf("[bind] Open: no relay, direct only (port=%d)", b.port)
 	}
 
+	// Each socket generation starts with an empty pending-txid table, so a
+	// pong addressed to a previous socket cannot refresh trust on this one.
+	b.pathTable.Range(func(_, value any) bool {
+		value.(*PeerPath).clearPendingPings()
+		return true
+	})
+	b.hbTicks.Store(0)
+	b.hbStop = make(chan struct{})
+	b.hbDone = make(chan struct{})
+	go b.runHeartbeat(udpConn, b.hbTickOverride, b.hbStop, b.hbDone)
+
 	return fns, b.port, nil
 }
 
@@ -232,6 +434,15 @@ func (b *WireKubeBind) makeReceiveFunc(udpConn *net.UDPConn) conn.ReceiveFunc {
 		n, addr, err := udpConn.ReadFromUDPAddrPort(packets[0])
 		if err != nil {
 			return 0, err
+		}
+
+		// Heartbeat control frames are consumed here, before the peer lookup,
+		// and never reach wireguard-go: (0, nil) is "no packets" to
+		// RoutineReceiveIncoming. They refresh no data watermark and no
+		// learned address; the pong path writes lastPongNs only.
+		if hasHeartbeatMagic(packets[0][:n]) {
+			b.handleHeartbeat(udpConn, packets[0][:n], addr)
+			return 0, nil
 		}
 
 		// Record direct receive evidence for any known peer. In dual-path mode,
@@ -358,9 +569,9 @@ func (b *WireKubeBind) lookupPeerByDirectAddr(addr netip.AddrPort) (string, *Pee
 // returned by Open will return net.ErrClosed.
 func (b *WireKubeBind) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.udp4 == nil {
+		b.mu.Unlock()
 		return nil
 	}
 
@@ -373,6 +584,18 @@ func (b *WireKubeBind) Close() error {
 	err := b.udp4.Close()
 	b.udp4 = nil
 	b.port = 0
+	stop, done := b.hbStop, b.hbDone
+	b.hbStop, b.hbDone = nil, nil
+	b.mu.Unlock()
+
+	// Join the scheduler outside b.mu: it never takes the mutex itself, but
+	// joining under it would still serialize Close behind a tick in progress
+	// for no reason. Writes to the closed socket in that tick are expected
+	// and logged once.
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	return err
 }
 
@@ -404,12 +627,13 @@ func (b *WireKubeBind) SetMark(mark uint32) error {
 // Send writes one or more encrypted WireGuard packets to the endpoint's
 // destination address(es). Path selection is driven by PeerPath.Mode:
 //
-//   - PathModeDirect: write to UDP only.
-//   - PathModeWarm:   write to BOTH UDP and relay on every packet. This is
-//     the Tailscale DERP-style bimodal send; WireGuard's replay counter on
-//     the receiver deduplicates transparently, so duplicate transport is
-//     free from a correctness standpoint and gives the receiver the earlier
-//     copy regardless of which leg happens to be working right now.
+//   - PathModeDirect / PathModeWarm: write to UDP, and also to the relay
+//     while the direct path is unproven (no evidence within
+//     directTrustWindow, or the MTU-probe veto). This is the Tailscale
+//     DERP-style bimodal send; WireGuard's replay counter on the receiver
+//     deduplicates transparently, so duplicate transport is free from a
+//     correctness standpoint and gives the receiver the earlier copy
+//     regardless of which leg happens to be working right now.
 //   - PathModeRelay:  write to relay only.
 //
 // The synthetic-endpoint case (peerKey set, dst port == 0) arises when
@@ -554,36 +778,45 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 	}
 
-	// Decide which legs to send on.
-	sendDirect := mode == PathModeDirect || mode == PathModeWarm
-	sendRelay := mode == PathModeRelay || mode == PathModeWarm
-
-	// Datapath trust check: if the direct receive watermark is stale and
-	// we have not given up on direct (mode != Relay), we should assume the
-	// remote peer cannot reach our direct leg either — they just don't
-	// know it yet because their outbound direct keeps succeeding. Mark
-	// this as stale so a hint gets fired below, and in PathModeDirect also
-	// dual-send this packet so we stay reachable while the remote
-	// converges.
+	// Decide which legs to send on. Evidence-based (Tailscale's
+	// addrForSendLocked): the direct leg is used unless the agent gave up on
+	// it, and the relay leg is added whenever the direct path is not
+	// currently proven.
 	//
-	// This condition must NOT gate on PathModeDirect alone: once the agent
-	// FSM demotes us to Warm, we still need to keep pulling the remote
-	// peer into bimodal via hints for the entire outage window. Without
-	// that, a peer that re-entered direct-only mode (hint expired, local
-	// LastSeen was refreshed by our direct traffic) would stop forwarding
-	// our replies over relay the moment we demoted — triggering a second
-	// blackout that lasts until the next FSM cycle.
-	nowNs := time.Now().UnixNano()
+	//	evidence    := max(LastSeen, lastPongNs)
+	//	directStale := evidence == 0 || now - evidence > directTrustWindowNs || mtuStale
+	//	sendDirect  := mode != Relay
+	//	sendRelay   := mode == Relay || directStale || hintActive || contested
+	//
+	// Warm therefore no longer dual-sends unconditionally: it dual-sends while
+	// evidence is missing or stale, which for a healthy pair means until the
+	// first pong. Direct and Warm still differ in the contested fan-out
+	// filter above, in status publication and in the agent's Warm → Relay
+	// countdown.
+	//
+	// The stale check must NOT gate on PathModeDirect alone: once the agent
+	// FSM demotes us to Warm, we still need to keep pulling the remote peer
+	// into bimodal via hints for the entire outage window. Without that, a
+	// peer that re-entered direct-only mode (hint expired, local evidence
+	// refreshed by our direct traffic) would stop forwarding our replies over
+	// relay the moment we demoted — triggering a second blackout that lasts
+	// until the next FSM cycle.
+	nowNs := b.clockNs()
 	directStale := false
 	if mode != PathModeRelay && pp != nil {
-		lastRX := pp.DirectHealth.LastSeen.Load()
-		if lastRX == 0 || nowNs-lastRX > directTrustWindowNs {
+		evidence := pp.DirectHealth.LastSeen.Load()
+		if pong := pp.lastPongNs.Load(); pong > evidence {
+			evidence = pong
+		}
+		if evidence == 0 || nowNs-evidence > directTrustWindowNs || pp.mtuStale.Load() {
 			directStale = true
-			if mode == PathModeDirect {
-				sendRelay = true
-			}
 		}
 	}
+	sendDirect := mode != PathModeRelay
+	// The contested-address branch resolves no pp, so it contributes its own
+	// term: without it a contested destination would lose the relay leg that
+	// its relay-only claimants depend on.
+	sendRelay := mode == PathModeRelay || directStale || len(contestedKeys) > 0
 
 	if bindDebug && directStale && !(relay != nil && hasPeerKey) {
 		last := lastLogDirectStaleNoRelayNs.Load()
@@ -660,6 +893,20 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return syscall.ENOTCONN
 	}
 
+	// lastSendNs keeps the heartbeat session alive and lastSendDst is what it
+	// probes; both describe intent, so an attempted send counts. The leg
+	// counters do not: they are charged per buffer from the write results
+	// below, because a failed write carried nothing and these metrics exist to
+	// be read during exactly the outages that make writes fail.
+	if pp != nil {
+		pp.lastSendNs.Store(nowNs)
+		if sendDirect {
+			d := dst
+			pp.lastSendDst.Store(&d)
+			pp.lastSendDstNs.Store(nowNs)
+		}
+	}
+
 	addr := net.UDPAddrFromAddrPort(dst)
 
 	for _, buf := range bufs {
@@ -689,6 +936,19 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 				if err := relay.SendToPeer(peerKeyBytes, buf); err != nil {
 					relayErr = err
 				}
+			}
+		}
+
+		if pp != nil {
+			directOK := sendDirect && directErr == nil
+			relayOK := sendRelay && relayErr == nil
+			switch {
+			case directOK && relayOK:
+				pp.sentDual.Add(1)
+			case directOK:
+				pp.sentDirectOnly.Add(1)
+			case relayOK:
+				pp.sentRelayOnly.Add(1)
 			}
 		}
 
@@ -932,6 +1192,9 @@ func (b *WireKubeBind) SetPeerPath(pubKeyB64 string, mode int32, directAddr neti
 	if directAddr.IsValid() {
 		b.claimAddr(directAddr.String(), pubKeyB64)
 	}
+	// The heartbeat key depends only on the two static keys, so it is derived
+	// here once (a no-op on every later sync tick) and never on the receive path.
+	b.deriveHeartbeatKey(b.hbConfig.Load(), pubKeyB64, pp)
 	// Only log the *initial* registration of a new peer path, not every
 	// sync cycle's reconfirmation. driveTransportMode commits SetPeerPath
 	// on every sync tick per peer, which would flood the log otherwise.
@@ -964,13 +1227,339 @@ func (b *WireKubeBind) MarkBimodalHint(srcPubKey [32]byte) {
 		actual, _ := b.pathTable.LoadOrStore(pubKeyB64, pp)
 		pp = actual.(*PeerPath)
 	}
-	nowNs := time.Now().UnixNano()
+	b.deriveHeartbeatKey(b.hbConfig.Load(), pubKeyB64, pp)
+	nowNs := b.clockNs()
 	prevUntil := pp.hintedUntilNs.Load()
 	pp.hintedUntilNs.Store(nowNs + bimodalHintWindowNs)
 	if prevUntil <= nowNs {
 		log.Printf("[bind] bimodal hint received peer=%s window=%s",
 			shortKey(pubKeyB64), time.Duration(bimodalHintWindowNs))
 	}
+}
+
+// LastDirectPong returns the unix nano timestamp of the last heartbeat pong
+// from a peer, or 0 if none has arrived. Kept separate from
+// DirectHealth.LastSeen so callers can apply their own liveness gate.
+func (b *WireKubeBind) LastDirectPong(pubKeyB64 string) int64 {
+	pp := b.GetPeerPath(pubKeyB64)
+	if pp == nil {
+		return 0
+	}
+	return pp.lastPongNs.Load()
+}
+
+// PeerPathStats returns a snapshot of the peer's send and heartbeat
+// accounting, and false if the peer has no path entry.
+func (b *WireKubeBind) PeerPathStats(pubKeyB64 string) (PathStats, bool) {
+	pp := b.GetPeerPath(pubKeyB64)
+	if pp == nil {
+		return PathStats{}, false
+	}
+	return PathStats{
+		SentDirectOnly: pp.sentDirectOnly.Load(),
+		SentDual:       pp.sentDual.Load(),
+		SentRelayOnly:  pp.sentRelayOnly.Load(),
+		PingsSent:      pp.pingsSent.Load(),
+		PongsRecv:      pp.pongsRecv.Load(),
+		AuthFail:       pp.authFail.Load(),
+		ReplayDrop:     pp.replayDrop.Load(),
+		LastSendNs:     pp.lastSendNs.Load(),
+		LastPongNs:     pp.lastPongNs.Load(),
+		LastMTUPongNs:  pp.lastMTUPongNs.Load(),
+		RTTNs:          pp.rttNs.Load(),
+		MTUStale:       pp.mtuStale.Load(),
+	}, true
+}
+
+// pongStatus is the outcome of matching an inbound pong against the pending
+// ping ring.
+type pongStatus int
+
+const (
+	pongMatched      pongStatus = iota
+	pongUnknown                 // no pending entry with that txid (or already consumed)
+	pongStale                   // entry older than heartbeatPendingTTLNs
+	pongSizeMismatch            // frame_len differs from the ping's
+)
+
+// recordPing stores an outstanding ping in the ring, overwriting the oldest
+// slot. Four slots outlast the 3s TTL at one ping per second.
+func (pp *PeerPath) recordPing(txid [12]byte, sentAtNs int64, frameLen uint16, mtuProbe bool) {
+	pp.pendingMu.Lock()
+	defer pp.pendingMu.Unlock()
+	slot := -1
+	var oldest int64
+	for i := range pp.pending {
+		if !pp.pending[i].valid {
+			slot = i
+			break
+		}
+		if slot == -1 || pp.pending[i].sentAtNs < oldest {
+			slot, oldest = i, pp.pending[i].sentAtNs
+		}
+	}
+	pp.pending[slot] = pendingPing{valid: true, mtuProbe: mtuProbe, txid: txid, sentAtNs: sentAtNs, frameLen: frameLen}
+}
+
+// completePing consumes the pending entry matching txid. The entry is consumed
+// on match and on staleness, so a replayed or late pong cannot be accepted
+// later; a size mismatch leaves it in place for the genuine pong.
+func (pp *PeerPath) completePing(txid [12]byte, frameLen uint16, nowNs int64) (rttNs int64, mtuProbe bool, st pongStatus) {
+	pp.pendingMu.Lock()
+	defer pp.pendingMu.Unlock()
+	for i := range pp.pending {
+		e := &pp.pending[i]
+		if !e.valid || e.txid != txid {
+			continue
+		}
+		if nowNs-e.sentAtNs > heartbeatPendingTTLNs {
+			e.valid = false
+			return 0, false, pongStale
+		}
+		if e.frameLen != frameLen {
+			return 0, false, pongSizeMismatch
+		}
+		e.valid = false
+		if e.mtuProbe {
+			pp.mtuMissed = 0
+		}
+		return nowNs - e.sentAtNs, e.mtuProbe, pongMatched
+	}
+	return 0, false, pongUnknown
+}
+
+// expirePendingPings drops entries past the TTL. An expired MTU probe counts
+// as a miss only while small pongs are fresh: that is the "small frames pass,
+// large frames vanish" signature the veto exists for. A path that answers
+// nothing is already handled by the trust window, and would otherwise carry
+// a stale miss count into its recovery. Returns the consecutive miss count.
+func (pp *PeerPath) expirePendingPings(nowNs int64, smallFresh bool) int {
+	pp.pendingMu.Lock()
+	defer pp.pendingMu.Unlock()
+	for i := range pp.pending {
+		e := &pp.pending[i]
+		if !e.valid || nowNs-e.sentAtNs <= heartbeatPendingTTLNs {
+			continue
+		}
+		e.valid = false
+		if e.mtuProbe {
+			if smallFresh {
+				pp.mtuMissed++
+			} else {
+				pp.mtuMissed = 0
+			}
+		}
+	}
+	return pp.mtuMissed
+}
+
+// clearPendingPings empties the ring for a new socket generation.
+func (pp *PeerPath) clearPendingPings() {
+	pp.pendingMu.Lock()
+	defer pp.pendingMu.Unlock()
+	pp.pending = [heartbeatPendingRing]pendingPing{}
+	pp.mtuMissed = 0
+}
+
+// heartbeatAddr is the address the scheduler probes: the address of the last
+// direct write while it is recent (the device's current roamed endpoint),
+// then the authenticated address, then the bootstrap address. LearnedAddr is
+// excluded on purpose: it is set before crypto from an IP-only match.
+func (pp *PeerPath) heartbeatAddr(nowNs int64) netip.AddrPort {
+	if d := pp.lastSendDst.Load(); d != nil && d.IsValid() && d.Port() != 0 &&
+		nowNs-pp.lastSendDstNs.Load() <= heartbeatSendDstMaxAgeNs {
+		return *d
+	}
+	if a := pp.AuthAddr(); a.IsValid() && a.Port() != 0 {
+		return a
+	}
+	if d := pp.DirectAddr(); d.IsValid() && d.Port() != 0 {
+		return d
+	}
+	return netip.AddrPort{}
+}
+
+// handleHeartbeat processes one heartbeat datagram from the direct socket.
+// Rules, in order: unsupported version, frame_len ≠ datagram length, and MAC
+// mismatch are authFail; a sender without a path entry (or without a derived
+// key) is dropped before any crypto and without a counter, since there is
+// nowhere to count it. A ping must have one of the two scheduler sizes and a
+// sent_at within the skew window; it is answered with a pong of the same
+// frame_len to the datagram's source, under a per-peer and a global rate
+// limit, and refreshes nothing (it proves peer→us only). A pong is matched
+// against the pending ring; only a match writes lastPongNs and RTT.
+func (b *WireKubeBind) handleHeartbeat(udpConn *net.UDPConn, frame []byte, src netip.AddrPort) {
+	hdr, versionOK := decodeHeartbeatHeader(frame)
+	pubKeyB64 := base64.StdEncoding.EncodeToString(hdr.Sender[:])
+	pp := b.GetPeerPath(pubKeyB64)
+	if pp == nil {
+		return
+	}
+	key := pp.hbKey.Load()
+	if key == nil {
+		return
+	}
+	if !versionOK || int(hdr.FrameLen) != len(frame) || !verifyHeartbeatMAC(frame, key[:]) {
+		pp.authFail.Add(1)
+		return
+	}
+	nowNs := b.clockNs()
+
+	switch hdr.Type {
+	case heartbeatTypePing:
+		cfg := b.hbConfig.Load()
+		if cfg == nil {
+			return
+		}
+		if !heartbeatPingSizeAllowed(len(frame), cfg.mtu) {
+			pp.authFail.Add(1)
+			return
+		}
+		if skew := nowNs - hdr.SentAt; skew > heartbeatSentAtSkewNs || skew < -heartbeatSentAtSkewNs {
+			pp.replayDrop.Add(1)
+			return
+		}
+		// Global cap first: consuming the per-peer token before checking it
+		// would let a saturated global drain every peer's bucket, so the
+		// backlog would outlive the flood that caused it.
+		if !b.pongGlobal.allow(nowNs, heartbeatPongGlobalCap, heartbeatPongGlobalCap) ||
+			!pp.pongBucket.allow(nowNs, heartbeatPongPeerRate, heartbeatPongPeerBurst) {
+			return
+		}
+		pong := encodeHeartbeat(heartbeatFrame{
+			Type:     heartbeatTypePong,
+			FrameLen: hdr.FrameLen,
+			TxID:     hdr.TxID,
+			SentAt:   hdr.SentAt,
+			Sender:   cfg.kp.Public,
+		}, key[:])
+		if _, err := udpConn.WriteToUDPAddrPort(pong, src); err != nil && bindDebug {
+			log.Printf("[bind] heartbeat pong write peer=%s dst=%s err=%v", shortKey(pubKeyB64), src, err)
+		}
+
+	case heartbeatTypePong:
+		rtt, mtuProbe, st := pp.completePing(hdr.TxID, hdr.FrameLen, nowNs)
+		switch st {
+		case pongMatched:
+			pp.lastPongNs.Store(nowNs)
+			pp.rttNs.Store(rtt)
+			pp.pongsRecv.Add(1)
+			if mtuProbe {
+				pp.lastMTUPongNs.Store(nowNs)
+				if pp.mtuStale.Swap(false) {
+					log.Printf("[bind] heartbeat MTU probe answered again peer=%s, veto cleared", shortKey(pubKeyB64))
+				}
+			}
+		case pongSizeMismatch:
+			pp.authFail.Add(1)
+		default: // unknown, consumed, or stale txid
+			pp.replayDrop.Add(1)
+		}
+
+	default:
+		pp.authFail.Add(1)
+	}
+}
+
+// runHeartbeat is the scheduler goroutine, one per socket generation. It
+// receives the socket as an argument and never takes b.mu, because Close
+// holds b.mu while closing that socket and then joins this goroutine.
+func (b *WireKubeBind) runHeartbeat(udpConn *net.UDPConn, tickOverride <-chan time.Time, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	tick := tickOverride
+	if tick == nil {
+		t := time.NewTicker(time.Duration(heartbeatTickNs))
+		defer t.Stop()
+		tick = t.C
+	}
+	logged := false
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick:
+			if err := b.heartbeatTick(udpConn); err != nil && !logged {
+				// Expected once per generation when a tick races Close.
+				logged = true
+				log.Printf("[bind] heartbeat ping write err=%v (logged once)", err)
+			}
+		}
+	}
+}
+
+// heartbeatTick sends one ping to every peer that qualifies: Mode is Direct
+// or Warm, a usable address exists (stub entries from MarkBimodalHint have
+// Mode 0 and no address and are skipped), and the session is active (Send
+// wrote to the peer within heartbeatSessionActiveNs). Every
+// heartbeatMTUProbeEvery-th tick sends the MTU probe instead of the small
+// ping. Heartbeat frames bypass Send and do not touch lastSendNs. Returns the
+// first write error, for the caller's once-per-generation log.
+func (b *WireKubeBind) heartbeatTick(udpConn *net.UDPConn) error {
+	cfg := b.hbConfig.Load()
+	if cfg == nil {
+		return nil
+	}
+	tickNo := b.hbTicks.Add(1)
+	mtuProbe := tickNo%heartbeatMTUProbeEvery == 0
+	frameLen := heartbeatMinLen
+	if mtuProbe {
+		if l := heartbeatMTUProbeLen(cfg.mtu); l > heartbeatMinLen && l <= 0xFFFF {
+			frameLen = l
+		}
+	}
+	nowNs := b.clockNs()
+	var firstErr error
+	b.pathTable.Range(func(key, value any) bool {
+		pp := value.(*PeerPath)
+		if pp.Mode.Load() == PathModeRelay {
+			return true
+		}
+		k := pp.hbKey.Load()
+		if k == nil {
+			return true
+		}
+		dst := pp.heartbeatAddr(nowNs)
+		if !dst.IsValid() {
+			return true
+		}
+		if last := pp.lastSendNs.Load(); last == 0 || nowNs-last > heartbeatSessionActiveNs {
+			return true
+		}
+
+		lastPong := pp.lastPongNs.Load()
+		smallFresh := lastPong != 0 && nowNs-lastPong <= directTrustWindowNs
+		if pp.expirePendingPings(nowNs, smallFresh) >= heartbeatMTUMissLimit && smallFresh {
+			if !pp.mtuStale.Swap(true) {
+				log.Printf("[bind] heartbeat MTU probes unanswered while small pongs are fresh peer=%s, dual-send until the next MTU pong",
+					shortKey(key.(string)))
+			}
+		}
+
+		var txid [12]byte
+		if _, err := rand.Read(txid[:]); err != nil {
+			return true
+		}
+		ping := encodeHeartbeat(heartbeatFrame{
+			Type:     heartbeatTypePing,
+			FrameLen: uint16(frameLen),
+			TxID:     txid,
+			SentAt:   nowNs,
+			Sender:   cfg.kp.Public,
+		}, k[:])
+		if _, err := udpConn.WriteToUDPAddrPort(ping, dst); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return true
+		}
+		// Only a ping that left the socket is pending. Recording before the
+		// write would let a local send error age out as a missed MTU probe
+		// and latch the veto on a path that was never tested.
+		pp.recordPing(txid, nowNs, uint16(frameLen), mtuProbe)
+		pp.pingsSent.Add(1)
+		return true
+	})
+	return firstErr
 }
 
 // DeliverRelayPacket pushes a packet received from the relay network into the

@@ -1,0 +1,30 @@
+{{- if and .Values.relay.enabled .Values.relay.metrics.enabled .Values.relay.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: wirekube-relay
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
+    {{- include "wirekube.labels" . | nindent 4 }}
+    {{- with .Values.relay.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    # The component label singles out the metrics Service; the relay's
+    # control/LoadBalancer Services share the name label but carry
+    # component=relay and no metrics port.
+    matchLabels:
+      app.kubernetes.io/name: wirekube-relay
+      app.kubernetes.io/component: relay-metrics
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.relay.metrics.serviceMonitor.interval }}
+      path: /metrics
+      scrapeTimeout: {{ .Values.relay.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}

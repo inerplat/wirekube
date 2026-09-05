@@ -58,6 +58,53 @@ var (
 		Help:      "Seconds since the last packet arrived from this peer on the direct UDP socket. The watermark PathMonitor demotes on, exported to make warm flapping diagnosable.",
 	}, []string{"source", "peer"})
 
+	// Heartbeat and send-leg series. The leg counters are what make the
+	// relay's duplicate load measurable from the agent side: dual/(sum) is
+	// the share of packets this node mirrors onto the relay. They are
+	// absolute counters in the Bind, so they are exported as _total gauges
+	// (Set, not Inc) like peerBytesSent above.
+	peerSendPackets = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_send_packets_total",
+		Help:      "Packets this node sent to the peer, by which legs carried them (direct_only, dual, relay_only).",
+	}, []string{"source", "peer", "leg"})
+
+	peerHeartbeatPongs = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_heartbeat_pongs_total",
+		Help:      "Heartbeat pongs matched from this peer on the direct leg.",
+	}, []string{"source", "peer"})
+
+	peerHeartbeatAuthFailures = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_heartbeat_auth_failures_total",
+		Help:      "Heartbeat frames claiming this peer that failed authentication (bad MAC, wrong length).",
+	}, []string{"source", "peer"})
+
+	peerHeartbeatReplayDrops = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_heartbeat_replay_drops_total",
+		Help:      "Heartbeat frames from this peer dropped as stale, unknown or already-consumed. Non-zero on paths with RTT spikes.",
+	}, []string{"source", "peer"})
+
+	peerDirectRTT = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_direct_rtt_seconds",
+		Help:      "Round-trip time of the last heartbeat pong on the direct leg.",
+	}, []string{"source", "peer"})
+
+	peerDirectPongAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_direct_pong_age_seconds",
+		Help:      "Seconds since the last heartbeat pong from this peer. Paired with peer_last_handshake_seconds this finds a path that answers pings while the session behind it is dead.",
+	}, []string{"source", "peer"})
+
+	peerMTUProbeStale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_mtu_probe_stale",
+		Help:      "1 while MTU-sized heartbeat probes go unanswered although small ones are answered, which forces dual-send.",
+	}, []string{"source", "peer"})
+
 	peerEndpointType = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_endpoint_type",
@@ -131,6 +178,13 @@ func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
 		peerICEStateMetric.DeletePartialMatch(labels)
 		peerDirectRxAge.DeletePartialMatch(labels)
 		peerEndpointType.DeletePartialMatch(labels)
+		peerSendPackets.DeletePartialMatch(labels)
+		peerHeartbeatPongs.DeletePartialMatch(labels)
+		peerHeartbeatAuthFailures.DeletePartialMatch(labels)
+		peerHeartbeatReplayDrops.DeletePartialMatch(labels)
+		peerDirectRTT.DeletePartialMatch(labels)
+		peerDirectPongAge.DeletePartialMatch(labels)
+		peerMTUProbeStale.DeletePartialMatch(labels)
 	}
 	a.peerMetricLabels = currentPeers
 }
@@ -219,6 +273,25 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			peerDirectRxAge.WithLabelValues(me, p.Name).Set(time.Since(time.Unix(0, rx)).Seconds())
 		} else {
 			peerDirectRxAge.DeleteLabelValues(me, p.Name)
+		}
+		if st, ok := a.wgMgr.PeerPathStats(p.Spec.PublicKey); ok {
+			peerSendPackets.WithLabelValues(me, p.Name, "direct_only").Set(float64(st.SentDirectOnly))
+			peerSendPackets.WithLabelValues(me, p.Name, "dual").Set(float64(st.SentDual))
+			peerSendPackets.WithLabelValues(me, p.Name, "relay_only").Set(float64(st.SentRelayOnly))
+			peerHeartbeatPongs.WithLabelValues(me, p.Name).Set(float64(st.PongsRecv))
+			peerHeartbeatAuthFailures.WithLabelValues(me, p.Name).Set(float64(st.AuthFail))
+			peerHeartbeatReplayDrops.WithLabelValues(me, p.Name).Set(float64(st.ReplayDrop))
+			peerMTUProbeStale.WithLabelValues(me, p.Name).Set(boolGauge(st.MTUStale))
+			if st.RTTNs > 0 {
+				peerDirectRTT.WithLabelValues(me, p.Name).Set(time.Duration(st.RTTNs).Seconds())
+			}
+			// Same freeze argument as the rx-age gauge above: a stale pong
+			// age reads as a healthy path that simply went quiet.
+			if st.LastPongNs > 0 {
+				peerDirectPongAge.WithLabelValues(me, p.Name).Set(time.Since(time.Unix(0, st.LastPongNs)).Seconds())
+			} else {
+				peerDirectPongAge.DeleteLabelValues(me, p.Name)
+			}
 		}
 		epType := float64(0)
 		if ok && s.endpoint != "" {
@@ -360,4 +433,12 @@ func setSuppressedRouteMetrics(node string, current map[string]string) {
 	for reason, n := range counts {
 		suppressedRoutes.WithLabelValues(node, reason).Set(float64(n))
 	}
+}
+
+// boolGauge renders a flag as the 0/1 a Prometheus gauge expects.
+func boolGauge(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }

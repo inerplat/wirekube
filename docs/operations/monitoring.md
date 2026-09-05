@@ -68,6 +68,7 @@ Key log messages:
 | `relay connected` | Agent initialized a relay pool endpoint |
 | `relay-client: connected to` | A relay TCP client connected and registered |
 | `path monitor: new peer, starting on warm` | New peer entered Warm (both legs) while the direct path is unproven |
+| `path monitor: transition` | Direct/Warm/Relay change, with the age of the evidence that caused it |
 | `upgraded to direct (relay proxy in standby)` | A direct path was proven and promoted |
 | `active probe failed, reverting to relay` | Direct probing failed and relay remained active |
 | `relay-client: reconnect failed` | Relay reconnect is backing off after a failure |
@@ -95,6 +96,27 @@ The agent exposes Prometheus metrics on `:9090/metrics`. The provided Service se
 | `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |
 | `wirekube_direct_peers_total` | Gauge | — | Peers currently using direct P2P |
 | `wirekube_peer_ice_state` | Gauge | source, peer | ICE state (0=relay, 1=gathering, 2=checking, 3=connected, 4=birthday, 5=failed) |
+| `wirekube_peer_send_packets_total` | Gauge | source, peer, leg | Packets sent to the peer by leg (`direct_only`, `dual`, `relay_only`). `dual` over the sum is the share this node mirrors onto the relay |
+| `wirekube_peer_heartbeat_pongs_total` | Gauge | source, peer | Heartbeat pongs matched on the direct leg |
+| `wirekube_peer_heartbeat_auth_failures_total` | Gauge | source, peer | Heartbeat frames claiming this peer that failed authentication |
+| `wirekube_peer_heartbeat_replay_drops_total` | Gauge | source, peer | Heartbeat frames dropped as stale, unknown or already consumed |
+| `wirekube_peer_direct_rtt_seconds` | Gauge | source, peer | Round-trip time of the last heartbeat pong |
+| `wirekube_peer_direct_pong_age_seconds` | Gauge | source, peer | Seconds since the last pong. With `peer_last_handshake_seconds` this finds a path that answers pings while the session behind it is dead |
+| `wirekube_peer_mtu_probe_stale` | Gauge | source, peer | 1 while MTU-sized probes go unanswered though small ones are answered, which forces dual-send |
+
+### Relay Metrics
+
+The relay exposes Prometheus metrics on `:9091/metrics` (`--metrics-addr`, env `WIREKUBE_RELAY_METRICS_ADDR`; empty disables) together with a trivial `/healthz`. The endpoint is published only through the cluster-local `wirekube-relay-metrics` Service (chart: `relay.metrics.*`), never through the relay's LoadBalancer Service: the `dest` label reveals peer key prefixes and traffic shape.
+
+`dest` is the first 8 bytes of the destination's WireGuard public key in hex, the same prefix the relay logs print. It exists only for peers currently registered on that replica; the series are deleted when the peer disconnects, so cardinality follows connected clients. A destination key that a sender merely names is never used as a label. `class` is `ctrl` for WireGuard handshake initiation/response/cookie payloads and relay control frames (bimodal hint, NAT probe, relay probe), `data` for everything else; control frames have their own queue and are written ahead of data.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `wirekube_relay_frames_forwarded_total` | Counter | class, dest | Frames enqueued for delivery to a registered local peer |
+| `wirekube_relay_frames_dropped_total` | Counter | reason, class, dest | Frames not delivered to a registered local peer. `reason` is `queue_tail` (send queue full, newest frame dropped), `gone` (connection already closed), `write_error` (socket write or flush failed; every frame in the failed batch is counted) or `shutdown` (still queued when the connection tore down) |
+| `wirekube_relay_frames_dropped_unknown_dest_total` | Counter | — | Data frames and bimodal hints whose destination key is registered on no replica |
+| `wirekube_relay_clients` | Gauge | — | Peers currently registered on this replica |
+| `wirekube_relay_queue_depth` | Gauge | class, dest | Frames waiting in a peer's send queue, sampled after each enqueue and dequeue (capacity 64 ctrl, 256 data) |
 
 ### Grafana Dashboard
 
