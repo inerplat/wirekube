@@ -48,7 +48,7 @@ func newHBPeer(t *testing.T, clock *fakeClock, withRelay bool) *hbPeer {
 		p.relay = &mockRelayTransport{connected: true}
 		p.b.SetRelayTransport(p.relay)
 	}
-	p.b.SetHeartbeatConfig(p.kp, 1420)
+	p.b.SetHeartbeatConfig(p.kp, testMeshMTU)
 	fns, port, err := p.b.Open(0)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -219,6 +219,10 @@ func TestHeartbeatRoundTripSetsPongNotLastSeen(t *testing.T) {
 
 // Every malformed or unauthenticated inbound frame is dropped with the right
 // counter and without a pong, and still never reaches wireguard-go.
+// testMeshMTU is the mesh MTU every test peer is configured with, so a test
+// can compute the probe and slack sizes the same way the code does.
+const testMeshMTU = 1420
+
 func TestHeartbeatDropsBadFrames(t *testing.T) {
 	clock := newFakeClock()
 	b := newHBPeer(t, clock, false)
@@ -259,7 +263,11 @@ func TestHeartbeatDropsBadFrames(t *testing.T) {
 		{"bad MAC", badMAC, 1, 0},
 		{"unsupported version", wrongVersion, 1, 0},
 		{"unknown type", unknownType, 1, 0},
-		{"ping size not allowed", valid(100, clock.Now()), 1, 0},
+		// Past the slack this node allows above its own MTU probe. Sizes
+		// between the two the scheduler emits are accepted on purpose, so a
+		// peer mid-MTU-change is not read as a forger; see the accepted case
+		// asserted after this table.
+		{"ping size past the allowed range", valid(uint16(heartbeatMTUProbeLen(testMeshMTU)+heartbeatSizeSlack+1), clock.Now()), 1, 0},
 		{"sent_at too old", valid(92, clock.Before(61*time.Second)), 0, 1},
 		{"sent_at too far ahead", valid(92, clock.At(61*time.Second)), 0, 1},
 		{"unknown sender", unknownSender, 0, 0},
@@ -281,6 +289,25 @@ func TestHeartbeatDropsBadFrames(t *testing.T) {
 			}
 		})
 	}
+
+	// A peer whose mesh MTU differs from ours probes at a size we never emit.
+	// Reflecting it is deliberate: rejecting it would turn an MTU change into
+	// authentication failures on one side and a latched dual-send veto on the
+	// other, for the length of a rolling restart.
+	t.Run("size between the emitted sizes is answered", func(t *testing.T) {
+		const odd = 1400
+		before := stats(t, b, a.PublicKeyBase64())
+		cap.send(t, valid(odd, clock.Now()), b.addr)
+		b.recvHeartbeat(t)
+		after := stats(t, b, a.PublicKeyBase64())
+		if after.AuthFail != before.AuthFail {
+			t.Errorf("authFail delta = %d, want 0 for a peer with a different MTU", after.AuthFail-before.AuthFail)
+		}
+		pong := cap.read(t, time.Second)
+		if len(pong) != odd {
+			t.Fatalf("pong of %d bytes, want %d (the ping's own length, so the reflection ratio stays 1.0)", len(pong), odd)
+		}
+	})
 }
 
 // A pong mirrors the ping's frame_len exactly (reflection ratio 1.0), for
