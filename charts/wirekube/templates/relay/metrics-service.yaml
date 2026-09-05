@@ -1,0 +1,24 @@
+{{- if and .Values.relay.enabled .Values.relay.metrics.enabled }}
+# Cluster-local scrape endpoint for the relay's Prometheus metrics. Separate
+# from the relay's public Services on purpose: the per-destination labels
+# reveal peer key prefixes and traffic shape, so this port is never added to
+# the LoadBalancer/NodePort Service in services.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wirekube-relay-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: relay-metrics
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "wirekube.relay.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.relay.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

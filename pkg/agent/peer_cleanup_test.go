@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,7 @@ import (
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
 func cleanupTestScheme(t *testing.T) *runtime.Scheme {
@@ -203,8 +205,19 @@ func TestDropStaleMetricLabelsRemovesVanished(t *testing.T) {
 	peerTransport.WithLabelValues("me", "gone").Set(2)
 	peerTransport.WithLabelValues("me", "alive").Set(1)
 
+	// peerSendPackets carries a third label, so it also proves the cleanup
+	// matches on "peer" alone rather than on a full label set.
+	peerSendPackets.Reset()
+	for _, leg := range []string{"direct_only", "dual", "relay_only"} {
+		peerSendPackets.WithLabelValues("me", "gone", leg).Set(1)
+		peerSendPackets.WithLabelValues("me", "alive", leg).Set(1)
+	}
+
 	if before := testutil.CollectAndCount(peerTransport); before != 2 {
 		t.Fatalf("setup: peerTransport count = %d, want 2", before)
+	}
+	if before := testutil.CollectAndCount(peerSendPackets); before != 6 {
+		t.Fatalf("setup: peerSendPackets count = %d, want 6", before)
 	}
 
 	a := &Agent{
@@ -215,6 +228,9 @@ func TestDropStaleMetricLabelsRemovesVanished(t *testing.T) {
 
 	if after := testutil.CollectAndCount(peerTransport); after != 1 {
 		t.Fatalf("peerTransport count after cleanup = %d, want 1", after)
+	}
+	if after := testutil.CollectAndCount(peerSendPackets); after != 3 {
+		t.Fatalf("peerSendPackets count after cleanup = %d, want 3 (the live peer's legs)", after)
 	}
 	if _, tracked := a.peerMetricLabels["gone"]; tracked {
 		t.Fatal("peerMetricLabels still contains vanished peer")
@@ -297,5 +313,57 @@ func TestUpsertOwnPeerPatchBackfillsOwnerReference(t *testing.T) {
 	}
 	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].UID != types.UID("node-uid-1") {
 		t.Fatalf("OwnerReferences not backfilled: %+v", got.OwnerReferences)
+	}
+}
+
+// The Bind's per-peer send-leg and heartbeat counters must actually reach
+// /metrics: dual/(sum) is how the relay's duplicate load is measured from the
+// agent side, and the MTU-probe veto is otherwise invisible.
+func TestUpdateMetricsExportsPathStats(t *testing.T) {
+	peerSendPackets.Reset()
+	peerHeartbeatPongs.Reset()
+	peerMTUProbeStale.Reset()
+	peerDirectRTT.Reset()
+
+	const key = "p1-key"
+	fake := &fakeWGEngine{
+		lastDirect: map[string]int64{},
+		lastPong:   map[string]int64{},
+		pathStats: map[string]wireguard.PathStats{key: {
+			SentDirectOnly: 700,
+			SentDual:       300,
+			SentRelayOnly:  0,
+			PongsRecv:      42,
+			RTTNs:          int64(3 * time.Millisecond),
+			MTUStale:       true,
+		}},
+	}
+	a := &Agent{
+		nodeName:         "self",
+		wgMgr:            fake,
+		log:              logr.Discard(),
+		peerMetricLabels: map[string]struct{}{},
+	}
+	peer := wirekubev1alpha1.WireKubePeer{}
+	peer.Name = "p1"
+	peer.Spec.PublicKey = key
+	list := &wirekubev1alpha1.WireKubePeerList{Items: []wirekubev1alpha1.WireKubePeer{peer}}
+
+	a.updateMetrics(context.Background(), list)
+
+	if got := testutil.ToFloat64(peerSendPackets.WithLabelValues("self", "p1", "dual")); got != 300 {
+		t.Errorf("send_packets{dual} = %v, want 300", got)
+	}
+	if got := testutil.ToFloat64(peerSendPackets.WithLabelValues("self", "p1", "direct_only")); got != 700 {
+		t.Errorf("send_packets{direct_only} = %v, want 700", got)
+	}
+	if got := testutil.ToFloat64(peerHeartbeatPongs.WithLabelValues("self", "p1")); got != 42 {
+		t.Errorf("heartbeat_pongs = %v, want 42", got)
+	}
+	if got := testutil.ToFloat64(peerMTUProbeStale.WithLabelValues("self", "p1")); got != 1 {
+		t.Errorf("mtu_probe_stale = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(peerDirectRTT.WithLabelValues("self", "p1")); got != 0.003 {
+		t.Errorf("direct_rtt_seconds = %v, want 0.003", got)
 	}
 }

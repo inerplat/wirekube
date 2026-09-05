@@ -120,6 +120,22 @@ relay:
       cpu: 500m
       memory: 128Mi
 
+  metrics:
+    # ClusterIP Service exposing the relay's :9091/metrics endpoint. Kept
+    # off the public relay Service on purpose: per-destination labels reveal
+    # peer key prefixes and traffic shape. Disabling also turns the endpoint
+    # off in the binary (WIREKUBE_RELAY_METRICS_ADDR="").
+    enabled: true
+    port: 9091
+    serviceMonitor:
+      # Requires the Prometheus Operator CRDs.
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      # Extra labels so your Prometheus instance selects this monitor,
+      # e.g. release: prometheus
+      labels: {}
+
   adminWeb:
     # External-peer management console sidecar. Binds to loopback only and is
     # reachable via `kubectl port-forward`; it is NOT exposed by any Service.

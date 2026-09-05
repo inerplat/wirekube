@@ -83,38 +83,147 @@ type Server struct {
 	destMissLog *suppressedLogger
 }
 
-// sendQueueDepth bounds how many frames may be waiting for one destination.
-// Frames are WireGuard packets, which the transport layer above already
-// treats as lossy, so overflow drops the newest frame rather than stalling
-// the sender. The depth only needs to cover a short scheduling hiccup; a
-// destination that stays behind for longer is genuinely broken and dropping
-// is the correct answer.
+// sendQueueDepth bounds how many data frames may be waiting for one
+// destination. Frames are WireGuard packets, which the transport layer above
+// already treats as lossy, so overflow drops the newest frame rather than
+// stalling the sender. The depth only needs to cover a short scheduling
+// hiccup; a destination that stays behind for longer is genuinely broken and
+// dropping is the correct answer.
 const sendQueueDepth = 256
+
+// ctrlQueueDepth bounds the separate control queue. Control frames are rare
+// (handshakes, hints, probes) but each one gates the peer's ability to move
+// traffic at all, so they must not wait behind a data backlog that is mostly
+// duplicates the receiver would discard anyway. Same tail-drop policy: a
+// destination whose control queue overflows is not draining at all.
+const ctrlQueueDepth = 64
 
 // dropLogInterval rate-limits the overflow warning. Without it a single
 // wedged destination would reproduce the log flood this queue exists to
 // prevent.
 const dropLogInterval = 10 * time.Second
 
+// frameClass decides which of a destination's two queues a frame joins.
+type frameClass uint8
+
+const (
+	classData frameClass = iota
+	classCtrl
+	frameClassCount
+)
+
+func (c frameClass) String() string {
+	if c == classCtrl {
+		return "ctrl"
+	}
+	return "data"
+}
+
+// WireGuard message types occupy the first byte of every packet (the type is
+// a little-endian uint32 with values 1..4). Handshake initiation, response
+// and cookie reply are control; transport data is everything a queue can
+// afford to lose.
+const (
+	wgMessageInitiation byte = 1
+	wgMessageResponse   byte = 2
+	wgMessageCookie     byte = 3
+
+	// Fixed sizes of the three handshake messages, from wireguard-go's
+	// device/noise-protocol.go (MessageInitiationSize, MessageResponseSize,
+	// MessageCookieReplySize). A handshake is never any other length, so the
+	// length is part of recognising one.
+	wgInitiationLen  = 148
+	wgResponseLen    = 92
+	wgCookieReplyLen = 64
+)
+
+// classify is the single point that decides a frame's queue. writeFrame calls
+// it, so every enqueue path is covered without each call site knowing about
+// the split. Relay control messages are control by type; Data and
+// ExternalData are control only when the WireGuard payload they carry is a
+// handshake message. Anything malformed or empty is data: the split exists to
+// protect control frames, not to reject traffic.
+func classify(frame Frame) frameClass {
+	switch frame.Type {
+	case MsgBimodalHint, MsgNATProbe, MsgRelayProbe:
+		// MsgNATProbe never reaches a queue in practice (the relay answers
+		// NAT probes over UDP), but the class belongs with the other control
+		// types rather than as a gap a future caller has to notice.
+		return classCtrl
+	case MsgData:
+		if len(frame.Body) > PubKeySize {
+			return classifyWGPayload(frame.Body[PubKeySize:])
+		}
+	case MsgExternalData:
+		if _, _, payload, err := ParseExternalDataFrame(frame.Body); err == nil {
+			return classifyWGPayload(payload)
+		}
+	}
+	return classData
+}
+
+// classifyWGPayload recognises a WireGuard handshake message. The class is a
+// scheduling decision made from bytes a remote peer chose, and relay
+// registration is unauthenticated, so the check is as narrow as the wire
+// format allows: the message type is a 4-byte little-endian field (the upper
+// three bytes are always zero), and each handshake type has one fixed length.
+// A transport data frame (type 4) or anything malformed is data. This does not
+// make the class unforgeable, which is why the writer also bounds how many
+// control frames may run back to back.
+func classifyWGPayload(payload []byte) frameClass {
+	if len(payload) < 4 || payload[1]|payload[2]|payload[3] != 0 {
+		return classData
+	}
+	switch payload[0] {
+	case wgMessageInitiation:
+		if len(payload) == wgInitiationLen {
+			return classCtrl
+		}
+	case wgMessageResponse:
+		if len(payload) == wgResponseLen {
+			return classCtrl
+		}
+	case wgMessageCookie:
+		if len(payload) == wgCookieReplyLen {
+			return classCtrl
+		}
+	}
+	return classData
+}
+
 type clientConn struct {
 	pubKey [PubKeySize]byte
 	conn   net.Conn
 	writer *bufio.Writer
 
-	// sendQ decouples "a peer wants to send to this destination" from "this
-	// destination's socket accepts bytes". Before it existed, writeFrame ran
-	// synchronously inside the *sending* peer's read loop while holding this
-	// connection's write mutex, so one slow destination blocked every peer
-	// trying to reach it, and those peers then could not forward to any
-	// other destination either. A single stalled socket froze the whole
-	// relay for as long as the write deadline allowed.
-	sendQ     chan Frame
+	// The queues decouple "a peer wants to send to this destination" from
+	// "this destination's socket accepts bytes". Before they existed,
+	// writeFrame ran synchronously inside the *sending* peer's read loop
+	// while holding this connection's write mutex, so one slow destination
+	// blocked every peer trying to reach it, and those peers then could not
+	// forward to any other destination either. A single stalled socket froze
+	// the whole relay for as long as the write deadline allowed.
+	//
+	// ctrlQ is drained before dataQ. A destination that cannot keep up with
+	// mirrored data traffic used to lose its handshakes and probes in the
+	// same tail drop, which turned a congested link into a dead session.
+	ctrlQ     chan Frame
+	dataQ     chan Frame
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// ctrlStreak counts control frames written back to back. Owned by the
+	// writer goroutine alone, so it needs no synchronisation.
+	ctrlStreak int
 
 	dropped     atomic.Uint64
 	dropLogMu   sync.Mutex
 	lastDropLog time.Time
+
+	// metrics is set under Server.mu when the peer registers and stays nil
+	// for connections that never register (tests, one-shot control
+	// sessions). The per-frame path tolerates nil.
+	metrics *connMetrics
 
 	probeMu sync.Mutex
 	probes  map[uint64]chan struct{}
@@ -127,9 +236,17 @@ func newClientConn(pubKey [PubKeySize]byte, conn net.Conn) *clientConn {
 		pubKey: pubKey,
 		conn:   conn,
 		writer: bufio.NewWriterSize(conn, 64*1024),
-		sendQ:  make(chan Frame, sendQueueDepth),
+		ctrlQ:  make(chan Frame, ctrlQueueDepth),
+		dataQ:  make(chan Frame, sendQueueDepth),
 		done:   make(chan struct{}),
 	}
+}
+
+func (c *clientConn) queueFor(class frameClass) chan Frame {
+	if class == classCtrl {
+		return c.ctrlQ
+	}
+	return c.dataQ
 }
 
 // writeFrame hands a frame to this connection's writer goroutine. It never
@@ -138,23 +255,38 @@ func newClientConn(pubKey [PubKeySize]byte, conn net.Conn) *clientConn {
 // blocking this design removes. A closed connection is still an error so
 // callers can drop the peer.
 func (c *clientConn) writeFrame(frame Frame) error {
+	class := classify(frame)
+
 	select {
 	case <-c.done:
+		c.countDrop(class, dropGone)
 		return net.ErrClosed
 	default:
 	}
 
+	q := c.queueFor(class)
 	select {
-	case c.sendQ <- frame:
+	case q <- frame:
+		if m := c.metrics; m != nil {
+			m.forwarded[class].Inc()
+			m.depth[class].Set(float64(len(q)))
+		}
 		return nil
 	default:
-		c.noteDrop()
+		c.noteDrop(class)
 		return nil
 	}
 }
 
-func (c *clientConn) noteDrop() {
+func (c *clientConn) countDrop(class frameClass, reason dropReason) {
+	if m := c.metrics; m != nil {
+		m.dropped[class][reason].Inc()
+	}
+}
+
+func (c *clientConn) noteDrop(class frameClass) {
 	total := c.dropped.Add(1)
+	c.countDrop(class, dropQueueTail)
 
 	c.dropLogMu.Lock()
 	defer c.dropLogMu.Unlock()
@@ -163,22 +295,92 @@ func (c *clientConn) noteDrop() {
 		return
 	}
 	c.lastDropLog = now
-	log.Printf("relay: send queue full for %x, dropping frames (total dropped %d)", c.pubKey[:8], total)
+	log.Printf("relay: send queue full for %x, dropping frames (total dropped %d, class %s)", c.pubKey[:8], total, class)
 }
 
 // writeLoop is the only goroutine that touches the socket's write side, so
 // the per-connection write mutex is gone along with the contention it caused.
+// Control frames are taken first whenever one is waiting; data is only
+// considered when the control queue is empty.
 func (c *clientConn) writeLoop() {
 	defer c.close()
 	for {
 		select {
 		case <-c.done:
 			return
-		case frame := <-c.sendQ:
-			if err := c.writeBatch(frame); err != nil {
+		default:
+		}
+		if frame, class, ok := c.nextQueued(); ok {
+			if err := c.writeBatch(frame, class); err != nil {
+				return
+			}
+			continue
+		}
+		// Both queues are empty, so there is nothing to prioritise between.
+		select {
+		case <-c.done:
+			return
+		case frame := <-c.ctrlQ:
+			c.noteDequeued(classCtrl)
+			if err := c.writeBatch(frame, classCtrl); err != nil {
+				return
+			}
+		case frame := <-c.dataQ:
+			c.noteDequeued(classData)
+			if err := c.writeBatch(frame, classData); err != nil {
 				return
 			}
 		}
+	}
+}
+
+// maxCtrlStreak bounds how many control frames the writer may send back to
+// back before it forces one data frame through. Control still wins every
+// honest burst, which is a handful of handshake retries and never approaches
+// this many. The bound exists because the class is decided from bytes a
+// remote peer chose and relay registration is unauthenticated: with strict
+// priority, one peer sending frames shaped like handshakes faster than a
+// destination drains would hold that destination's data throughput at exactly
+// zero while its handshakes kept flowing, which looks healthy from both ends.
+const maxCtrlStreak = 8
+
+// nextQueued pops the next frame to write without blocking: control before
+// data, except when control has already had maxCtrlStreak frames in a row and
+// data is waiting.
+func (c *clientConn) nextQueued() (Frame, frameClass, bool) {
+	if c.ctrlStreak < maxCtrlStreak {
+		select {
+		case frame := <-c.ctrlQ:
+			c.ctrlStreak++
+			c.noteDequeued(classCtrl)
+			return frame, classCtrl, true
+		default:
+		}
+	}
+	select {
+	case frame := <-c.dataQ:
+		c.ctrlStreak = 0
+		c.noteDequeued(classData)
+		return frame, classData, true
+	default:
+	}
+	// No data to be fair to, so a held-back control frame goes now.
+	select {
+	case frame := <-c.ctrlQ:
+		c.ctrlStreak++
+		c.noteDequeued(classCtrl)
+		return frame, classCtrl, true
+	default:
+	}
+	return Frame{}, classData, false
+}
+
+// noteDequeued resamples the depth gauge as the queue drains. Sampling only on
+// enqueue leaves a peer that took one burst and went idle reporting that
+// burst's depth forever, which is the reading an operator would alert on.
+func (c *clientConn) noteDequeued(class frameClass) {
+	if m := c.metrics; m != nil {
+		m.depth[class].Set(float64(len(c.queueFor(class))))
 	}
 }
 
@@ -186,47 +388,126 @@ func (c *clientConn) writeLoop() {
 // flushes once. Coalescing matters here: warm-bimodal peers deliver frames in
 // bursts, and one flush per burst keeps the syscall count off the critical
 // path.
-func (c *clientConn) writeBatch(first Frame) error {
+func (c *clientConn) writeBatch(first Frame, firstClass frameClass) error {
+	// Frames sit in the bufio buffer until Flush, so a dead socket usually
+	// surfaces there (or already at SetWriteDeadline) rather than at the
+	// write that filled the buffer. Every frame handed to the writer in this
+	// batch is charged to write_error when any step fails; the batch is
+	// bounded, so the overcount when bufio flushed part of it on its own is
+	// bounded too.
+	var buffered [frameClassCount]uint64
+	failBatch := func(err error) error {
+		for class, n := range buffered {
+			for ; n > 0; n-- {
+				c.countDrop(frameClass(class), dropWriteError)
+			}
+		}
+		return err
+	}
+	buffered[firstClass]++
+
 	if relayClientWriteTimeout > 0 {
 		if err := c.conn.SetWriteDeadline(time.Now().Add(relayClientWriteTimeout)); err != nil {
-			return err
+			return failBatch(err)
 		}
 		defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	}
 
 	if err := WriteFrame(c.writer, first); err != nil {
-		return err
+		return failBatch(err)
 	}
-	// Bounded so the deadline above stays meaningful: producers can refill
-	// sendQ while we drain it, and an unbounded loop would let one batch run
-	// arbitrarily long under a single deadline.
-	for i := 1; i < sendQueueDepth; i++ {
-		select {
-		case next := <-c.sendQ:
-			if err := WriteFrame(c.writer, next); err != nil {
-				return err
-			}
-		default:
-			return c.writer.Flush()
+	// Bounded by the combined queue capacity so the deadline above stays
+	// meaningful: producers can refill the queues while we drain them, and an
+	// unbounded loop would let one batch run arbitrarily long under a single
+	// deadline.
+	for i := 1; i < ctrlQueueDepth+sendQueueDepth; i++ {
+		next, class, ok := c.nextQueued()
+		if !ok {
+			break
+		}
+		buffered[class]++
+		if err := WriteFrame(c.writer, next); err != nil {
+			return failBatch(err)
 		}
 	}
-	return c.writer.Flush()
+	if err := c.writer.Flush(); err != nil {
+		return failBatch(err)
+	}
+	return nil
 }
 
 func (c *clientConn) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
+		// Whatever the writer had not reached is gone with the socket.
+		// Counting it keeps the dropped total an accurate answer to "frames
+		// this relay accepted and did not deliver"; producers that enqueue
+		// after this point still race the writer and are charged when their
+		// own send sees the closed connection.
+		c.drainQueues()
 	})
+}
+
+// drainQueues empties both queues and charges the remainder to shutdown. Safe
+// to run concurrently with a producer's enqueue: a frame that lands after the
+// drain sits in a buffered channel nobody reads, and the channel is garbage
+// once the connection is dropped.
+func (c *clientConn) drainQueues() {
+	for _, class := range []frameClass{classCtrl, classData} {
+		q := c.queueFor(class)
+		for {
+			select {
+			case <-q:
+				c.countDrop(class, dropShutdown)
+			default:
+				c.noteDequeued(class)
+				goto next
+			}
+		}
+	next:
+	}
 }
 
 func (s *Server) dropPeer(c *clientConn) {
 	c.close()
+	s.unregister(c)
+}
+
+// register makes cc the connection for its key and returns the connection it
+// replaced, if any. The metric children are created under the same lock that
+// unregister deletes them under, so a reconnect cannot lose its series to the
+// old connection's teardown.
+func (s *Server) register(cc *clientConn) (old *clientConn, replaced bool) {
 	s.mu.Lock()
-	if s.peers[c.pubKey] == c {
-		delete(s.peers, c.pubKey)
+	defer s.mu.Unlock()
+	old, replaced = s.peers[cc.pubKey]
+	s.peers[cc.pubKey] = cc
+	cc.metrics = newConnMetrics(destLabel(cc.pubKey))
+	// Delta rather than Set(len(s.peers)): the gauge is process-global while
+	// the count is one Server's, so setting it makes two Servers in one
+	// process (the test binary) overwrite each other. A reconnect that
+	// replaces a live connection leaves the peer count unchanged.
+	if !replaced {
+		relayClients.Inc()
 	}
-	s.mu.Unlock()
+	return old, replaced
+}
+
+// unregister removes c from the peer table if it is still the registered
+// connection for its key, and reports whether it was. A connection that was
+// already replaced by a reconnect leaves the table, the registry entry and
+// the metrics of the new connection alone.
+func (s *Server) unregister(c *clientConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peers[c.pubKey] != c {
+		return false
+	}
+	delete(s.peers, c.pubKey)
+	deleteDestMetrics(destLabel(c.pubKey))
+	relayClients.Dec()
+	return true
 }
 
 func NewServer() *Server {
@@ -447,12 +728,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	copy(pubKey[:], frame.Body)
 
 	cc := newClientConn(pubKey, conn)
+	old, exists := s.register(cc)
 	go cc.writeLoop()
-
-	s.mu.Lock()
-	old, exists := s.peers[pubKey]
-	s.peers[pubKey] = cc
-	s.mu.Unlock()
 
 	if exists {
 		old.close()
@@ -465,14 +742,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer func() {
 		// Stop the writer goroutine too: the read loop exiting is what tells
 		// us this peer is gone, and without this the goroutine would sit on
-		// sendQ until the next write error.
+		// the queues until the next write error.
 		cc.close()
-		s.mu.Lock()
-		stillOwner := s.peers[pubKey] == cc
-		if stillOwner {
-			delete(s.peers, pubKey)
-		}
-		s.mu.Unlock()
+		stillOwner := s.unregister(cc)
 		// Withdraw only when this connection was still the registered one:
 		// if a reconnect already replaced it, the peer is still local and
 		// the registry entry must survive.
@@ -523,6 +795,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				if s.cluster != nil && s.cluster.ForwardToPeer(destKey, MakeDataFrame(pubKey, payload)) {
 					continue
 				}
+				relayFramesDroppedUnknownDest.Inc()
 				s.destMissLog.Logf("relay: data from %x to %x: dest not found", pubKey[:8], destKey[:8])
 				continue
 			}
@@ -591,9 +864,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				// Hints matter for convergence speed, so chase the peer to
 				// its owning replica like data frames do. A miss is fine:
 				// the sender's FSM falls back on its slower demote path.
-				if s.cluster != nil {
-					_ = s.cluster.ForwardToPeer(destKey, outFrame)
+				if s.cluster != nil && s.cluster.ForwardToPeer(destKey, outFrame) {
+					continue
 				}
+				relayFramesDroppedUnknownDest.Inc()
 				continue
 			}
 			if err := dest.writeFrame(outFrame); err != nil {

@@ -11,7 +11,7 @@ type PathMode int
 
 const (
 	PathDirect PathMode = iota // Send via direct UDP only
-	PathWarm                   // Send via BOTH direct UDP and relay (Tailscale-style duplicate send)
+	PathWarm                   // Direct UDP, plus relay while the direct path is unproven
 	PathRelay                  // Send via relay TCP only
 )
 
@@ -71,6 +71,17 @@ type WGEngine interface {
 	// packet received from a peer. Returns 0 if no relay packet has been
 	// received. Used for observability and relay health verification.
 	LastRelayReceive(pubKey string) int64
+
+	// LastDirectPong returns the unix nano timestamp of the last heartbeat
+	// pong from a peer: proof that a frame made a UDP round trip to the probed
+	// direct address, but not that the peer's WireGuard session is alive.
+	// Returns 0 if none has arrived. Kept separate from LastDirectReceive so
+	// callers apply their own liveness gate.
+	LastDirectPong(pubKey string) int64
+
+	// PeerPathStats returns the Bind's per-peer send-leg and heartbeat
+	// accounting, and false if the peer has no path entry.
+	PeerPathStats(pubKey string) (PathStats, bool)
 
 	// MarkBimodalHint arms the dual-send window for a peer in the Bind. The
 	// relay pool calls this when a remote peer relays a BimodalHint frame
