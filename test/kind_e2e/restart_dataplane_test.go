@@ -9,6 +9,7 @@ package kind_e2e
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -419,6 +420,40 @@ func TestRestartWithBlackholedRelayStallsTheDataPath(t *testing.T) {
 	subjectIP := nodeIPForPeer(t, subject)
 	pinger := agentPodForNode(ctx, t, remote)
 
+	// Does the probe actually traverse the tunnel? Every measurement here is
+	// meaningless if it does not, and this has been assumed rather than checked
+	// through three rounds of failed reproduction.
+	if out, err := ctrExec("exec", remote, "ip", "route", "get", subjectIP); err != nil {
+		t.Logf("route get %s from %s: %v", subjectIP, remote, err)
+	} else {
+		t.Logf("probe target %s, route from %s: %s", subjectIP, remote, strings.TrimSpace(out))
+	}
+
+	// Sample the restarting node's tunnel device from the node container, which
+	// outlives the agent pod, so the device state during the outage window is
+	// visible rather than inferred.
+	stopSampling := make(chan struct{})
+	sampled := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		for {
+			select {
+			case <-stopSampling:
+				sampled <- b.String()
+				return
+			default:
+			}
+			out, err := ctrExec("exec", subject, "sh", "-c",
+				"date -u +%H:%M:%S; ip -o link show wire_kube 2>&1 | head -1")
+			if err != nil {
+				fmt.Fprintf(&b, "  link sample error: %v\n", err)
+			} else {
+				fmt.Fprintf(&b, "  %s\n", strings.ReplaceAll(strings.TrimSpace(out), "\n", " | "))
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+
 	type pingResult struct {
 		out string
 		err error
@@ -439,6 +474,8 @@ func TestRestartWithBlackholedRelayStallsTheDataPath(t *testing.T) {
 	restartAgentOnNode(ctx, t, subject)
 
 	result := <-pingDone
+	close(stopSampling)
+	t.Logf("wire_kube on %s across the restart:\n%s", subject, <-sampled)
 	if result.err != nil {
 		t.Logf("ping returned an error (expected when loss is high): %v", result.err)
 	}
