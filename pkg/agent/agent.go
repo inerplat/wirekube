@@ -2013,12 +2013,32 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 		a.wgMgr.MarkBimodalHint(srcKey)
 	})
 
-	if err := a.relayPool.Connect(ctx); err != nil {
-		a.log.Error(err, "relay initial connect failed, will retry in background", "endpoint", endpoint)
-		return nil
-	}
-
-	a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
+	// Dial the relay off the startup path.
+	//
+	// setup() runs before the agent's first sync, and the first sync is what
+	// pushes transport paths into the Bind. Blocking here leaves the Bind with
+	// no path for any peer until the dial finishes, so the node can receive
+	// but cannot send. Measured on a ten-node cluster by restarting one agent
+	// under continuous ping:
+	//
+	//	relay address does not answer   10.5s of outbound loss
+	//	relay answers immediately        0.5s
+	//
+	// A tcpdump on the stalled node recorded 15801 inbound packets with no gap
+	// and a single 10.9s gap outbound, ending the moment the first SetPeerPath
+	// ran. Moving the dial into the background took the same node to 1.0s,
+	// which is the process swap alone.
+	//
+	// Nothing below needs the connection established. SetRelayTransport has
+	// already handed the pool to the Bind, the pool reconnects on its own, and
+	// the error path here always said so.
+	go func() {
+		if err := a.relayPool.Connect(ctx); err != nil {
+			a.log.Error(err, "relay initial connect failed, will retry in background", "endpoint", endpoint)
+			return
+		}
+		a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
+	}()
 	return nil
 }
 
