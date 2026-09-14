@@ -287,14 +287,8 @@ jobs:
 
       - name: Run restart data-path e2e
         run: |
-          # Keep the inter-VPC masquerade in place. The default setup strips
-          # it to give peers unmangled addresses, which also removes the NAT
-          # the production nodes sit behind. Without NAT a restarting node
-          # receives inbound traffic immediately, so an outage that depends on
-          # re-punching a mapping cannot appear here at all.
           WIREKUBE_IMAGE=inerplat/wirekube:ci-${{ github.sha }} \
           WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
           WIREKUBE_E2E_RELAY_TRANSPORT=tcp \
-          WIREKUBE_E2E_SKIP_VPC_ISOLATION=1 \
           go test -tags "kind_e2e kind_e2e_restart" -v ./test/kind_e2e/... \
             -run 'TestRestart' -timeout 20m
