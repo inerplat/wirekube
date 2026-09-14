@@ -1,4 +1,9 @@
-//go:build kind_e2e
+//go:build kind_e2e && kind_e2e_restart
+
+// These cases carry a second build tag so the existing e2e job does not grow by
+// the eight minutes they take. The regular matrix already runs close to its
+// twenty-minute budget. A dedicated job selects them with
+// -tags kind_e2e,kind_e2e_restart.
 
 package kind_e2e
 

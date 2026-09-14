@@ -242,3 +242,53 @@ jobs:
           WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
           WIREKUBE_E2E_RELAY_TRANSPORT=${{ matrix.relay-transport }} \
           go test -tags kind_e2e -v ./test/kind_e2e/... -timeout 20m
+
+
+  e2e-restart:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cni-mode:
+          - cilium-kube-proxy
+          - flannel
+    name: e2e restart (${{ matrix.cni-mode }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Install helm
+        if: matrix.cni-mode == 'cilium-kube-proxy'
+        run: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Pull kindest/node image
+        run: docker pull kindest/node:v1.34.0
+
+      - name: Download wirekube image
+        uses: actions/download-artifact@v8
+        with:
+          name: wirekube-image
+          path: /tmp
+
+      - name: Load wirekube image
+        run: docker load -i /tmp/wirekube-ci.tar
+
+      - name: Run restart data-path e2e
+        run: |
+          WIREKUBE_IMAGE=inerplat/wirekube:ci-${{ github.sha }} \
+          WIREKUBE_E2E_CNI_MODE=${{ matrix.cni-mode }} \
+          WIREKUBE_E2E_RELAY_TRANSPORT=tcp \
+          go test -tags "kind_e2e kind_e2e_restart" -v ./test/kind_e2e/... \
+            -run 'TestRestart' -timeout 20m
