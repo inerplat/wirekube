@@ -324,3 +324,75 @@ func TestRestartLosingRelayDuringDemotionBlackholes(t *testing.T) {
 			"was down for %d consecutive probes (max %d)", demotions, gap, maxSeqGap)
 	}
 }
+
+// An agent restart must not hold the data path hostage to a relay dial that
+// will never answer.
+//
+// Measured on the incident cluster by restarting one node under continuous
+// ping. Both the mesh address and a pod address on that node lost the same
+// 22 consecutive probes at 0.5 s spacing, an 11.0 s outage starting the moment
+// the pod was deleted. The agent log accounts for it exactly:
+//
+//	07:18:36  container starts, initRelay entered
+//	          (ten seconds, no log output)
+//	07:18:46  relay initial connect failed: dial tcp ...:3478: i/o timeout
+//	07:18:46  first sync runs, tunnel comes back
+//
+// Pool.Connect is called synchronously from setup before Run reaches its first
+// sync, and dialTimeout is ten seconds. When the relay address does not answer,
+// the agent spends all of it before configuring a single WireGuard peer. The
+// error it then logs says "will retry in background", which is where the dial
+// belonged from the start.
+//
+// The contrast with TestRestartWithoutRelayKeepsDataPath is the evidence.
+// There the relay is scaled to zero, connect() is refused instantly, and the
+// gap is zero. Here the same restart with the same relay outage costs the full
+// timeout, because the address is dropped rather than refused.
+func TestRestartWithBlackholedRelayStallsTheDataPath(t *testing.T) {
+	ctx := context.Background()
+
+	peers := resetTransportState(ctx, t)
+	subject := peers[0]
+	remote := peers[1]
+	waitForDirectWithTraffic(ctx, t, subject, remote)
+
+	subjectIP := nodeIPForPeer(t, subject)
+	pinger := agentPodForNode(ctx, t, remote)
+
+	type pingResult struct {
+		out string
+		err error
+	}
+	pingDone := make(chan pingResult, 1)
+	go func() {
+		out, err := execInPod(ctx, t, pinger, "agent",
+			[]string{"ping", "-i", "0.5", "-c", "180", "-W", "2", subjectIP})
+		pingDone <- pingResult{out, err}
+	}()
+	time.Sleep(4 * time.Second)
+
+	// In place before the restart, so the agent that comes back finds the
+	// relay address unreachable during its own startup.
+	restoreRelay := blackholeRelayTCP(t, subject)
+	defer restoreRelay()
+
+	restartAgentOnNode(ctx, t, subject)
+
+	result := <-pingDone
+	if result.err != nil {
+		t.Logf("ping returned an error (expected when loss is high): %v", result.err)
+	}
+	gap := longestPingSeqGap(result.out)
+
+	// At 2 pps the suite's bimodal warm-send bound is 8 probes. A full
+	// dialTimeout is 20 on top of whatever the pod swap costs, so the two
+	// outcomes are far apart and the threshold does not need to be precise.
+	const maxSeqGap = 8
+	t.Logf("longest consecutive seq gap with the relay blackholed: %d (%.1fs), max allowed %d",
+		gap, float64(gap)*0.5, maxSeqGap)
+	if gap > maxSeqGap {
+		t.Errorf("the data path was down for %d consecutive probes (%.1fs) because startup "+
+			"waited out a relay dial that never answered (max %d)",
+			gap, float64(gap)*0.5, maxSeqGap)
+	}
+}

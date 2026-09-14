@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1641,6 +1642,32 @@ func execInPodViaCRI(t *testing.T, pod corev1.Pod, container string, cmd []strin
 }
 
 // ── Fault injection ──────────────────────────────────────────────────────────
+
+// blackholeRelayTCP silently drops this node's outbound relay connections.
+//
+// Dropping is not the same as refusing, and the difference is the whole point.
+// Scaling the relay to zero makes connect() fail instantly with a refusal, so
+// the agent moves on. A blackholed address makes it wait out dialTimeout
+// instead, which is what a node behind NAT sees when the relay address stops
+// answering. On the incident cluster that wait was ten seconds of an agent
+// holding its own startup, and the tunnel is dead for all of it.
+func blackholeRelayTCP(t *testing.T, nodeName string) func() {
+	t.Helper()
+	args := []string{"-p", "tcp", "--dport", "3478", "-j", "DROP"}
+	if _, err := ctrExec(append([]string{"exec", nodeName, "iptables", "-I", "OUTPUT", "1"}, args...)...); err != nil {
+		t.Fatalf("blackhole relay TCP on %s: %v", nodeName, err)
+	}
+	t.Logf("blackholed outbound relay TCP on %s", nodeName)
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if _, err := ctrExec(append([]string{"exec", nodeName, "iptables", "-D", "OUTPUT"}, args...)...); err != nil {
+				t.Logf("warning: restore relay TCP on %s: %v", nodeName, err)
+			}
+		})
+	}
+}
 
 func blockWireGuardUDP(t *testing.T, nodeName string) func() {
 	t.Helper()
