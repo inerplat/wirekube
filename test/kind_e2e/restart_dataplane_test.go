@@ -9,6 +9,8 @@ package kind_e2e
 
 import (
 	"context"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,6 +33,64 @@ import (
 // The existing TestAgentRestart only asserts that the peer's reported
 // connection mode comes back. It never looks at the kernel routes or at
 // whether packets kept flowing, so it passes while the data path is gone.
+
+// pingGapWindows returns each run of lost probes as (firstSeq, lastSeq).
+// longestPingSeqGap collapses this to one number; the incident analysis needed
+// where the gap sat relative to the restart, not only how long it was.
+func pingGapWindows(out string) [][2]int {
+	var seqs []int
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "bytes from") {
+			continue
+		}
+		if m := regexp.MustCompile(`\bseq=(\d+)`).FindStringSubmatch(line); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err == nil {
+				seqs = append(seqs, n)
+			}
+		}
+	}
+	if len(seqs) == 0 {
+		return nil
+	}
+	sort.Ints(seqs)
+	have := map[int]bool{}
+	for _, s := range seqs {
+		have[s] = true
+	}
+	var runs [][2]int
+	start := -1
+	for i := seqs[0]; i <= seqs[len(seqs)-1]; i++ {
+		switch {
+		case !have[i] && start < 0:
+			start = i
+		case have[i] && start >= 0:
+			runs = append(runs, [2]int{start, i - 1})
+			start = -1
+		}
+	}
+	if start >= 0 {
+		runs = append(runs, [2]int{start, seqs[len(seqs)-1]})
+	}
+	return runs
+}
+
+// logTimeline prints the agent's startup steps with timestamps so a CI run can
+// be lined up against the ping gaps the same way the production incident was.
+func logTimeline(t *testing.T, logs string) {
+	t.Helper()
+	keep := []string{"Open:", "SetPeerPath", "relay initial connect", "relay-client",
+		"reusing dataplane state", "preserved routes", "bind-delivery",
+		"keeping preserved routes", "path monitor", "reverting to relay"}
+	for _, line := range strings.Split(logs, "\n") {
+		for _, k := range keep {
+			if strings.Contains(line, k) {
+				t.Logf("  agent: %s", strings.TrimSpace(line))
+				break
+			}
+		}
+	}
+}
 
 // wireKubeRouteTable returns the node's WireKube routing table as text.
 func wireKubeRouteTable(t *testing.T, nodeName string) string {
@@ -392,6 +452,17 @@ func TestRestartWithBlackholedRelayStallsTheDataPath(t *testing.T) {
 	stalled := strings.Contains(logs, "relay initial connect failed")
 	t.Logf("longest consecutive seq gap with the relay blackholed: %d (%.1fs)", gap, float64(gap)*0.5)
 	t.Logf("relay dial timed out during startup: %v", stalled)
+
+	// Where the gaps sat, not only how long. On the incident cluster the single
+	// gap started 0.5 s after the pod was deleted and ended exactly when the
+	// first SetPeerPath ran, ten seconds after the process was already up.
+	pingStart := time.Now().Add(-time.Duration(len(strings.Split(result.out, "\n"))) * 500 * time.Millisecond)
+	for _, w := range pingGapWindows(result.out) {
+		t.Logf("  gap seq %d-%d = %.1fs, ~%.1fs after ping start (restart was at ~4.0s)",
+			w[0], w[1], float64(w[1]-w[0]+1)*0.5, float64(w[0])*0.5)
+	}
+	_ = pingStart
+	logTimeline(t, logs)
 
 	if !stalled {
 		// Print what the agent did reach, so the next run says why rather than
