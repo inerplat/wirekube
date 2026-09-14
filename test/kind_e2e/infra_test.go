@@ -64,7 +64,12 @@ func runCmd(name string, args ...string) (string, error) {
 }
 
 func podmanMachineSSH(cmd string) (string, error) {
-	return runCmd("podman", "machine", "ssh", cmd)
+	// The machine's login user is unprivileged and every caller here edits
+	// netfilter inside the VM, which needs root. Without this the nft calls
+	// fail with "Operation not permitted (you must be root)" and cluster setup
+	// aborts before any test runs. Passwordless sudo ships with the machine
+	// image. This path is macOS/Windows only; Linux CI has no podman machine.
+	return runCmd("podman", "machine", "ssh", "sudo "+cmd)
 }
 
 // hostIptables runs an iptables command on the Docker host's network namespace.
