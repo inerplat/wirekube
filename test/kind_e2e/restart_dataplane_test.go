@@ -15,10 +15,18 @@ import (
 	"time"
 )
 
-// These tests probe what an agent restart does to a node's data path while the
-// relay is unavailable. They were written from a production incident on a
-// cluster where a rolling restart of the agent DaemonSet took the pod network
-// down across several nodes for minutes.
+// These tests probe what an agent restart does to a node's data path.
+//
+// They come from an incident where a rolling restart of the agent DaemonSet
+// stranded one node for six minutes. The cause, read off the cluster's own
+// metrics: the node demoted all nine of its peers to relay seconds after
+// restarting, and its relay leg went away two seconds later. Transport mode
+// relay with no relay is a blackhole.
+//
+// wirekube_suppressed_routes stayed at zero for the whole window, so no route
+// was ever withdrawn. The first draft of these tests assumed route withdrawal
+// was the mechanism; the metrics say otherwise, and the two route tests below
+// are kept as regression cover rather than as evidence of the incident.
 //
 // The existing TestAgentRestart only asserts that the peer's reported
 // connection mode comes back. It never looks at the kernel routes or at
@@ -51,9 +59,11 @@ func routeTableHas(table, addr string) bool {
 // between nodes. If they disappear, the pod network on that node stops even
 // though every WireKubePeer still reads "connected".
 //
-// The relay is taken down first because that is the condition the incident
-// happened under, and because canRouteBeforeHandshake refuses to install any
-// route before a handshake when the relay is unusable.
+// This did NOT happen during the incident: suppressed_routes was zero
+// throughout. The test is regression cover for canRouteBeforeHandshake, which
+// refuses to install any route before a handshake when the relay is unusable,
+// and for the one-tick grace window on preserved routes. Neither has been seen
+// to fire in production.
 func TestRestartWithoutRelayKeepsNodeRoutes(t *testing.T) {
 	ctx := context.Background()
 
@@ -114,8 +124,12 @@ func TestRestartWithoutRelayKeepsNodeRoutes(t *testing.T) {
 // down.
 //
 // The ping runs from the peer that is NOT restarted, so it survives the pod
-// deletion and measures the restarting node's return path. Echo replies leave
-// the restarted node, so a route withdrawal there shows up as a gap here.
+// deletion and measures the restarting node's return path.
+//
+// On its own this passes with a gap of zero, and the reason matters: with the
+// relay already gone before the restart, no demotion happens, so the peer stays
+// direct and nothing is lost. The incident needed a demotion first. That case
+// is TestRestartLosingRelayDuringDemotionBlackholes below.
 func TestRestartWithoutRelayKeepsDataPath(t *testing.T) {
 	ctx := context.Background()
 
@@ -223,5 +237,90 @@ func TestRestartDoesNotDemoteHealthyDirectPeers(t *testing.T) {
 	if len(demotions) > 0 {
 		t.Errorf("the active probe demoted %d peer(s) to relay after a restart that recovered a direct path",
 			len(demotions))
+	}
+}
+
+// A peer demoted to relay while the relay leg is gone has nowhere to send.
+//
+// This is the sequence the incident actually followed, read off the cluster's
+// own metrics rather than inferred from the code:
+//
+//	02:12:26  agent restarts, peers promote warm -> direct
+//	02:12:30  all nine peers demoted to relay (relayed_peers_total 1 -> 9)
+//	02:12:32  relay connect starts failing, i/o timeout
+//	02:18:26  relay reconnects, traffic resumes
+//
+// wirekube_suppressed_routes stayed at zero throughout, so no route was ever
+// withdrawn. The transport mode was the whole of it: PathModeRelay with no
+// relay leg means the Bind has nowhere to put the packet.
+//
+// Only the node hosting the relay pod demoted every peer. The other four nodes
+// demoted two apiece during their own restarts and rode it out, because their
+// relay leg was still there.
+//
+// The two tests above isolate the halves of this and both pass: a demotion with
+// a live relay costs nothing, and a dead relay with no demotion costs nothing.
+// The outage needs both, so this test kills the relay in the window between the
+// restart and the demotion that follows it.
+func TestRestartLosingRelayDuringDemotionBlackholes(t *testing.T) {
+	ctx := context.Background()
+
+	peers := resetTransportState(ctx, t)
+	subject := peers[0]
+	remote := peers[1]
+	waitForDirectWithTraffic(ctx, t, subject, remote)
+
+	subjectIP := nodeIPForPeer(t, subject)
+	pinger := agentPodForNode(ctx, t, remote)
+
+	type pingResult struct {
+		out string
+		err error
+	}
+	pingDone := make(chan pingResult, 1)
+	go func() {
+		out, err := execInPod(ctx, t, pinger, "agent",
+			[]string{"ping", "-i", "0.5", "-c", "300", "-W", "2", subjectIP})
+		pingDone <- pingResult{out, err}
+	}()
+	time.Sleep(4 * time.Second)
+
+	// Restart with the relay still up, exactly as on the incident cluster. The
+	// demotion needs a relay it believes in; killing the relay first stops the
+	// demotion from happening at all, which is what made the earlier attempt
+	// measure nothing.
+	restartAgentOnNode(ctx, t, subject)
+
+	// The relay disappears while the agent is coming back, the way it did for
+	// the node that was hosting it.
+	restoreRelay := scaleRelayEntrypoint(ctx, t, 0)
+	defer restoreRelay()
+	t.Logf("relay scaled to zero right after %s restarted", subject)
+
+	// Give the ICE layer time to run its evaluations and demote.
+	time.Sleep(75 * time.Second)
+
+	logs := agentLogsSince(ctx, t, subject, 5*time.Minute)
+	demotions := strings.Count(logs, "active probe failed, reverting to relay")
+	t.Logf("demotions after the restart: %d", demotions)
+
+	result := <-pingDone
+	if result.err != nil {
+		t.Logf("ping returned an error (expected when loss is high): %v", result.err)
+	}
+	gap := longestPingSeqGap(result.out)
+
+	t.Logf("longest consecutive seq gap: %d", gap)
+	if demotions == 0 {
+		t.Skipf("no demotion occurred, so the blackhole condition never formed; "+
+			"seq gap was %d", gap)
+	}
+
+	// At 2 pps a six-minute blackhole is 720 probes. Anything past 20 already
+	// means the peer is stranded rather than merely reconverging.
+	const maxSeqGap = 20
+	if gap > maxSeqGap {
+		t.Errorf("%d peers were demoted to relay with no relay leg and the data path "+
+			"was down for %d consecutive probes (max %d)", demotions, gap, maxSeqGap)
 	}
 }
