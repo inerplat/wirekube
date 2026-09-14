@@ -384,12 +384,36 @@ func TestRestartWithBlackholedRelayStallsTheDataPath(t *testing.T) {
 	}
 	gap := longestPingSeqGap(result.out)
 
+	// Check the condition actually formed before judging the measurement. The
+	// first version of this test asserted on the gap without ever confirming
+	// the agent had hit a relay timeout, so a rule that silently failed to
+	// match looked exactly like a passing test.
+	logs := agentLogsSince(ctx, t, subject, 5*time.Minute)
+	stalled := strings.Contains(logs, "relay initial connect failed")
+	t.Logf("longest consecutive seq gap with the relay blackholed: %d (%.1fs)", gap, float64(gap)*0.5)
+	t.Logf("relay dial timed out during startup: %v", stalled)
+
+	if !stalled {
+		// Print what the agent did reach, so the next run says why rather than
+		// leaving another guess to make.
+		for _, line := range strings.Split(logs, "\n") {
+			if strings.Contains(line, "relay") {
+				t.Logf("  agent relay log: %s", strings.TrimSpace(line))
+			}
+		}
+		rules, err := ctrExec("exec", subject, "iptables", "-S", "OUTPUT")
+		if err != nil {
+			t.Logf("  iptables -S OUTPUT: %v", err)
+		} else {
+			t.Logf("  iptables OUTPUT on %s:\n%s", subject, rules)
+		}
+		t.Skipf("the relay dial never stalled, so the condition under test never formed; gap was %d", gap)
+	}
+
 	// At 2 pps the suite's bimodal warm-send bound is 8 probes. A full
 	// dialTimeout is 20 on top of whatever the pod swap costs, so the two
 	// outcomes are far apart and the threshold does not need to be precise.
 	const maxSeqGap = 8
-	t.Logf("longest consecutive seq gap with the relay blackholed: %d (%.1fs), max allowed %d",
-		gap, float64(gap)*0.5, maxSeqGap)
 	if gap > maxSeqGap {
 		t.Errorf("the data path was down for %d consecutive probes (%.1fs) because startup "+
 			"waited out a relay dial that never answered (max %d)",
