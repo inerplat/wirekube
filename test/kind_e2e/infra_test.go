@@ -64,7 +64,12 @@ func runCmd(name string, args ...string) (string, error) {
 }
 
 func podmanMachineSSH(cmd string) (string, error) {
-	return runCmd("podman", "machine", "ssh", cmd)
+	// The machine's login user is unprivileged and every caller here edits
+	// netfilter inside the VM, which needs root. Without this the nft calls
+	// fail with "Operation not permitted (you must be root)" and cluster setup
+	// aborts before any test runs. Passwordless sudo ships with the machine
+	// image. This path is macOS/Windows only; Linux CI has no podman machine.
+	return runCmd("podman", "machine", "ssh", "sudo "+cmd)
 }
 
 // hostIptables runs an iptables command on the Docker host's network namespace.
@@ -107,9 +112,13 @@ func setupCluster(_ context.Context) error {
 		}
 	}
 
-	fmt.Println("e2e: disabling NAT masquerade between VPC subnets…")
-	if err := disableInterVPCMasquerade(); err != nil {
-		return fmt.Errorf("disable inter-VPC masquerade: %w", err)
+	if skipVPCIsolation() {
+		fmt.Println("e2e: skipping NAT masquerade changes (WIREKUBE_E2E_SKIP_VPC_ISOLATION)")
+	} else {
+		fmt.Println("e2e: disabling NAT masquerade between VPC subnets…")
+		if err := disableInterVPCMasquerade(); err != nil {
+			return fmt.Errorf("disable inter-VPC masquerade: %w", err)
+		}
 	}
 
 	for _, n := range nodeConfigs {
@@ -208,9 +217,13 @@ func setupCluster(_ context.Context) error {
 		return err
 	}
 
-	fmt.Println("e2e: enforcing VPC isolation (iptables)…")
-	if err := enforceVPCIsolation(); err != nil {
-		return fmt.Errorf("enforce VPC isolation: %w", err)
+	if skipVPCIsolation() {
+		fmt.Println("e2e: skipping VPC isolation (WIREKUBE_E2E_SKIP_VPC_ISOLATION)")
+	} else {
+		fmt.Println("e2e: enforcing VPC isolation (iptables)…")
+		if err := enforceVPCIsolation(); err != nil {
+			return fmt.Errorf("enforce VPC isolation: %w", err)
+		}
 	}
 
 	return nil
@@ -220,6 +233,19 @@ func setupCluster(_ context.Context) error {
 // Both Podman (netavark) and Docker masquerade cross-subnet traffic by default,
 // which causes STUN to reflect the gateway IP instead of the node's real IP.
 // We insert accept rules in POSTROUTING to skip masquerade for inter-VPC traffic.
+// skipVPCIsolation drops the netfilter edits that turn the three container
+// networks into NAT-separated VPCs.
+//
+// They need root in the container host's network namespace. A rootless podman
+// machine puts netavark's rules inside a user namespace where the VM's own
+// root cannot reach them, so setup aborts before any test runs. Skipping costs
+// the cross-NAT shape of the environment: peers reach each other without
+// address translation, so NAT-traversal tests lose their point. Tests that only
+// need a working mesh, a relay and a restart still hold.
+func skipVPCIsolation() bool {
+	return os.Getenv("WIREKUBE_E2E_SKIP_VPC_ISOLATION") != ""
+}
+
 func disableInterVPCMasquerade() error {
 	var subnets []string
 	for _, n := range nodeConfigs {
