@@ -503,36 +503,48 @@ func (a *Agent) setup(ctx context.Context) error {
 		return fmt.Errorf("upserting own peer: %w", err)
 	}
 
-	// Initialize relay client if configured (relay-first: connect immediately).
-	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64()); err != nil {
-		a.log.Error(err, "relay init failed, will retry")
-	}
-
-	// If initial STUN detected cone NAT and relay is available, refine detection
-	// to distinguish port-restricted cone from address-restricted cone.
-	if a.detectedNATType == string(nat.NATCone) && a.relayPool != nil && a.relayPool.IsConnected() {
-		relayIP := a.relayPool.RelayIP()
-		a.log.Info("starting port-restriction detection", "relayIP", relayIP)
-		if relayIP != "" {
-			probeFunc := func(ip net.IP, port int) error {
-				return a.relayPool.SendNATProbe(ip, port)
-			}
-			refinedType, err := nat.DetectPortRestriction(ctx, mesh.Spec.STUNServers, relayIP, probeFunc)
-			if err != nil {
-				a.log.Error(err, "port-restriction detection failed, keeping cone")
-			} else {
-				a.detectedNATType = string(refinedType)
-				if refinedType == nat.NATPortRestrictedCone {
-					a.log.Info("port-restricted cone NAT detected, direct retry disabled for incompatible peers")
-				} else {
-					a.log.Info("address-restricted cone NAT confirmed, direct P2P possible")
-				}
-				// Update CRD with refined NAT type.
-				if err := a.updateDiscoveryMethod(ctx, peerName, "stun"); err != nil {
-					a.log.Error(err, "updating NAT type in CRD")
-				}
-			}
+	// Initialize relay client. The dial runs in the background; cone
+	// refinement is handed to initRelay as the work to do once it lands.
+	//
+	// It cannot stay inline here. initRelay returns before the dial completes,
+	// so IsConnected() would be false at this point even for a reachable
+	// relay, and DetectPortRestriction has exactly one caller. Skipping it
+	// leaves a port-restricted cone node classified as plain cone for the life
+	// of the process, because the periodic re-classifier deliberately does not
+	// draw that distinction (see peerIsStableNAT). The node would then keep
+	// probing direct paths to symmetric peers that cannot exist.
+	refineCone := func(pool *agentrelay.Pool) {
+		if a.detectedNATType != string(nat.NATCone) {
+			return
 		}
+		relayIP := pool.RelayIP()
+		if relayIP == "" {
+			return
+		}
+		a.log.Info("starting port-restriction detection", "relayIP", relayIP)
+		probeFunc := func(ip net.IP, port int) error {
+			return pool.SendNATProbe(ip, port)
+		}
+		refinedType, err := nat.DetectPortRestriction(ctx, mesh.Spec.STUNServers, relayIP, probeFunc)
+		if err != nil {
+			a.log.Error(err, "port-restriction detection failed, keeping cone")
+			return
+		}
+		// Hand the result to the sync goroutine rather than writing
+		// detectedNATType here. This callback runs on the dial goroutine, and
+		// every mutation of the NAT fields belongs to sync (see
+		// applyNATClassification). Reusing natClassCh also means the refinement
+		// passes the same guards as a periodic re-classification, including the
+		// one that refuses to downgrade a port-restricted result back to cone.
+		select {
+		case a.natClassCh <- &NATClassification{NATType: refinedType}:
+		default:
+			a.log.V(1).Info("NAT classification channel busy, dropping cone refinement",
+				"refinedType", refinedType)
+		}
+	}
+	if err := a.initRelay(ctx, mesh, kp.PublicKeyBase64(), refineCone); err != nil {
+		a.log.Error(err, "relay init failed, will retry")
 	}
 
 	// Recover ICE state from surviving WireGuard peers. If the interface was
@@ -1881,7 +1893,7 @@ func (a *Agent) maybeRefreshRelayEndpoint(ctx context.Context, mesh *wirekubev1a
 		// one transient init error cannot disable this seam permanently.
 		a.log.V(1).Info("relay pool missing after a failed rebuild; retrying init", "endpoint", config.endpoint)
 	}
-	if err := a.initRelay(ctx, mesh, a.ownPublicKeyB64); err != nil {
+	if err := a.initRelay(ctx, mesh, a.ownPublicKeyB64, nil); err != nil {
 		a.log.Error(err, "relay re-init after endpoint change failed")
 	}
 }
@@ -1901,7 +1913,14 @@ func relayRebuildDecision(poolExists, poolConnected bool, currentEndpoint, resol
 }
 
 // initRelay sets up the relay client from the mesh relay configuration.
-func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, myPubKeyB64 string) error {
+// initRelay builds the relay pool and starts dialling it in the background.
+//
+// onConnected, when non-nil, runs once that dial succeeds, on the goroutine
+// that performed it, with the pool it succeeded on. Anything that needs an
+// established relay belongs there and not after the call: initRelay returns
+// before the dial completes, so a.relayPool.IsConnected() is false at the
+// return in the ordinary case even when the relay is perfectly reachable.
+func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, myPubKeyB64 string, onConnected func(*agentrelay.Pool)) error {
 	if mesh.Spec.Relay == nil {
 		return nil
 	}
@@ -2031,13 +2050,25 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	//
 	// Nothing below needs the connection established. SetRelayTransport has
 	// already handed the pool to the Bind, the pool reconnects on its own, and
-	// the error path here always said so.
+	// the error path here always said so. Work that genuinely does need an
+	// established relay goes in onConnected.
+	//
+	// The goroutine dials the pool captured here, not a.relayPool. That field
+	// is replaced whenever a managed endpoint changes: maybeRefreshRelayEndpoint
+	// closes the old pool, sets the field to nil, and re-enters initRelay. A
+	// goroutine that read the field at run time could find nil, or dial a
+	// replacement that is already dialling itself, racing Pool.cancel and
+	// starting a second discovery loop.
+	pool := a.relayPool
 	go func() {
-		if err := a.relayPool.Connect(ctx); err != nil {
+		if err := pool.Connect(ctx); err != nil {
 			a.log.Error(err, "relay initial connect failed, will retry in background", "endpoint", endpoint)
 			return
 		}
 		a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
+		if onConnected != nil {
+			onConnected(pool)
+		}
 	}()
 	return nil
 }

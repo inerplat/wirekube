@@ -101,3 +101,100 @@ func TestRelayDialKeepsItsRationale(t *testing.T) {
 		}
 	}
 }
+
+// Work that needs an established relay must run from initRelay's callback, not
+// after the call.
+//
+// initRelay returns before the dial completes, so a.relayPool.IsConnected() is
+// false at the return in the ordinary case, even when the relay answers
+// instantly. setup used to gate cone refinement on exactly that check.
+// DetectPortRestriction has a single caller, and skipping it leaves a
+// port-restricted cone node classified as plain cone for the life of the
+// process: the periodic re-classifier deliberately refuses to draw that
+// distinction, so nothing recovers it. The node then keeps probing direct
+// paths to symmetric peers that cannot exist.
+func TestRelayDependentWorkDoesNotGateOnIsConnectedAfterInitRelay(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "agent.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse agent.go: %v", err)
+	}
+
+	var offenders []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "setup" {
+			return true
+		}
+		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			call, ok := inner.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "IsConnected" {
+				return true
+			}
+			offenders = append(offenders, fset.Position(call.Pos()).String())
+			return true
+		})
+		return false
+	})
+
+	if len(offenders) > 0 {
+		t.Errorf("setup gates on relay IsConnected at %s; the dial has not finished by then, "+
+			"so the guarded work is skipped even for a reachable relay. Pass it to initRelay "+
+			"as the onConnected callback instead", strings.Join(offenders, ", "))
+	}
+}
+
+// The dial goroutine must use the pool it was handed, not re-read a.relayPool.
+//
+// maybeRefreshRelayEndpoint closes the current pool, sets the field to nil, and
+// re-enters initRelay whenever a managed endpoint changes. A goroutine that
+// dereferences the field when it happens to run can find nil, or dial the
+// replacement concurrently with the replacement's own dial, racing Pool.cancel
+// and starting a second discovery loop.
+func TestRelayDialUsesTheCapturedPool(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "agent.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse agent.go: %v", err)
+	}
+
+	var viaField bool
+	ast.Inspect(file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "initRelay" {
+			return true
+		}
+		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			goStmt, ok := inner.(*ast.GoStmt)
+			if !ok {
+				return true
+			}
+			ast.Inspect(goStmt, func(c ast.Node) bool {
+				call, ok := c.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Connect" {
+					return true
+				}
+				// a.relayPool.Connect(...) reads the mutable field.
+				if inner, ok := sel.X.(*ast.SelectorExpr); ok && inner.Sel.Name == "relayPool" {
+					viaField = true
+				}
+				return true
+			})
+			return true
+		})
+		return false
+	})
+
+	if viaField {
+		t.Error("the background dial reads a.relayPool instead of a captured local; " +
+			"maybeRefreshRelayEndpoint can nil or replace that field while the dial is outstanding")
+	}
+}
