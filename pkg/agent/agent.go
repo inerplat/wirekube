@@ -2060,15 +2060,19 @@ func (a *Agent) initRelay(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMe
 	// replacement that is already dialling itself, racing Pool.cancel and
 	// starting a second discovery loop.
 	pool := a.relayPool
+	if onConnected != nil {
+		// Registered on the pool rather than keyed off Connect's return value.
+		// Client.Connect starts its reconnect loop even when it returns the
+		// initial dial error, so a pool that comes online seconds after a
+		// transient startup outage would otherwise never run this.
+		pool.SetOnFirstConnect(func() { onConnected(pool) })
+	}
 	go func() {
 		if err := pool.Connect(ctx); err != nil {
 			a.log.Error(err, "relay initial connect failed, will retry in background", "endpoint", endpoint)
 			return
 		}
 		a.log.Info("relay connected", "endpoint", endpoint, "mode", a.relayMode)
-		if onConnected != nil {
-			onConnected(pool)
-		}
 	}()
 	return nil
 }

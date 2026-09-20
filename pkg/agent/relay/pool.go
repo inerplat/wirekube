@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -31,6 +32,21 @@ type Pool struct {
 	mu      sync.RWMutex
 	clients map[string]*Client // keyed by resolved IP:port
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
+
+	// onFirstConnect fires once, on the first client that comes online,
+	// whether that is the initial dial or a later reconnect. Client.Connect
+	// starts its reconnect loop even when it returns the initial dial error,
+	// so work keyed off Connect's return value never runs after a transient
+	// startup outage.
+	onFirstConnect func()
+	firstConnected bool
+
+	// closed records that Close ran. Connect is started from a goroutine, so
+	// Close can land first: without this the pool would have no cancel to call
+	// yet, return, and then the late Connect would bring up clients and the
+	// discovery loop on a pool nobody references any more, leaving duplicate
+	// relay registrations that nothing can stop.
+	closed bool
 
 	// bindDelivery, when set, routes incoming relay data packets directly
 	// to the WireKubeBind instead of through UDPProxy. Used in userspace
@@ -111,9 +127,45 @@ func (p *Pool) SetProbeAddr(addr string) {
 // Connect resolves the relay address and connects to all discovered endpoints.
 // It starts a background goroutine that periodically re-resolves DNS to track
 // replica changes (scale-up, scale-down, restarts).
+// errPoolClosed is returned when Connect runs after Close. The dial is started
+// from a goroutine, so this ordering is reachable whenever a managed relay
+// endpoint changes during startup.
+var errPoolClosed = errors.New("relay pool closed")
+
+// SetOnFirstConnect registers work to run once the pool has a live client.
+// It must be called before Connect.
+func (p *Pool) SetOnFirstConnect(fn func()) {
+	p.mu.Lock()
+	p.onFirstConnect = fn
+	p.mu.Unlock()
+}
+
+// noteConnected fires onFirstConnect at most once. Called from every path that
+// can bring a client online: the initial dial, the discovery loop, and the
+// watcher that covers a client whose own reconnect loop succeeded later.
+func (p *Pool) noteConnected() {
+	p.mu.Lock()
+	if p.firstConnected || p.closed || p.onFirstConnect == nil {
+		p.mu.Unlock()
+		return
+	}
+	p.firstConnected = true
+	fn := p.onFirstConnect
+	p.mu.Unlock()
+	fn()
+}
+
 func (p *Pool) Connect(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		cancel()
+		return errPoolClosed
+	}
 	p.cancel = cancel
+	p.mu.Unlock()
 
 	endpoints := p.resolve()
 	if len(endpoints) == 0 {
@@ -129,11 +181,41 @@ func (p *Pool) Connect(ctx context.Context) error {
 	}
 
 	go p.discoveryLoop(ctx)
+	go p.connectWatchLoop(ctx)
 
+	if len(p.connectedClients()) > 0 {
+		p.noteConnected()
+	}
 	if firstErr != nil && len(p.connectedClients()) == 0 {
 		return firstErr
 	}
 	return nil
+}
+
+// connectWatchLoop reports the first live client for the case the initial dial
+// failed. Client.Connect returns that error but leaves its reconnect loop
+// running, so the pool can come online seconds later with nothing to announce
+// it. Stops as soon as it has something to report, or when the pool closes.
+func (p *Pool) connectWatchLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		p.mu.RLock()
+		done := p.firstConnected || p.closed || p.onFirstConnect == nil
+		p.mu.RUnlock()
+		if done {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if len(p.connectedClients()) > 0 {
+			p.noteConnected()
+			return
+		}
+	}
 }
 
 // IsConnected returns true if at least one relay is connected.
@@ -326,8 +408,12 @@ func (p *Pool) SendBimodalHint(destPubKey [relayproto.PubKeySize]byte) error {
 
 // Close shuts down all relay clients and proxies.
 func (p *Pool) Close() {
-	if p.cancel != nil {
-		p.cancel()
+	p.mu.Lock()
+	p.closed = true
+	cancel := p.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 
 	p.mu.Lock()
@@ -533,6 +619,9 @@ func (p *Pool) discoveryLoop(ctx context.Context) {
 			if err := p.connectOne(ctx, ep); err != nil {
 				log.Printf("relay-pool: failed to connect to new replica %s: %v", ep, err)
 			}
+		}
+		if len(p.connectedClients()) > 0 {
+			p.noteConnected()
 		}
 
 		// Remove clients for endpoints that no longer resolve.
