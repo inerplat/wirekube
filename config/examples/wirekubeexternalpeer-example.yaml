@@ -14,8 +14,10 @@
 #      reconcile and the user loses connectivity within ~60s.
 #
 # Optional fields not shown:
-#   - spec.allowedDestinations: defaults to [meshCIDR, podCIDR] from
-#     WireKubeMesh; override only if the peer should reach a narrower scope.
+#   - spec.allowedDestinations: defaults to the mesh CIDR, every node pod CIDR,
+#     the Service ClusterIP range(s) and every WireKubeGateway route. An
+#     explicit list REPLACES all of that, so set one only when the peer should
+#     reach a narrower scope — and then name every range it still needs.
 #   - spec.ingressPeer:         pin to a specific WireKubePeer; default is
 #     auto-select at allocation time.
 #   - spec.mtu:                 override the rendered client MTU. Defaults to

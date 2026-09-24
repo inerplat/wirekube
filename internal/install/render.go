@@ -130,6 +130,10 @@ func agentClusterRole(options Options, labels map[string]string) *rbacv1.Cluster
 		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent", Labels: labels},
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{""}, Resources: []string{"nodes", "services"}, Verbs: []string{"get", "list", "watch"}},
+			// ServiceCIDR holds the cluster's Service ClusterIP range(s), which
+			// the external-peer reconciler advertises to off-cluster clients.
+			// Absent on older API servers; the reconciler degrades to no ranges.
+			{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"servicecidrs"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "patch"}},
 			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubepeers"}, Verbs: []string{"get", "list", "create", "patch", "update", "delete", "watch"}},
 			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubepeers/status", "wirekubemeshes/status", "wirekubegateways/status", "wirekubeexternalpeers/status"}, Verbs: []string{"get", "patch", "update"}},

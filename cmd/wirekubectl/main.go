@@ -630,7 +630,7 @@ cluster never sees it.`,
 		},
 	}
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "auto-delete this peer after TTL (e.g. 24h); 0 = no expiry")
-	cmd.Flags().StringSliceVar(&allowed, "allow", nil, "extra CIDR(s) to add to AllowedIPs (defaults to mesh + pod CIDRs at the controller)")
+	cmd.Flags().StringSliceVar(&allowed, "allow", nil, "CIDR(s) for AllowedIPs; replaces the controller defaults (mesh, pod, service and gateway CIDRs) rather than adding to them")
 	cmd.Flags().StringVar(&ingress, "ingress-peer", "", "pin to a specific WireKubePeer by name (default: controller auto-selects)")
 	cmd.Flags().Int32Var(&mtu, "mtu", 0, "WireGuard interface MTU for the external client (default: controller-recommended 1248)")
 	cmd.Flags().DurationVar(&waitFor, "wait", 60*time.Second, "how long to wait for Phase=Active before failing")

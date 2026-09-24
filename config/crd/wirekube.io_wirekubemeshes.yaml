@@ -372,6 +372,19 @@ spec:
                     - tunnel
                     type: string
                 type: object
+              serviceCIDRs:
+                description: |-
+                  ServiceCIDRs pins the Service ClusterIP range(s) advertised to
+                  external peers. When empty the controller discovers them from the
+                  cluster's ServiceCIDR objects (networking.k8s.io), which every
+                  server that serves that API reports authoritatively. Set this on
+                  clusters too old to serve ServiceCIDR, or to advertise a narrower
+                  range than the cluster actually allocates from. In-cluster peers do
+                  not need this: they reach ClusterIPs through their own node.
+                items:
+                  pattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
+                  type: string
+                type: array
               stunServers:
                 description: |-
                   STUNServers is a list of STUN server addresses used for public endpoint discovery.

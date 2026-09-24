@@ -589,6 +589,11 @@ func (in *WireKubeMeshSpec) DeepCopyInto(out *WireKubeMeshSpec) {
 		*out = new(NATTraversalSpec)
 		**out = **in
 	}
+	if in.ServiceCIDRs != nil {
+		in, out := &in.ServiceCIDRs, &out.ServiceCIDRs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.AutoAllowedIPs != nil {
 		in, out := &in.AutoAllowedIPs, &out.AutoAllowedIPs
 		*out = new(AutoAllowedIPsSpec)
