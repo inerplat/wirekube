@@ -493,14 +493,15 @@ func TestAllowedDestinations_KeepsGatewayThatListsTheIngressPeer(t *testing.T) {
 	}
 }
 
-// TestAllowedDestinations_KeepsGatewayForItsOwnPeer covers the shape real
+// TestAllowedDestinations_KeepsGatewayForItsElectedPeer covers the shape real
 // clusters use: clientRefs lists every node except the gateway itself, because
-// the gateway peer carries the routes natively rather than as a client. An
-// external peer entering through that node must not lose the route.
-func TestAllowedDestinations_KeepsGatewayForItsOwnPeer(t *testing.T) {
+// the elected gateway peer carries the routes natively rather than as a client.
+// An external peer entering through that node must not lose the route.
+func TestAllowedDestinations_KeepsGatewayForItsElectedPeer(t *testing.T) {
 	gateway := newGateway("ncp", "172.20.0.0/16")
 	gateway.Spec.PeerRefs = []string{testIngressPeer}
 	gateway.Spec.ClientRefs = []string{"worker1", "worker2"}
+	gateway.Status.ActivePeer = testIngressPeer
 
 	cr := newExternalPeer(testExternalName)
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(), gateway)
@@ -511,5 +512,79 @@ func TestAllowedDestinations_KeepsGatewayForItsOwnPeer(t *testing.T) {
 	got := getCR(t, c, testExternalName).Status.AllowedDestinations
 	if !slices.Contains(got, "172.20.0.0/16") {
 		t.Fatalf("route dropped for the gateway's own peer: %v", got)
+	}
+}
+
+// TestAllowedDestinations_SkipsGatewayStandbyPeer is the counterpart: only the
+// elected peer has the routes injected, so a standby named in peerRefs but
+// excluded by clientRefs would blackhole until it happens to be elected.
+func TestAllowedDestinations_SkipsGatewayStandbyPeer(t *testing.T) {
+	gateway := newGateway("ncp", "172.20.0.0/16")
+	gateway.Spec.PeerRefs = []string{"gateway-primary", testIngressPeer}
+	gateway.Spec.ClientRefs = []string{"worker1", "worker2"}
+	gateway.Status.ActivePeer = "gateway-primary"
+
+	cr := newExternalPeer(testExternalName)
+	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(), gateway)
+	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost)}
+
+	reconcileTwice(t, r, testExternalName)
+
+	got := getCR(t, c, testExternalName).Status.AllowedDestinations
+	if slices.Contains(got, "172.20.0.0/16") {
+		t.Fatalf("route advertised through an unelected standby: %v", got)
+	}
+}
+
+// TestAllowedDestinations_DegradedReadRequeues pins that a preserved list is
+// retried: a failed read raises no watch event of its own, so without a
+// requeue the peer would hold the stale list indefinitely.
+func TestAllowedDestinations_DegradedReadRequeues(t *testing.T) {
+	cr := newExternalPeer(testExternalName)
+	scheme := testScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cr, newReadyMesh(), newIngressPeer(), newNode("node-a", "10.244.1.0/24")).
+		WithStatusSubresource(
+			&wirekubev1alpha1.WireKubeExternalPeer{},
+			&wirekubev1alpha1.WireKubeMesh{},
+			&wirekubev1alpha1.WireKubePeer{},
+		).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*wirekubev1alpha1.WireKubeGatewayList); ok {
+					return apierrors.NewServiceUnavailable("synthetic outage")
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	r := &Reconciler{Client: c, Scheme: scheme, Relay: newMockRelay(testRelayHost)}
+	res := reconcileTwice(t, r, testExternalName)
+
+	if res.RequeueAfter == 0 {
+		t.Fatal("degraded reconcile returned no requeue; the stale list would never be retried")
+	}
+}
+
+// TestAllowedDestinations_HealthyReadDoesNotRequeue keeps the retry scoped to
+// actual failures rather than becoming an unconditional poll.
+func TestAllowedDestinations_HealthyReadDoesNotRequeue(t *testing.T) {
+	cr := newExternalPeer(testExternalName)
+	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(), newNode("node-a", "10.244.1.0/24"))
+	r := &Reconciler{
+		Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost),
+		APIReader: &serviceCIDRReader{
+			Reader:     c,
+			apiVersion: "networking.k8s.io/v1",
+			items: []unstructured.Unstructured{
+				newServiceCIDRObject("networking.k8s.io/v1", "kubernetes", boolPtr(true), "10.96.0.0/12"),
+			},
+		},
+	}
+
+	if res := reconcileTwice(t, r, testExternalName); res.RequeueAfter != 0 {
+		t.Fatalf("healthy reconcile requeued after %s", res.RequeueAfter)
 	}
 }
