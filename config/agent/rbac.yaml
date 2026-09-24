@@ -19,6 +19,19 @@ rules:
   - get
   - list
   - watch
+# ServiceCIDR carries the cluster's Service ClusterIP range(s), which the
+# external-peer reconciler advertises to off-cluster WireGuard clients. The
+# kind is served only by newer API servers and is read across the group
+# versions that have carried it; a cluster that serves none simply yields no
+# ranges. WireKubeMesh.spec.serviceCIDRs pins them when this is unavailable.
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - servicecidrs
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:

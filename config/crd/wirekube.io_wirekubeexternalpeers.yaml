@@ -73,10 +73,13 @@ spec:
               allowedDestinations:
                 description: |-
                   AllowedDestinations lists CIDR ranges this external peer is permitted
-                  to reach through the mesh. The controller defaults this to the mesh
-                  overlay CIDR plus the cluster pod CIDR(s) at admission/reconcile time
-                  when left empty. Used to populate the AllowedIPs field of the rendered
-                  WireGuard conf and to scope ingress-side routing.
+                  to reach through the mesh. Used to populate the AllowedIPs field of the
+                  rendered WireGuard conf and to scope ingress-side routing.
+
+                  An explicit list REPLACES the controller defaults rather than adding to
+                  them, so it must name every range the peer needs — including the mesh
+                  overlay and pod CIDRs it would otherwise get for free. Leave it empty
+                  unless the peer really should reach a narrower scope than the cluster.
                 items:
                   type: string
                 type: array
@@ -133,12 +136,12 @@ spec:
                 description: |-
                   AllowedDestinations is the effective AllowedIPs list rendered into
                   the external client's WireGuard conf. Mirrors Spec.AllowedDestinations
-                  when the operator set one explicitly; otherwise the controller fills
-                  it with the mesh overlay CIDR plus every Node's pod CIDR(s) so the
-                  peer reaches both mesh nodes and pods through the ingress peer. The CLI
-                  renders from this field rather than the spec so its output is
-                  authoritative regardless of whether the operator overrode the
-                  defaults.
+                  when the operator set one explicitly; otherwise the controller fills it
+                  with the mesh overlay CIDR, every Node's pod CIDR(s), the Service
+                  ClusterIP range(s) and every WireKubeGateway route, sorted, so the peer
+                  reaches the same cluster an in-cluster peer reaches. The CLI renders
+                  from this field rather than the spec so its output is authoritative
+                  regardless of whether the operator overrode the defaults.
                 items:
                   type: string
                 type: array

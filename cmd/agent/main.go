@@ -298,7 +298,10 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 	r := &externalctrl.Reconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Relay:  externalctrl.NewNoopRelayController(""),
+		// ServiceCIDR is absent on older API servers; an uncached reader
+		// keeps the cache from starting an informer that can never sync.
+		APIReader: mgr.GetAPIReader(),
+		Relay:     externalctrl.NewNoopRelayController(""),
 		RelayResolver: func(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) externalctrl.RelayController {
 			return relayControllerFromMesh(ctx, mgr.GetClient(), mesh, relayNamespace)
 		},

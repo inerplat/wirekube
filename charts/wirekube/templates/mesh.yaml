@@ -13,6 +13,10 @@ spec:
   mtu: {{ .Values.mesh.mtu }}
   stunServers:
     {{- toYaml .Values.mesh.stunServers | nindent 4 }}
+  {{- with .Values.mesh.serviceCIDRs }}
+  serviceCIDRs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- if .Values.mesh.autoAllowedIPs.includeNodeInternalIP }}
   autoAllowedIPs:
     includeNodeInternalIP: true

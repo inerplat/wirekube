@@ -11,11 +11,18 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	"github.com/inerplat/wirekube/pkg/meship"
@@ -75,6 +82,12 @@ type Reconciler struct {
 	Scheme        *runtime.Scheme
 	Relay         RelayController
 	RelayResolver func(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) RelayController
+	// APIReader performs uncached reads for resource kinds that may not
+	// exist on the cluster at all. ServiceCIDR is served only by newer
+	// API servers, and reading an absent kind through the manager's cache
+	// starts an informer that can never sync, stalling the reconcile.
+	// Production callers set mgr.GetAPIReader(); when nil, Client is used.
+	APIReader client.Reader
 	// Now is injectable for deterministic TTL tests; production callers
 	// leave it nil and the reconciler falls back to time.Now.
 	Now func() time.Time
@@ -84,9 +97,65 @@ type Reconciler struct {
 // is intentionally separate from the constructor so the test suite can
 // instantiate the reconciler without a manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Default the uncached reader here so no manager-registered caller can
+	// forget it: reading an unserved kind through the cache starts an informer
+	// that never syncs, which would hang the reconcile rather than fail it.
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&wirekubev1alpha1.WireKubeExternalPeer{}).
+		// status.allowedDestinations is derived from Nodes and gateways, and
+		// an Active peer is otherwise never requeued. Without these watches a
+		// node joining or a gateway being created would leave every issued
+		// peer's rendered conf stale indefinitely.
+		Watches(&corev1.Node{},
+			r.enqueueAllExternalPeers(),
+			builder.WithPredicates(nodePodCIDRChanged())).
+		Watches(&wirekubev1alpha1.WireKubeGateway{},
+			r.enqueueAllExternalPeers(),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
+}
+
+// enqueueAllExternalPeers maps an event on a derived-from resource to every
+// WireKubeExternalPeer, since the defaults are cluster-wide rather than
+// per-peer. Reconcile is cheap and idempotent when nothing actually changed:
+// activeStatusMatches short-circuits before any write.
+func (r *Reconciler) enqueueAllExternalPeers() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
+		list := &wirekubev1alpha1.WireKubeExternalPeerList{}
+		if err := r.List(ctx, list); err != nil {
+			return nil
+		}
+		requests := make([]reconcile.Request, 0, len(list.Items))
+		for i := range list.Items {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: list.Items[i].Name},
+			})
+		}
+		return requests
+	})
+}
+
+// nodePodCIDRChanged limits Node events to the ones that can move a pod CIDR.
+// Node objects update every few seconds for status heartbeats, and enqueuing
+// every external peer on each of those would be a reconcile storm. Update is
+// still watched rather than dropped outright because kubelet registers a Node
+// before the IPAM controller writes spec.podCIDR, so the CIDR usually arrives
+// as an update rather than at creation.
+func nodePodCIDRChanged() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, oldOK := e.ObjectOld.(*corev1.Node)
+			newNode, newOK := e.ObjectNew.(*corev1.Node)
+			if !oldOK || !newOK {
+				return false
+			}
+			return oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR ||
+				!slices.Equal(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs)
+		},
+	}
 }
 
 func (r *Reconciler) now() time.Time {
@@ -194,11 +263,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	//
 	// If the operator set spec.allowedDestinations explicitly we honour it
 	// verbatim (operator knows what they want — e.g. a narrow /24 carve-out
-	// for contractor access). Otherwise we default to mesh overlay CIDR +
-	// every Node's pod CIDR(s), so the rendered conf actually routes mesh
-	// and pod traffic through the ingress peer instead of leaving the client
-	// with a single /32 self-route.
-	allowed, err := r.effectiveAllowedDestinations(ctx, cr, mesh)
+	// for contractor access). Otherwise we default to the mesh overlay CIDR,
+	// every Node's pod CIDR(s), the Service ClusterIP range(s) and every
+	// gateway route, so the rendered conf actually routes cluster traffic
+	// through the ingress peer instead of leaving the client with a single
+	// /32 self-route.
+	allowed, err := r.effectiveAllowedDestinations(ctx, cr, mesh, ingressPeerName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("compute allowed destinations: %w", err)
 	}
@@ -641,17 +711,37 @@ func effectiveMTU(cr *wirekubev1alpha1.WireKubeExternalPeer) int32 {
 // effectiveAllowedDestinations resolves the AllowedIPs list rendered into
 // the external peer's WireGuard conf. When the operator set
 // spec.allowedDestinations explicitly we honour it verbatim. Otherwise we
-// build a sane default — mesh overlay CIDR plus every Node's pod CIDR(s)
-// — so the peer can actually reach mesh nodes and pods through the
-// ingress peer. Without this defaulting the conf would only carry the peer's
-// own /32 and the WireGuard client would install no routes for cluster
-// destinations.
-func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) ([]string, error) {
+// build a sane default so the peer reaches the same cluster through the
+// ingress peer that an in-cluster peer reaches:
+//
+//   - the mesh overlay CIDR,
+//   - every Node's pod CIDR(s),
+//   - the Service ClusterIP range(s), pinned by WireKubeMesh.spec.serviceCIDRs
+//     or discovered from the cluster's ServiceCIDR objects,
+//   - every WireKubeGateway route, so an external peer reaches the
+//     off-cluster networks (VPCs, private links) that gateways carry.
+//
+// Without this defaulting the conf would only carry the peer's own /32 and
+// the WireGuard client would install no routes for cluster destinations.
+//
+// A source that cannot be read is skipped rather than failing issuance, so a
+// first-time peer still gets a conf that reaches most of the cluster. It must
+// not, however, narrow a peer that already has destinations: the rendered conf
+// is read back from status, so dropping a range because the apiserver blipped
+// would hand the next downloader a conf that silently stops routing it. When
+// any source failed and status already holds a list, that list is kept and the
+// watches above bring it forward once the read succeeds again.
+//
+// The derived list is sorted because Node, ServiceCIDR and gateway listings
+// arrive in arbitrary order while status.allowedDestinations is compared with
+// slices.Equal — an unsorted list would rewrite status on every reconcile. An
+// explicit spec list keeps the operator's own order.
+func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh, ingressPeerName string) ([]string, error) {
 	if len(cr.Spec.AllowedDestinations) > 0 {
 		return slices.Clone(cr.Spec.AllowedDestinations), nil
 	}
 
-	out := make([]string, 0, 4)
+	out := make([]string, 0, 8)
 	seen := make(map[string]struct{})
 	add := func(cidr string) {
 		if cidr == "" {
@@ -668,21 +758,179 @@ func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirek
 		add(mesh.Spec.MeshCIDR)
 	}
 
+	degraded := false
+
 	nodeList := &corev1.NodeList{}
 	if err := r.List(ctx, nodeList); err != nil {
-		// Nodes unreadable shouldn't block peer issuance — at minimum we
-		// can render a conf that reaches the mesh overlay; the operator
-		// can re-issue with --allow if pod-CIDR routing matters.
-		return out, nil //nolint:nilerr
-	}
-	for i := range nodeList.Items {
-		n := &nodeList.Items[i]
-		for _, c := range n.Spec.PodCIDRs {
-			add(c)
+		degraded = true
+	} else {
+		for i := range nodeList.Items {
+			n := &nodeList.Items[i]
+			for _, c := range n.Spec.PodCIDRs {
+				add(c)
+			}
+			add(n.Spec.PodCIDR)
 		}
-		add(n.Spec.PodCIDR)
+	}
+
+	serviceCIDRs, serviceCIDRsResolved := r.serviceCIDRs(ctx, mesh)
+	if !serviceCIDRsResolved {
+		degraded = true
+	}
+	for _, c := range serviceCIDRs {
+		add(c)
+	}
+
+	gatewayList := &wirekubev1alpha1.WireKubeGatewayList{}
+	if err := r.List(ctx, gatewayList); err != nil {
+		degraded = true
+	} else {
+		for i := range gatewayList.Items {
+			gateway := &gatewayList.Items[i]
+			if !gatewayServesPeer(gateway, ingressPeerName) {
+				continue
+			}
+			for _, route := range gateway.Spec.Routes {
+				add(route.CIDR)
+			}
+		}
+	}
+
+	sort.Strings(out)
+
+	if degraded && len(cr.Status.AllowedDestinations) > 0 {
+		return slices.Clone(cr.Status.AllowedDestinations), nil
 	}
 	return out, nil
+}
+
+// gatewayServesPeer reports whether the ingress peer would actually hold a
+// kernel route for this gateway. An agent skips installing a gateway route on
+// a node that a non-empty clientRefs list excludes (see shouldSkipGatewayRoute
+// in pkg/agent/gateway.go), so advertising such a route to the external client
+// would point it at an ingress that blackholes the traffic — strictly worse
+// than leaving the destination off the tunnel.
+//
+// The gateway's own peers are served even though clientRefs normally omits
+// them: the elected one carries the routes natively (collectGatewayCIDRsForPeer)
+// and a standby carries them the moment it is elected, so an external peer that
+// entered through a gateway node must not lose the route it is sitting on.
+func gatewayServesPeer(gateway *wirekubev1alpha1.WireKubeGateway, peerName string) bool {
+	if len(gateway.Spec.ClientRefs) == 0 {
+		return true
+	}
+	return slices.Contains(gateway.Spec.ClientRefs, peerName) ||
+		slices.Contains(gateway.Spec.PeerRefs, peerName)
+}
+
+// serviceCIDRGroupVersions are the API group/versions that have carried
+// ServiceCIDR, newest first. The kind graduated v1alpha1 -> v1beta1 -> v1
+// across releases, and k8s.io/api at the version this module builds against
+// only contains the v1alpha1 Go type, so the object is read unstructured and
+// the first group/version the server actually serves wins.
+var serviceCIDRGroupVersions = []string{
+	"networking.k8s.io/v1",
+	"networking.k8s.io/v1beta1",
+	"networking.k8s.io/v1alpha1",
+}
+
+// serviceCIDRs returns the Service ClusterIP ranges to advertise to external
+// peers. An explicit WireKubeMesh.spec.serviceCIDRs wins so operators can
+// pin a range on servers that do not serve ServiceCIDR at all.
+// The second return reports whether the answer is trustworthy. A cluster that
+// serves no ServiceCIDR group version resolves to (nil, true): that is a
+// stable property, not a failed read. A Forbidden or transient error resolves
+// to (nil, false) so the caller keeps whatever the peer already had.
+func (r *Reconciler) serviceCIDRs(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) ([]string, bool) {
+	if mesh != nil && len(mesh.Spec.ServiceCIDRs) > 0 {
+		return slices.Clone(mesh.Spec.ServiceCIDRs), true
+	}
+	return r.discoverServiceCIDRs(ctx)
+}
+
+// discoverServiceCIDRs reads the cluster's ServiceCIDR objects. A server that
+// serves none of the known group/versions, or an agent whose RBAC omits the
+// resource, yields nil and the peer is issued without ClusterIP reachability.
+func (r *Reconciler) discoverServiceCIDRs(ctx context.Context) ([]string, bool) {
+	resolved := true
+	for _, gv := range serviceCIDRGroupVersions {
+		list := &unstructured.UnstructuredList{}
+		list.SetAPIVersion(gv)
+		list.SetKind("ServiceCIDRList")
+		if err := r.reader().List(ctx, list); err != nil {
+			// A kind the server does not serve is the expected answer on an
+			// older cluster and says nothing is wrong. Anything else — most
+			// often a ClusterRole that was never reapplied — is a failed read
+			// that must not be mistaken for "this cluster has no Services".
+			if !serviceCIDRKindAbsent(err) {
+				resolved = false
+				logger := ctrl.LoggerFrom(ctx)
+				if apierrors.IsForbidden(err) {
+					logger.Info("not authorized to list ServiceCIDR; external peers will not learn the Service ClusterIP range",
+						"apiVersion", gv, "err", err,
+						"hint", "grant networking.k8s.io/servicecidrs to the agent ClusterRole or set WireKubeMesh.spec.serviceCIDRs")
+				} else {
+					logger.V(1).Info("listing ServiceCIDR failed", "apiVersion", gv, "err", err)
+				}
+			}
+			continue
+		}
+		// This group/version is served; whatever it holds is authoritative,
+		// including nothing at all. Do not fall through to an older one.
+		out := make([]string, 0, len(list.Items))
+		for i := range list.Items {
+			item := &list.Items[i]
+			if !serviceCIDRIsReady(item) {
+				continue
+			}
+			cidrs, found, err := unstructured.NestedStringSlice(item.Object, "spec", "cidrs")
+			if err != nil || !found {
+				continue
+			}
+			out = append(out, cidrs...)
+		}
+		return out, true
+	}
+	return nil, resolved
+}
+
+// serviceCIDRKindAbsent reports whether the error means the server simply does
+// not serve ServiceCIDR at this group/version, as opposed to a read that ought
+// to have worked.
+func serviceCIDRKindAbsent(err error) bool {
+	return meta.IsNoMatchError(err) || apierrors.IsNotFound(err)
+}
+
+// serviceCIDRIsReady reports whether a ServiceCIDR is usable. A terminating
+// range reports Ready=False and must not be advertised. Objects that carry no
+// conditions at all are taken at face value rather than dropped: that is the
+// only range the cluster has.
+func serviceCIDRIsReady(obj *unstructured.Unstructured) bool {
+	conditions, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil || !found {
+		return true
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if condition["type"] != "Ready" {
+			continue
+		}
+		return condition["status"] == string(metav1.ConditionTrue)
+	}
+	return true
+}
+
+// reader returns the uncached reader. SetupWithManager always populates it, so
+// the fallback only serves tests that construct the reconciler without a
+// manager and pass a client that can answer for the kinds they exercise.
+func (r *Reconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func hasFinalizer(cr *wirekubev1alpha1.WireKubeExternalPeer, name string) bool {

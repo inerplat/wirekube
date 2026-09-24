@@ -204,6 +204,15 @@ mesh:
   listenPort: 51820
   mtu: 1420
 
+  # Service ClusterIP range(s) advertised to external peers. Leave empty and
+  # the controller reads them from the cluster's ServiceCIDR objects
+  # (networking.k8s.io), which is what every reasonably current API server
+  # serves. Set them explicitly on a cluster too old to serve that API, or to
+  # advertise a narrower range than the cluster allocates from — otherwise
+  # external peers are issued configs that never route ClusterIPs.
+  # Example: ["10.96.0.0/12"]
+  serviceCIDRs: []
+
   stunServers:
     - stun:stun.cloudflare.com:3478
     - stun:stun.l.google.com:19302

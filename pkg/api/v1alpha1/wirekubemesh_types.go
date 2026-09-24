@@ -55,6 +55,17 @@ type WireKubeMeshSpec struct {
 	// +kubebuilder:validation:Pattern=`^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$`
 	MeshCIDR string `json:"meshCIDR,omitempty"`
 
+	// ServiceCIDRs pins the Service ClusterIP range(s) advertised to
+	// external peers. When empty the controller discovers them from the
+	// cluster's ServiceCIDR objects (networking.k8s.io), which every
+	// server that serves that API reports authoritatively. Set this on
+	// clusters too old to serve ServiceCIDR, or to advertise a narrower
+	// range than the cluster actually allocates from. In-cluster peers do
+	// not need this: they reach ClusterIPs through their own node.
+	// +optional
+	// +kubebuilder:validation:items:Pattern=`^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$`
+	ServiceCIDRs []string `json:"serviceCIDRs,omitempty"`
+
 	// AutoAllowedIPs adds node-derived entries to each peer's AllowedIPs in
 	// addition to the mesh overlay IP. This is useful when other services on
 	// the cluster still address peers by their physical node IP — without

@@ -50,6 +50,7 @@ spec:
 | `interfaceName` | string | No | `wire_kube` | Name of the WireGuard network interface |
 | `mtu` | int | No | `1420` | Interface MTU. 1420 accounts for WireGuard overhead (40B IPv6 or 20B IPv4 + 8B UDP + 32B WG) |
 | `meshCIDR` | string | No | - | Private CIDR used for mesh overlay addresses. Each node gets a deterministic `/32` inside this range, derived from an FNV-1a hash of the node name. The overlay IP becomes the primary AllowedIPs entry and is assigned to the `wire_kube` TUN. Choose a range that does not overlap with node, pod, service, VPC, proxy, or corporate networks. When empty, peers use only manually managed AllowedIPs. |
+| `serviceCIDRs` | []string | No | - | Service ClusterIP range(s) advertised to external peers. When empty the controller discovers them from the cluster's `ServiceCIDR` objects (`networking.k8s.io`, tried newest group version first). Set this on clusters too old to serve that API, or to advertise a narrower range than the cluster allocates from. In-cluster peers do not use this: they reach ClusterIPs through their own node. |
 | `autoAllowedIPs.includeNodeInternalIP` | bool | No | `false` | When `true`, the agent also appends the node's **private** address to `spec.allowedIPs` (resolved from `Node.status.addresses` first, then from local interfaces as a fallback). Public IPs are never auto-advertised — doing so would hijack SSH / apiserver routes on the next tunnel flap. Operators can override the picked address with the `wirekube.io/internal-ip` annotation on the Node. |
 | `stunServers` | []string | No | - | STUN servers for public endpoint discovery. **Minimum 2 required** — the agent compares mapped ports across servers to detect Symmetric NAT (RFC 5780). |
 | `routing.localSubnetPolicy` | string | No | `tunnel` | `tunnel` keeps same-segment traffic in the tunnel, encrypted. `bypass` drops the tunnel host route for a peer this node has confirmed is on its own segment, so that traffic takes the physical link unencrypted. The confirmation is two-sided: the address must resolve in this node's neighbour table to the same MAC the peer publishes in `status.linkAddresses` for the link it owns that address on. Containment in an attached prefix is never sufficient alone, so VPCs that reuse one private range keep their tunnel routes. The decision is recomputed every sync and follows the wiring. |
@@ -273,7 +274,7 @@ WireKubeExternalPeer authorizes an off-cluster host that runs a standard WireGua
 | `displayName` | string | Yes | Stable human-readable identity used by the deterministic mesh-IP allocator. |
 | `publicKey` | string | Yes | External client's 44-character base64 WireGuard public key. |
 | `ttl` | duration | No | Optional lifetime after which the CR is deleted. |
-| `allowedDestinations` | []string | No | CIDRs rendered into the external client's AllowedIPs. Defaults are resolved by the reconciler. |
+| `allowedDestinations` | []string | No | CIDRs rendered into the external client's AllowedIPs. **Replaces** the defaults rather than adding to them, so an explicit list must name every range the peer needs. Leave empty to let the reconciler resolve them. |
 | `mtu` | int | No | Client MTU override; the effective default is `1248`. |
 | `ingressPeer` | string | No | Pins the client to a specific WireKubePeer; otherwise the reconciler selects an ingress peer. |
 
@@ -285,7 +286,7 @@ WireKubeExternalPeer authorizes an off-cluster host that runs a standard WireGua
 | `relayEndpoint` | Shared raw-WireGuard UDP endpoint rendered into the client configuration. |
 | `ingressPeerName` | Selected in-cluster ingress peer. |
 | `ingressPublicKey` | WireGuard public key authenticated by the external client. |
-| `allowedDestinations` | Effective AllowedIPs rendered for the client. |
+| `allowedDestinations` | Effective AllowedIPs rendered for the client. When `spec.allowedDestinations` is empty this is the mesh CIDR, every Node pod CIDR, the Service ClusterIP range(s) and every `WireKubeGateway` route, sorted. |
 | `mtu` | Effective client MTU. |
 | `phase` | `Pending`, `Active`, `Revoked`, or `Failed`. |
 | `connected`, `lastHandshake` | Reserved health fields; the allocation reconciler does not currently populate them. |
