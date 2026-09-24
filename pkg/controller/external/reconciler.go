@@ -115,6 +115,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&wirekubev1alpha1.WireKubeGateway{},
 			r.enqueueAllExternalPeers(),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// spec.meshCIDR and spec.serviceCIDRs both feed the derived list.
+		Watches(&wirekubev1alpha1.WireKubeMesh{},
+			r.enqueueAllExternalPeers(),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }
 
@@ -268,7 +272,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// gateway route, so the rendered conf actually routes cluster traffic
 	// through the ingress peer instead of leaving the client with a single
 	// /32 self-route.
-	allowed, err := r.effectiveAllowedDestinations(ctx, cr, mesh, ingressPeerName)
+	allowed, destinationsDegraded, err := r.effectiveAllowedDestinations(ctx, cr, mesh, ingressPeerName)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("compute allowed destinations: %w", err)
 	}
@@ -303,9 +307,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{RequeueAfter: expiry.Sub(now)}, nil
+		requeue := expiry.Sub(now)
+		// A degraded read has no watch event to bring it back, so retry
+		// sooner than the TTL deadline when that lands first.
+		if destinationsDegraded && requeueLong < requeue {
+			requeue = requeueLong
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
+	if destinationsDegraded {
+		return ctrl.Result{RequeueAfter: requeueLong}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -729,16 +742,19 @@ func effectiveMTU(cr *wirekubev1alpha1.WireKubeExternalPeer) int32 {
 // not, however, narrow a peer that already has destinations: the rendered conf
 // is read back from status, so dropping a range because the apiserver blipped
 // would hand the next downloader a conf that silently stops routing it. When
-// any source failed and status already holds a list, that list is kept and the
-// watches above bring it forward once the read succeeds again.
+// any source failed and status already holds a list, that list is kept.
+//
+// The second return reports that a read failed. A failed read produces no
+// watch event of its own, so the caller must requeue or the peer would hold
+// the preserved list until something unrelated happens to trigger it.
 //
 // The derived list is sorted because Node, ServiceCIDR and gateway listings
 // arrive in arbitrary order while status.allowedDestinations is compared with
 // slices.Equal — an unsorted list would rewrite status on every reconcile. An
 // explicit spec list keeps the operator's own order.
-func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh, ingressPeerName string) ([]string, error) {
+func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh, ingressPeerName string) ([]string, bool, error) {
 	if len(cr.Spec.AllowedDestinations) > 0 {
-		return slices.Clone(cr.Spec.AllowedDestinations), nil
+		return slices.Clone(cr.Spec.AllowedDestinations), false, nil
 	}
 
 	out := make([]string, 0, 8)
@@ -799,9 +815,9 @@ func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirek
 	sort.Strings(out)
 
 	if degraded && len(cr.Status.AllowedDestinations) > 0 {
-		return slices.Clone(cr.Status.AllowedDestinations), nil
+		return slices.Clone(cr.Status.AllowedDestinations), true, nil
 	}
-	return out, nil
+	return out, degraded, nil
 }
 
 // gatewayServesPeer reports whether the ingress peer would actually hold a
@@ -811,16 +827,18 @@ func (r *Reconciler) effectiveAllowedDestinations(ctx context.Context, cr *wirek
 // would point it at an ingress that blackholes the traffic — strictly worse
 // than leaving the destination off the tunnel.
 //
-// The gateway's own peers are served even though clientRefs normally omits
-// them: the elected one carries the routes natively (collectGatewayCIDRsForPeer)
-// and a standby carries them the moment it is elected, so an external peer that
-// entered through a gateway node must not lose the route it is sitting on.
+// The elected gateway peer is served even though clientRefs normally omits it:
+// it carries the routes natively (collectGatewayCIDRsForPeer), so an external
+// peer that entered through the gateway node must not lose the route it is
+// sitting on. A standby in peerRefs is not served — only the elected peer has
+// the routes injected, so advertising through a standby would blackhole until
+// it happens to be elected.
 func gatewayServesPeer(gateway *wirekubev1alpha1.WireKubeGateway, peerName string) bool {
 	if len(gateway.Spec.ClientRefs) == 0 {
 		return true
 	}
 	return slices.Contains(gateway.Spec.ClientRefs, peerName) ||
-		slices.Contains(gateway.Spec.PeerRefs, peerName)
+		(gateway.Status.ActivePeer != "" && gateway.Status.ActivePeer == peerName)
 }
 
 // serviceCIDRGroupVersions are the API group/versions that have carried
