@@ -100,6 +100,31 @@ type Allocator struct {
 	MeshCIDR string
 }
 
+// Request describes the claim to make.
+type Request struct {
+	// Holder identifies who holds the claim. It is the name the reaper looks
+	// up to decide whether the claim is still answered for, so it has to be a
+	// WireKubePeer or WireKubeExternalPeer name — both of which are Kubernetes
+	// object names, and so safe to put in a label.
+	Holder string
+	// Name is the name the address derives from. It defaults to Holder, and
+	// differs only where WireKube itself derives from something else: an
+	// external peer's address comes from its display name, which is free-form
+	// text and must never be used as the holder. Deriving from the wrong one
+	// would renumber a peer that is already up.
+	Name string
+	// Preferred is the address the caller already holds, if any. It is taken
+	// when it is usable and free, so adopting the allocator renumbers nobody.
+	Preferred string
+}
+
+func (r Request) hashName() string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return r.Holder
+}
+
 // Result is a claimed address and how it was reached.
 type Result struct {
 	// Address is the claimed /32 in CIDR notation.
@@ -130,16 +155,19 @@ type Result struct {
 // A preferred address held by somebody else is not an error: the peer moves.
 // That is the case the allocator exists for, and refusing it would leave two
 // peers advertising the same /32 rather than fixing it.
-func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (Result, error) {
+func (a *Allocator) Allocate(ctx context.Context, request Request) (Result, error) {
 	if err := a.validate(); err != nil {
 		return Result{}, err
+	}
+	if request.Holder == "" {
+		return Result{}, fmt.Errorf("meshalloc: a claim needs a holder")
 	}
 	capacity, err := meship.Capacity(a.MeshCIDR)
 	if err != nil {
 		return Result{}, err
 	}
 
-	held, found, err := a.heldClaim(ctx, peerName, preferred)
+	held, found, err := a.heldClaim(ctx, request)
 	if err != nil {
 		return Result{}, err
 	}
@@ -147,8 +175,8 @@ func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (R
 		return held, nil
 	}
 
-	if preferred != "" && meship.Contains(preferred, a.MeshCIDR) {
-		result, claimed, err := a.claim(ctx, peerName, preferred, -1)
+	if request.Preferred != "" && meship.Contains(request.Preferred, a.MeshCIDR) {
+		result, claimed, err := a.claim(ctx, request.Holder, request.Preferred, -1)
 		if err != nil {
 			return Result{}, err
 		}
@@ -159,11 +187,11 @@ func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (R
 
 	probed := min(probeLimit, capacity)
 	for attempt := range probed {
-		address, err := meship.IPForNameAttempt(peerName, a.MeshCIDR, attempt)
+		address, err := meship.IPForNameAttempt(request.hashName(), a.MeshCIDR, attempt)
 		if err != nil {
 			return Result{}, err
 		}
-		result, claimed, err := a.claim(ctx, peerName, address, attempt)
+		result, claimed, err := a.claim(ctx, request.Holder, address, attempt)
 		if err != nil {
 			return Result{}, err
 		}
@@ -175,7 +203,7 @@ func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (R
 		// The walk is a permutation, so it has already tried every address.
 		return Result{}, fmt.Errorf("%w: %s holds %d addresses", ErrExhausted, a.MeshCIDR, capacity)
 	}
-	return a.allocateFromFreeList(ctx, peerName, capacity)
+	return a.allocateFromFreeList(ctx, request, capacity)
 }
 
 // heldClaim returns the claim peerName already holds, if any.
@@ -185,39 +213,53 @@ func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (R
 // stray behind, and nothing else would ever collect it: the reaper only
 // reclaims claims whose holder no longer exists. So the extras are released
 // here, where the holder is present and can say which one it kept.
-func (a *Allocator) heldClaim(ctx context.Context, peerName, preferred string) (Result, bool, error) {
-	claims, err := a.list(ctx, client.MatchingLabels{PeerLabel: labelSafe(peerName)})
+func (a *Allocator) heldClaim(ctx context.Context, request Request) (Result, bool, error) {
+	claims, err := a.list(ctx, client.MatchingLabels{PeerLabel: labelSafe(request.Holder)})
 	if err != nil {
 		return Result{}, false, err
 	}
-	mine := make([]*coordinationv1.Lease, 0, 1)
+	var mine, stale []*coordinationv1.Lease
 	for i := range claims.Items {
 		lease := &claims.Items[i]
-		// The label is truncated and therefore ambiguous; holderIdentity is
-		// the authoritative holder.
-		if holderOf(lease) == peerName && addressOf(lease) != "" {
+		// The label is lossy and therefore ambiguous; holderIdentity is the
+		// authoritative holder.
+		if holderOf(lease) != request.Holder || addressOf(lease) == "" {
+			continue
+		}
+		// A claim the mesh CIDR no longer covers is not an allocation, it is a
+		// leftover from the CIDR it was made under. Adopting it would hand back
+		// an address the mesh cannot route, and the caller would quietly fall
+		// back to an unclaimed one — a duplicate, which is the whole thing this
+		// package exists to prevent.
+		if meship.Contains(addressOf(lease), a.MeshCIDR) {
 			mine = append(mine, lease)
+		} else {
+			stale = append(stale, lease)
 		}
 	}
-	if len(mine) == 0 {
-		return Result{}, false, nil
-	}
 
-	keep := mine[0]
-	for _, lease := range mine[1:] {
-		if betterClaim(lease, keep, preferred) {
+	keep := (*coordinationv1.Lease)(nil)
+	for _, lease := range mine {
+		if keep == nil || betterClaim(lease, keep, request.Preferred) {
 			keep = lease
 		}
 	}
-	for _, lease := range mine {
+	// Release everything this holder should not be holding: the stale ones,
+	// and any duplicate beyond the one kept. Nothing else would collect the
+	// duplicates — the reaper only reclaims claims whose holder is gone — and
+	// here the holder is present and can say which one it kept.
+	for _, lease := range append(stale, mine...) {
 		if lease == keep {
 			continue
 		}
 		uid := lease.UID
 		if err := a.Client.Delete(ctx, lease, client.Preconditions{UID: &uid}); err != nil &&
 			!apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-			return Result{}, false, fmt.Errorf("release the duplicate claim on mesh address %s: %w", addressOf(lease), err)
+			return Result{}, false, fmt.Errorf("release the superseded claim on mesh address %s: %w", addressOf(lease), err)
 		}
+	}
+	if keep == nil {
+		return Result{}, false, nil
 	}
 	return Result{Address: addressOf(keep), Attempt: attemptOf(keep), Adopted: true}, true, nil
 }
@@ -247,20 +289,20 @@ func betterClaim(candidate, incumbent *coordinationv1.Lease, preferred string) b
 // The list can be stale by the time a create lands. That is fine — the create
 // is still the arbiter, and a lost race just advances to the next unclaimed
 // candidate.
-func (a *Allocator) allocateFromFreeList(ctx context.Context, peerName string, capacity int) (Result, error) {
+func (a *Allocator) allocateFromFreeList(ctx context.Context, request Request, capacity int) (Result, error) {
 	taken, err := a.claimedAddresses(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 	for attempt := range capacity {
-		address, err := meship.IPForNameAttempt(peerName, a.MeshCIDR, attempt)
+		address, err := meship.IPForNameAttempt(request.hashName(), a.MeshCIDR, attempt)
 		if err != nil {
 			return Result{}, err
 		}
 		if _, occupied := taken[address]; occupied {
 			continue
 		}
-		result, claimed, err := a.claim(ctx, peerName, address, attempt)
+		result, claimed, err := a.claim(ctx, request.Holder, address, attempt)
 		if err != nil {
 			return Result{}, err
 		}
@@ -307,17 +349,17 @@ func (a *Allocator) claim(ctx context.Context, peerName, address string, attempt
 // it never deletes a claim held by somebody else: an enrolment that is torn
 // down after its address was already reassigned must not take the new holder's
 // claim with it.
-func (a *Allocator) Release(ctx context.Context, peerName string) error {
+func (a *Allocator) Release(ctx context.Context, holder string) error {
 	if err := a.validate(); err != nil {
 		return err
 	}
-	claims, err := a.list(ctx, client.MatchingLabels{PeerLabel: labelSafe(peerName)})
+	claims, err := a.list(ctx, client.MatchingLabels{PeerLabel: labelSafe(holder)})
 	if err != nil {
 		return err
 	}
 	for i := range claims.Items {
 		lease := &claims.Items[i]
-		if holderOf(lease) != peerName {
+		if holderOf(lease) != holder {
 			continue
 		}
 		uid := lease.UID
@@ -434,15 +476,30 @@ func attemptOf(lease *coordinationv1.Lease) int {
 	return attempt
 }
 
-// labelSafe renders a peer name as a label value. Peer names are node names or
-// external-peer resource names, both of which already satisfy the 63-character
-// label limit, but the label is only a selector shortcut — holderIdentity is
-// the authoritative holder — so truncating is better than failing the create.
+// labelSafe renders a holder as a label value.
+//
+// It is lossy on purpose. A label value is at most 63 characters of
+// alphanumerics, '-', '_' and '.', and holders can be longer than that; two
+// holders that reduce to the same label is harmless, because the label is only
+// a selector shortcut and holderIdentity is what actually decides ownership.
+// Producing an invalid value is not harmless — it fails the create, and it
+// fails the *list* too, where an unparseable selector turns into an error that
+// looks nothing like the label that caused it.
 func labelSafe(name string) string {
-	if len(name) > 63 {
-		name = name[:63]
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			out = append(out, r)
+		default:
+			out = append(out, '-')
+		}
+		if len(out) == 63 {
+			break
+		}
 	}
-	// A label value must start and end alphanumeric, which a truncation can
-	// break.
-	return strings.Trim(name, "-_.")
+	// A label value must start and end alphanumeric. Trimming can empty it,
+	// which is still a valid value and still selects consistently.
+	return strings.Trim(string(out), "-_.")
 }

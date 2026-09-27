@@ -88,7 +88,7 @@ func TestReconcileAllocatorModeMovesOffAHeldAddress(t *testing.T) {
 	}
 	// A node got there first.
 	incumbent := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: testMeshCIDR}
-	if _, err := incumbent.Allocate(context.Background(), "some-node", contested); err != nil {
+	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{Holder: "some-node", Preferred: contested}); err != nil {
 		t.Fatal(err)
 	}
 

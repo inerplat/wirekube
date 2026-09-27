@@ -205,7 +205,7 @@ func TestAllocateMeshIPAdoptsAPreClaimedAddress(t *testing.T) {
 	mesh := allocatorMesh("198.18.18.0/24")
 	const preClaimed = "198.18.18.177/32"
 	enroller := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: mesh.Spec.MeshCIDR}
-	if _, err := enroller.Allocate(context.Background(), "worker1", preClaimed); err != nil {
+	if _, err := enroller.Allocate(context.Background(), meshalloc.Request{Holder: "worker1", Preferred: preClaimed}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -247,7 +247,7 @@ func TestUpsertOwnPeerRecordsTheAllocatedAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	incumbent := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: mesh.Spec.MeshCIDR}
-	if _, err := incumbent.Allocate(context.Background(), "squatter", contested); err != nil {
+	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{Holder: "squatter", Preferred: contested}); err != nil {
 		t.Fatal(err)
 	}
 
