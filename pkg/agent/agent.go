@@ -605,8 +605,8 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 		if createErr := a.client.Create(ctx, peer); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return fmt.Errorf("creating own WireKubePeer: %w", createErr)
 		}
-		if err := a.recordMeshIP(ctx, name, assigned); err != nil {
-			a.log.V(1).Info("recording mesh IP", "error", err, "peer", name)
+		if err := a.recordMeshIP(ctx, mesh, name, assigned); err != nil {
+			return err
 		}
 		if method != "" {
 			if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
@@ -639,8 +639,8 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
 		return fmt.Errorf("patching own WireKubePeer: %w", patchErr)
 	}
-	if err := a.recordMeshIP(ctx, name, assigned); err != nil {
-		a.log.V(1).Info("recording mesh IP", "error", err, "peer", name)
+	if err := a.recordMeshIP(ctx, mesh, name, assigned); err != nil {
+		return err
 	}
 	if method != "" {
 		if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
@@ -792,7 +792,11 @@ func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireK
 		MeshName:  mesh.Name,
 		MeshCIDR:  mesh.Spec.MeshCIDR,
 	}
-	result, err := allocator.Allocate(ctx, meshalloc.Request{Holder: peerName, Preferred: recorded})
+	result, err := allocator.Allocate(ctx, meshalloc.Request{
+		Holder:    meshalloc.HolderForPeer(peerName),
+		Name:      peerName,
+		Preferred: recorded,
+	})
 	if err != nil {
 		if recorded == "" {
 			return "", fmt.Errorf("claiming a mesh address for %s: %w", peerName, err)
@@ -824,12 +828,30 @@ func (a *Agent) claimNamespace() string {
 // peer, and only when the value actually changes, so a steady-state mesh does
 // not generate status traffic.
 //
-// A failure here is logged and not fatal: the address is already in AllowedIPs
-// and carrying traffic, and the next upsert retries the record.
-func (a *Agent) recordMeshIP(ctx context.Context, name, address string) error {
+// On a mesh that arbitrates addresses the record is load-bearing and a failure
+// is fatal to setup, which Run retries. Nothing re-enters this code path
+// otherwise — upsertOwnPeer runs once per process — so a peer moved off a
+// contested address would leave status.meshIP empty for the life of the pod,
+// and turning the allocator off after that would put it straight back onto the
+// address somebody else is using.
+//
+// On a hash mesh the record is only groundwork for that future switch, and the
+// operator's own check before flipping is what catches a gap, so a failure
+// there is logged rather than failing an enrollment that is otherwise fine.
+func (a *Agent) recordMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, name, address string) error {
 	if address == "" {
 		return nil
 	}
+	if err := a.patchMeshIP(ctx, name, address); err != nil {
+		if mesh != nil && mesh.Spec.UsesAddressAllocator() {
+			return fmt.Errorf("recording the mesh address of %s: %w", name, err)
+		}
+		a.log.Error(err, "recording mesh IP", "peer", name, "address", address)
+	}
+	return nil
+}
+
+func (a *Agent) patchMeshIP(ctx context.Context, name, address string) error {
 	peer := &wirekubev1alpha1.WireKubePeer{}
 	if err := a.client.Get(ctx, client.ObjectKey{Name: name}, peer); err != nil {
 		return err

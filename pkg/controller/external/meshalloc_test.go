@@ -3,6 +3,7 @@ package external
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -70,10 +71,12 @@ func TestReconcileAllocatorModeClaimsTheAddress(t *testing.T) {
 	if addr := claim.Annotations[meshalloc.AddressAnnotation]; addr != want {
 		t.Errorf("claim covers %s, want %s", addr, want)
 	}
-	// The claim is held under the display name, which is what the address
-	// derives from and what the reaper looks for.
-	if holder := *claim.Spec.HolderIdentity; holder != got.Spec.DisplayName {
-		t.Errorf("claim holder = %q, want the display name %q", holder, got.Spec.DisplayName)
+	// Held under the resource name, prefixed by its kind. The display name is
+	// only what the address derives from; using it as the holder would let a
+	// node of the same name adopt this claim.
+	wantHolder := meshalloc.HolderForExternalPeer(got.Name)
+	if holder := *claim.Spec.HolderIdentity; holder != wantHolder {
+		t.Errorf("claim holder = %q, want %q", holder, wantHolder)
 	}
 }
 
@@ -93,7 +96,9 @@ func TestReconcileAllocatorModeMovesOffAHeldAddress(t *testing.T) {
 	}
 	// A node got there first.
 	incumbent := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: testMeshCIDR}
-	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{Holder: "some-node", Preferred: contested}); err != nil {
+	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{
+		Holder: meshalloc.HolderForPeer("some-node"), Name: "some-node", Preferred: contested,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,14 +251,40 @@ func TestReconcileFailsTerminallyOnExhaustion(t *testing.T) {
 
 	filler := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: mesh.Spec.MeshCIDR}
 	for i := range 2 {
-		if _, err := filler.Allocate(context.Background(), meshalloc.Request{Holder: fmt.Sprintf("filler-%d", i)}); err != nil {
+		if _, err := filler.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer(fmt.Sprintf("filler-%d", i))}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
+	result := reconcileTwice(t, r, testExternalName)
+	// Pending, not Failed: the pool fills and empties, and the reaper frees
+	// addresses as peers go away, so this has to come back on its own.
+	if got := getCR(t, c, testExternalName).Status.Phase; got != wirekubev1alpha1.ExternalPeerPhasePending {
+		t.Errorf("phase = %q, want Pending on an exhausted mesh", got)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("an exhausted mesh was left with nothing to bring it back")
+	}
+	if cond := findCondition(getCR(t, c, testExternalName).Status.Conditions, conditionReady); !strings.Contains(cond.Message, "widen") {
+		t.Errorf("the condition does not say what to do: %q", cond.Message)
+	}
+}
+
+// TestReconcileFailsTerminallyOnAnUnusableCIDR is the other half: a mesh the
+// allocator cannot work with at all is a spec problem, and retrying it forever
+// would say nothing an operator can act on.
+func TestReconcileFailsTerminallyOnAnUnusableCIDR(t *testing.T) {
+	cr := newExternalPeer(testExternalName)
+	mesh := newAllocatorMesh()
+	// Syntactically valid for the CRD's regex, and unusable: a /31 has no
+	// assignable host range.
+	mesh.Spec.MeshCIDR = "198.18.18.0/31"
+	c := newFakeClient(t, cr, mesh, newIngressPeer())
+	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost), ClaimNamespace: "wirekube-system"}
+
 	reconcileTwice(t, r, testExternalName)
 	if got := getCR(t, c, testExternalName).Status.Phase; got != wirekubev1alpha1.ExternalPeerPhaseFailed {
-		t.Errorf("phase = %q, want Failed on an exhausted mesh", got)
+		t.Errorf("phase = %q, want Failed on a CIDR the allocator cannot use", got)
 	}
 }
 

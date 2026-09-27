@@ -186,9 +186,12 @@ a restart cannot drift it onto an address that has since been freed.
 
 Retries are bounded. After 32 probes the claims are listed once and the search
 becomes exact, which keeps the last free address in a `/24` holding 253 claims
-under 70 API calls instead of 253. When every address is claimed the enrolment
-fails with a terminal error rather than retrying; nothing frees up on its own,
-so widen `meshCIDR`.
+under 70 API calls instead of 253.
+
+When every address is claimed, an agent's enrolment fails and an external peer
+goes `Pending` with `MeshAddressesExhausted` and keeps retrying, since the
+sweep frees addresses as peers go away. Neither recovers on its own if the
+fleet is simply larger than the CIDR, so widen `meshCIDR`.
 
 The winning candidate index is recorded in the `wirekube.io/attempt` annotation
 on the claim. A fleet where that is routinely non-zero is running close enough
