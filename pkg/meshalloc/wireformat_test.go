@@ -131,3 +131,24 @@ func TestValidateRejectsAMeshNameThatCannotLabelClaims(t *testing.T) {
 		}
 	}
 }
+
+// TestHolderIdentitiesAreNamespacedByKind. WireKubePeer and
+// WireKubeExternalPeer are both cluster-scoped, and "wirekubectl invite alice"
+// names the external peer after its display name, so a node called alice is
+// all it takes for the two to share a name. Unprefixed, the external peer
+// finds the node's claim, sees its own holder identity on it, adopts it, and
+// the two advertise one address.
+//
+// Idlectl reproduces these prefixes, so they are wire format, not an
+// implementation detail.
+func TestHolderIdentitiesAreNamespacedByKind(t *testing.T) {
+	if got := HolderForPeer("alice"); got != "wirekubepeer/alice" {
+		t.Errorf("HolderForPeer = %q", got)
+	}
+	if got := HolderForExternalPeer("alice"); got != "wirekubeexternalpeer/alice" {
+		t.Errorf("HolderForExternalPeer = %q", got)
+	}
+	if HolderForPeer("alice") == HolderForExternalPeer("alice") {
+		t.Error("a node and an external peer with one name share a holder identity")
+	}
+}

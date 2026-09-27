@@ -86,6 +86,12 @@ const (
 // CIDR has to be widened.
 var ErrExhausted = errors.New("meshalloc: every address in the mesh CIDR is claimed")
 
+// ErrInvalidMesh reports that the allocator cannot work with this mesh at all:
+// an unparseable or too-small CIDR, a mesh name that cannot name or label a
+// claim, a missing client. Retrying changes nothing, so callers must not treat
+// it as the API server having a bad moment.
+var ErrInvalidMesh = errors.New("meshalloc: the mesh cannot be allocated from")
+
 // Allocator claims mesh addresses as Leases in a single namespace.
 type Allocator struct {
 	// Client creates and deletes the claim Leases.
@@ -168,11 +174,11 @@ func (a *Allocator) Allocate(ctx context.Context, request Request) (Result, erro
 		return Result{}, err
 	}
 	if request.Holder == "" {
-		return Result{}, fmt.Errorf("meshalloc: a claim needs a holder")
+		return Result{}, fmt.Errorf("%w: a claim needs a holder", ErrInvalidMesh)
 	}
 	capacity, err := meship.Capacity(a.MeshCIDR)
 	if err != nil {
-		return Result{}, err
+		return Result{}, fmt.Errorf("%w: %s", ErrInvalidMesh, err)
 	}
 
 	held, found, err := a.heldClaim(ctx, request)
@@ -434,25 +440,25 @@ func (a *Allocator) leaseFor(peerName, address string, attempt int) *coordinatio
 
 func (a *Allocator) validate() error {
 	if a.Client == nil {
-		return fmt.Errorf("meshalloc: no client configured")
+		return fmt.Errorf("%w: no client configured", ErrInvalidMesh)
 	}
 	if a.Namespace == "" {
-		return fmt.Errorf("meshalloc: no namespace configured for address claims")
+		return fmt.Errorf("%w: no namespace configured for address claims", ErrInvalidMesh)
 	}
 	if a.MeshName == "" {
-		return fmt.Errorf("meshalloc: no mesh name configured")
+		return fmt.Errorf("%w: no mesh name configured", ErrInvalidMesh)
 	}
 	if a.MeshCIDR == "" {
-		return fmt.Errorf("meshalloc: the mesh does not set spec.meshCIDR")
+		return fmt.Errorf("%w: it does not set spec.meshCIDR", ErrInvalidMesh)
 	}
 	// The mesh name goes into the claim's name and into a label value, and it
 	// is checked once here rather than at each create because the API server's
 	// own rejection names a requirement rather than the mesh behind it.
 	if longest := ClaimName(a.MeshName, "255.255.255.255/32"); len(longest) > validation.DNS1123SubdomainMaxLength {
-		return fmt.Errorf("meshalloc: mesh name %q is too long to name address claims", a.MeshName)
+		return fmt.Errorf("%w: mesh name %q is too long to name address claims", ErrInvalidMesh, a.MeshName)
 	}
 	for _, problem := range validation.IsValidLabelValue(a.MeshName) {
-		return fmt.Errorf("meshalloc: mesh name %q cannot label address claims: %s", a.MeshName, problem)
+		return fmt.Errorf("%w: mesh name %q cannot label address claims: %s", ErrInvalidMesh, a.MeshName, problem)
 	}
 	return nil
 }
@@ -465,6 +471,25 @@ func (a *Allocator) reader() client.Reader {
 	}
 	return a.Client
 }
+
+// Holder identities are prefixed by the kind that owns them.
+//
+// WireKubePeer and WireKubeExternalPeer are both cluster-scoped, so one name
+// can legally exist as both — and "wirekubectl invite alice" names the
+// external peer after its display name, so a node called alice is all it
+// takes. Unprefixed, the external peer would find the node's claim, see its
+// own holder identity on it, adopt it, and the two would advertise one
+// address. The prefix is what keeps the two namespaces of names apart.
+const (
+	peerHolderPrefix         = "wirekubepeer/"
+	externalPeerHolderPrefix = "wirekubeexternalpeer/"
+)
+
+// HolderForPeer is the claim holder identity of a WireKubePeer.
+func HolderForPeer(name string) string { return peerHolderPrefix + name }
+
+// HolderForExternalPeer is the claim holder identity of a WireKubeExternalPeer.
+func HolderForExternalPeer(name string) string { return externalPeerHolderPrefix + name }
 
 // ClaimName is the Lease name that arbitrates address within mesh. Two callers
 // racing for one address must compute the same name or the arbitration does

@@ -734,3 +734,33 @@ func TestAllocateReadsThroughTheUncachedReader(t *testing.T) {
 		t.Error("the conflict read did not go through the reader")
 	}
 }
+
+// TestAllocateSeparatesPeerKinds. A node and an external peer can legally
+// share a name. Without the kind in the holder identity the second one finds
+// the first's claim, recognises its own holder on it, adopts it, and the mesh
+// has two peers on one address — arrived at through the allocator rather than
+// in spite of it.
+func TestAllocateSeparatesPeerKinds(t *testing.T) {
+	a := newAllocator(t, "198.18.18.0/24")
+	node, err := a.Allocate(context.Background(), meshalloc.Request{
+		Holder: meshalloc.HolderForPeer("alice"), Name: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	external, err := a.Allocate(context.Background(), meshalloc.Request{
+		Holder: meshalloc.HolderForExternalPeer("alice"), Name: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if external.Address == node.Address {
+		t.Fatalf("the external peer adopted the node's claim on %s", node.Address)
+	}
+	if external.Adopted {
+		t.Error("the external peer reported the node's claim as its own")
+	}
+	if n := countClaims(t, a.Namespace); n != 2 {
+		t.Errorf("%d claims, want one per peer", n)
+	}
+}

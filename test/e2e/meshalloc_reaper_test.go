@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,7 +94,7 @@ func (f *reaperFixture) addPeer(name string) *wirekubev1alpha1.WireKubePeer {
 func TestReaperKeepsAClaimWhosePeerExists(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(72 * time.Hour)
@@ -109,7 +110,7 @@ func TestReaperKeepsAClaimWhosePeerExists(t *testing.T) {
 // machine that is still booting.
 func TestReaperGivesAnEnrolmentItsGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "enrolling"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("enrolling"), Name: "enrolling"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -132,7 +133,7 @@ func TestReaperGivesAnEnrolmentItsGrace(t *testing.T) {
 
 func TestReaperReclaimsAnOrphanAfterTheGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("abandoned"), Name: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -149,7 +150,7 @@ func TestReaperReclaimsAnOrphanAfterTheGrace(t *testing.T) {
 func TestReaperGraceRunsFromTheDisappearance(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	peer := f.addPeer("long-lived")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "long-lived"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("long-lived"), Name: "long-lived"}); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(30 * 24 * time.Hour)
@@ -175,10 +176,10 @@ func TestReaperGraceRunsFromTheDisappearance(t *testing.T) {
 // long default.
 func TestReaperHonoursAClaimsOwnGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "slow-enrolment"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("slow-enrolment"), Name: "slow-enrolment"}); err != nil {
 		t.Fatal(err)
 	}
-	setLeaseDuration(t, f.allocator.Namespace, "slow-enrolment", 3600)
+	setLeaseDuration(t, f.allocator.Namespace, meshalloc.HolderForPeer("slow-enrolment"), 3600)
 
 	f.sweep()
 	f.advance(30 * time.Minute) // well past the reaper's 10-minute default
@@ -199,7 +200,7 @@ func TestReaperHonoursAClaimsOwnGrace(t *testing.T) {
 func TestReaperReclaimsAnAddressOutsideTheCIDR(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("resident")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "resident"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("resident"), Name: "resident"}); err != nil {
 		t.Fatal(err)
 	}
 	// The operator moves the mesh to a different range.
@@ -235,7 +236,7 @@ func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), external) })
 
 	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{
-		Holder: external.Name,
+		Holder: meshalloc.HolderForExternalPeer(external.Name),
 		Name:   external.Spec.DisplayName,
 	}); err != nil {
 		t.Fatal(err)
@@ -252,7 +253,7 @@ func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 // reclaiming is that the address goes back into the pool.
 func TestReaperReclaimedAddressIsReusable(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	held, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"})
+	held, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("abandoned"), Name: "abandoned"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +274,7 @@ func TestReaperReclaimedAddressIsReusable(t *testing.T) {
 // early one.
 func TestReaperSurvivesALeaderChange(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("abandoned"), Name: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -300,12 +301,31 @@ func TestReaperSurvivesALeaderChange(t *testing.T) {
 	}
 }
 
+// labelSafe mirrors the allocator's own reduction, because the peer label is
+// lossy and a test selecting on the raw holder would find nothing.
+func labelSafe(name string) string {
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			out = append(out, r)
+		default:
+			out = append(out, '-')
+		}
+		if len(out) == 63 {
+			break
+		}
+	}
+	return strings.Trim(string(out), "-_.")
+}
+
 func setLeaseDuration(t *testing.T, namespace, peer string, seconds int32) {
 	t.Helper()
 	claims := &coordinationv1.LeaseList{}
 	if err := k8sClient.List(context.Background(), claims,
 		client.InNamespace(namespace),
-		client.MatchingLabels{meshalloc.ClaimLabel: meshalloc.ClaimAddress, meshalloc.PeerLabel: peer}); err != nil {
+		client.MatchingLabels{meshalloc.ClaimLabel: meshalloc.ClaimAddress, meshalloc.PeerLabel: labelSafe(peer)}); err != nil {
 		t.Fatal(err)
 	}
 	if len(claims.Items) != 1 {
@@ -324,7 +344,7 @@ func setLeaseDuration(t *testing.T, namespace, peer string, seconds int32) {
 func TestReaperWithdrawsTheSeriesOfADeletedMesh(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -397,7 +417,7 @@ func metricExists(t *testing.T, name, mesh string) bool {
 func TestReaperWaitsOutAMissingMesh(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -430,7 +450,7 @@ func TestReaperWaitsOutAMissingMesh(t *testing.T) {
 func TestReaperReclaimsAfterTheMeshStaysGone(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -452,7 +472,7 @@ func TestReaperReclaimsAfterTheMeshStaysGone(t *testing.T) {
 // invited an external peer under that node's name.
 func TestReaperDoesNotTreatADisplayNameAsAHolder(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	external := &wirekubev1alpha1.WireKubeExternalPeer{

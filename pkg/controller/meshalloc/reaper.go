@@ -285,7 +285,7 @@ func (r *Reaper) peerNames(ctx context.Context) (map[string]struct{}, error) {
 	}
 	names := make(map[string]struct{}, len(peers.Items))
 	for i := range peers.Items {
-		names[peers.Items[i].Name] = struct{}{}
+		names[meshalloc.HolderForPeer(peers.Items[i].Name)] = struct{}{}
 	}
 
 	external := &wirekubev1alpha1.WireKubeExternalPeerList{}
@@ -293,13 +293,13 @@ func (r *Reaper) peerNames(ctx context.Context) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("list WireKubeExternalPeer: %w", err)
 	}
 	for i := range external.Items {
-		// Only the resource name. An external peer's address derives from its
-		// display name, but the claim is held under the resource name, so
-		// adding display names would protect nothing and would widen the set
-		// with operator-supplied text: a peer whose display name happens to
-		// match a decommissioned node would keep that node's orphaned claim
-		// alive forever, which is the one thing this sweep exists to collect.
-		names[external.Items[i].Name] = struct{}{}
+		// The resource name, under the external-peer prefix. Not the display
+		// name: the claim is not held under it, so adding it would protect
+		// nothing while widening the set with operator-supplied text, and a
+		// peer whose display name happened to match a decommissioned node
+		// would keep that node's orphaned claim alive forever — the one thing
+		// this sweep exists to collect.
+		names[meshalloc.HolderForExternalPeer(external.Items[i].Name)] = struct{}{}
 	}
 	return names, nil
 }
