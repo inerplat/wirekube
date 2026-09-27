@@ -28,7 +28,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 
@@ -148,7 +147,7 @@ func (a *Allocator) Allocate(ctx context.Context, peerName, preferred string) (R
 		return held, nil
 	}
 
-	if preferred != "" && withinMesh(preferred, a.MeshCIDR) {
+	if preferred != "" && meship.Contains(preferred, a.MeshCIDR) {
 		result, claimed, err := a.claim(ctx, peerName, preferred, -1)
 		if err != nil {
 			return Result{}, err
@@ -403,30 +402,6 @@ func (a *Allocator) validate() error {
 		return fmt.Errorf("meshalloc: mesh name %q is too long to name address claims", a.MeshName)
 	}
 	return nil
-}
-
-// withinMesh reports whether address is a host address meshCIDR can hand out.
-func withinMesh(address, meshCIDR string) bool {
-	ip, ipnet, err := net.ParseCIDR(address)
-	if err != nil {
-		return false
-	}
-	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
-		return false
-	}
-	_, mesh, err := net.ParseCIDR(meshCIDR)
-	if err != nil || !mesh.Contains(ip) {
-		return false
-	}
-	ip4, base := ip.To4(), mesh.IP.To4()
-	if ip4 == nil || base == nil || ip4.Equal(base) {
-		return false
-	}
-	broadcast := make(net.IP, 4)
-	for i := range broadcast {
-		broadcast[i] = base[i] | ^mesh.Mask[i]
-	}
-	return !ip4.Equal(broadcast)
 }
 
 // ClaimName is the Lease name that arbitrates address within mesh. Two callers
