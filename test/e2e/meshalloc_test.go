@@ -664,3 +664,73 @@ func claimHolder(t *testing.T, namespace, address, mesh string) string {
 	}
 	return *lease.Spec.HolderIdentity
 }
+
+// readerOnly counts reads and refuses to be a writer, so a test can prove
+// which of the two clients an allocation actually reads through.
+type readerOnly struct {
+	client.Reader
+	gets  int
+	lists int
+}
+
+func (r *readerOnly) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	r.gets++
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func (r *readerOnly) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	r.lists++
+	return r.Reader.List(ctx, list, opts...)
+}
+
+// blindClient fails every read, so a test fails loudly if the allocator reads
+// through the write client instead of the reader it was given.
+type blindClient struct {
+	client.Client
+}
+
+func (c blindClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return errors.New("read through the write client, which may be cached")
+}
+
+func (c blindClient) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return errors.New("read through the write client, which may be cached")
+}
+
+// TestAllocateReadsThroughTheUncachedReader. Every read that decides an
+// allocation has to bypass the cache. A cached Get after an AlreadyExists can
+// still be serving the previous holder of an address that has since changed
+// hands, and this caller would conclude the claim is its own and publish an
+// address another peer holds.
+func TestAllocateReadsThroughTheUncachedReader(t *testing.T) {
+	namespace := allocNamespace(t)
+	reader := &readerOnly{Reader: k8sClient}
+	a := &meshalloc.Allocator{
+		Client:    blindClient{k8sClient},
+		Reader:    reader,
+		Namespace: namespace,
+		MeshName:  "default",
+		MeshCIDR:  "198.18.18.0/24",
+	}
+	held, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
+	if err != nil {
+		t.Fatalf("Allocate read through the write client: %v", err)
+	}
+	if reader.lists == 0 {
+		t.Error("the adoption list did not go through the reader")
+	}
+
+	// Force the Get-after-AlreadyExists, which is the read that decides
+	// whether a contested claim is ours.
+	before := reader.gets
+	second, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker2", Preferred: held.Address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Address == held.Address {
+		t.Fatalf("worker2 took %s, which worker1 holds", held.Address)
+	}
+	if reader.gets == before {
+		t.Error("the conflict read did not go through the reader")
+	}
+}

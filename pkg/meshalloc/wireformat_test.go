@@ -1,6 +1,7 @@
 package meshalloc
 
 import (
+	"strings"
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -92,5 +93,41 @@ func TestValidateRejectsAMeshNameThatCannotNameClaims(t *testing.T) {
 	}
 	if len(ClaimName("default", "255.255.255.255/32")) > 253 {
 		t.Error("the default mesh name already overflows the object-name limit")
+	}
+}
+
+// TestValidateRejectsAMeshNameThatCannotLabelClaims. The mesh name is a label
+// value as well as part of the claim name, and the two limits are far apart:
+// a 100-character name names a claim perfectly well and then fails every
+// create and every list with an error that mentions neither the mesh nor the
+// field.
+func TestValidateRejectsAMeshNameThatCannotLabelClaims(t *testing.T) {
+	for _, mesh := range []string{
+		strings.Repeat("x", 64),
+		strings.Repeat("x", 200),
+		"has spaces",
+		"-leading-dash",
+		"trailing-dash-",
+	} {
+		a := &Allocator{
+			Client:    fake.NewClientBuilder().Build(),
+			Namespace: "wirekube-system",
+			MeshName:  mesh,
+			MeshCIDR:  "198.18.18.0/24",
+		}
+		if err := a.validate(); err == nil {
+			t.Errorf("mesh name %q was accepted but cannot label a claim", mesh)
+		}
+	}
+	for _, mesh := range []string{"default", "prod", strings.Repeat("x", 63)} {
+		a := &Allocator{
+			Client:    fake.NewClientBuilder().Build(),
+			Namespace: "wirekube-system",
+			MeshName:  mesh,
+			MeshCIDR:  "198.18.18.0/24",
+		}
+		if err := a.validate(); err != nil {
+			t.Errorf("mesh name %q was rejected: %v", mesh, err)
+		}
 	}
 }

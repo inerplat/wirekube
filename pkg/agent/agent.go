@@ -596,7 +596,11 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 				PersistentKeepalive: defaultPeerKeepaliveSeconds,
 			},
 		}
-		assigned := applyMeshIP(a.log, mesh, name, a.allocateMeshIP(ctx, mesh, name, ""), &peer.Spec)
+		claimed, err := a.allocateMeshIP(ctx, mesh, name, "")
+		if err != nil {
+			return err
+		}
+		assigned := applyMeshIP(a.log, mesh, name, claimed, &peer.Spec)
 		applyNodeInternalIP(a.log, mesh, node, &peer.Spec)
 		if createErr := a.client.Create(ctx, peer); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return fmt.Errorf("creating own WireKubePeer: %w", createErr)
@@ -625,7 +629,11 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if !hasNodeOwnerReference(existing.OwnerReferences, node) {
 		existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
 	}
-	assigned := applyMeshIP(a.log, mesh, name, a.allocateMeshIP(ctx, mesh, name, existing.Status.MeshIP), &existing.Spec)
+	claimed, err := a.allocateMeshIP(ctx, mesh, name, existing.Status.MeshIP)
+	if err != nil {
+		return err
+	}
+	assigned := applyMeshIP(a.log, mesh, name, claimed, &existing.Spec)
 	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
 	existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
@@ -764,15 +772,19 @@ func containsString(items []string, value string) bool {
 // mesh keeps the address it is advertising rather than being renumbered the
 // moment the switch is flipped.
 //
-// An allocator failure falls back to recorded rather than to the name hash.
-// The hash is where a collision would put two peers in the first place, and an
-// API error is exactly when the peer cannot check whether that is the case, so
-// keeping the address it already has is the only safe answer. A peer with no
-// record yet gets "" and applyMeshIP derives the hash, which is what it would
-// have done anyway.
-func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, peerName, recorded string) string {
+// An allocator failure falls back to recorded, never to the name hash. The
+// hash is where a collision would put two peers in the first place, and an API
+// error is exactly when the peer cannot check whether that is the case, so
+// keeping the address it already holds is the only safe answer.
+//
+// A peer with nothing recorded has no safe answer, so the error is returned.
+// Falling through to the hash there would park the node on an address nobody
+// claimed: this runs once per agent process, from setup, so nothing would
+// revisit the decision until the pod restarts. Returning the error instead
+// fails setup, which Run retries with backoff.
+func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, peerName, recorded string) (string, error) {
 	if mesh == nil || !mesh.Spec.UsesAddressAllocator() {
-		return recorded
+		return recorded, nil
 	}
 	allocator := &meshalloc.Allocator{
 		Client:    a.client,
@@ -782,15 +794,18 @@ func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireK
 	}
 	result, err := allocator.Allocate(ctx, meshalloc.Request{Holder: peerName, Preferred: recorded})
 	if err != nil {
+		if recorded == "" {
+			return "", fmt.Errorf("claiming a mesh address for %s: %w", peerName, err)
+		}
 		a.log.Error(err, "claiming a mesh address; keeping the recorded one",
 			"peer", peerName, "recorded", recorded)
-		return recorded
+		return recorded, nil
 	}
 	if recorded != "" && result.Address != recorded {
 		a.log.Info("mesh address reassigned: another peer holds the recorded one",
 			"peer", peerName, "was", recorded, "now", result.Address, "attempt", result.Attempt)
 	}
-	return result.Address
+	return result.Address, nil
 }
 
 // claimNamespace is where address claims live. It is the namespace the agent

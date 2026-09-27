@@ -116,7 +116,12 @@ func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.Wi
 		namespace = defaultClaimNamespace
 	}
 	allocator := &meshalloc.Allocator{
-		Client:    r.Client,
+		Client: r.Client,
+		// The manager's client reads Leases through an informer, and a claim
+		// has to be read as it is, not as the cache last saw it: a stale read
+		// of a released claim would make this reconcile adopt an address
+		// another peer now holds.
+		Reader:    r.APIReader,
 		Namespace: namespace,
 		MeshName:  mesh.Name,
 		MeshCIDR:  mesh.Spec.MeshCIDR,

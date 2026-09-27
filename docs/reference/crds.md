@@ -179,18 +179,20 @@ the case. For a `/24` the bound is around 16 names; for a `/10`, around 2048.
 
 Under `allocator`:
 
-- **Nobody is renumbered by turning it on.** The first candidate is the hashed
-  address, and the peer's existing `status.meshIP` is preferred over it, so an
-  uncontended mesh keeps every address exactly where it was.
-- **The address is sticky.** A peer adopts the claim it already holds before
-  anything is written, so a restart cannot drift it onto an address that has
-  since been freed.
-- **Retries are bounded.** After 32 probes the claims are listed once and the
-  search becomes exact, so the last free address in a full `/24` costs a
-  measured 67 API calls rather than 253.
-- **Exhaustion is reported, not retried.** When every address is claimed the
-  enrolment fails with a terminal error. Nothing frees up on its own; widen
-  `meshCIDR`.
+Turning it on renumbers nobody: the first candidate is the hashed address, and
+a peer's existing `status.meshIP` is preferred over it. Allocation is sticky,
+because a peer adopts the claim it already holds before anything is written, so
+a restart cannot drift it onto an address that has since been freed.
+
+Retries are bounded. After 32 probes the claims are listed once and the search
+becomes exact, which keeps the last free address in a `/24` holding 253 claims
+under 70 API calls instead of 253. When every address is claimed the enrolment
+fails with a terminal error rather than retrying; nothing frees up on its own,
+so widen `meshCIDR`.
+
+The winning candidate index is recorded in the `wirekube.io/attempt` annotation
+on the claim. A fleet where that is routinely non-zero is running close enough
+to full that the CIDR wants widening.
 
 Claims are `Lease` objects in the namespace WireKube runs in, labelled
 `wirekube.io/claim=address`:
@@ -202,12 +204,19 @@ wirekube-default-198-18-18-74    master    31d
 wirekube-default-198-18-18-83    worker1   31d
 ```
 
-They carry no `ownerReference` on purpose: an enrolment tool claims an address
-*before* the node that will advertise it exists, and garbage collection would
-delete a claim whose owner is not there yet. A leader-elected sweep collects
-them instead, once no peer has answered for the holder for 15 minutes (or for
-`spec.leaseDurationSeconds`, if the claim sets one), or at once if `meshCIDR`
-has moved out from under the address.
+The namespace is where the agent runs; `wirekube-system` is only the default.
+
+Claims carry no `ownerReference` on purpose: an enrolment tool claims an
+address *before* the node that will advertise it exists, and garbage collection
+would delete a claim whose owner is not there yet. A leader-elected sweep
+collects them instead, once no peer has answered for the holder for 15 minutes
+(or for `spec.leaseDurationSeconds`, if the claim sets one), or at once if
+`meshCIDR` has moved out from under the address.
+
+Going back to `hash` is safe and is not a rollback of the addresses: peers keep
+what they were allocated, because the agent still honours `status.meshIP` over
+the name hash. The claims are then no longer consulted, and the sweep collects
+each one as its holder goes away.
 
 #### Turning it on
 
