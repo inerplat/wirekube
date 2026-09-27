@@ -93,6 +93,18 @@ The agent exposes Prometheus metrics on `:9090/metrics`. The provided Service se
 | `wirekube_peer_endpoint_type` | Gauge | source, peer | Where the WG endpoint points (0=none, 1=direct address, 2=relay loopback proxy) |
 | `wirekube_node_nat_type` | Gauge | node | NAT type (0=unknown, 1=cone, 2=symmetric, 3=port-restricted-cone, 4=open) |
 | `wirekube_peers_total` | Gauge | — | Total WireKubePeer count |
+| `wirekube_mesh_addresses_capacity` | Gauge | mesh | Usable host addresses in `meshCIDR` |
+| `wirekube_mesh_addresses_allocated` | Gauge | mesh | Mesh addresses currently claimed |
+| `wirekube_mesh_addresses_free` | Gauge | mesh | Mesh addresses still available. Nothing frees up on its own, so alert well before zero |
+
+The three `wirekube_mesh_addresses_*` series come from the leader-elected sweep, not from each agent. They carry no `source` label and are exposed by exactly one agent Pod at a time, so scrape them across the DaemonSet rather than from a named Pod. They are published only for a mesh with `spec.addressAllocation: allocator`; a mesh that does not arbitrate has no claims to count.
+
+Exhaustion is terminal — the mesh CIDR has to be widened — and collisions start long before the pool is full, so alert with room to act:
+
+```
+min(wirekube_mesh_addresses_free) by (mesh)
+  / min(wirekube_mesh_addresses_capacity) by (mesh) < 0.2
+```
 | `wirekube_relayed_peers_total` | Gauge | — | Peers currently using relay |
 | `wirekube_direct_peers_total` | Gauge | — | Peers currently using direct P2P |
 | `wirekube_peer_ice_state` | Gauge | source, peer | ICE state (0=relay, 1=gathering, 2=checking, 3=connected, 4=birthday, 5=failed) |
