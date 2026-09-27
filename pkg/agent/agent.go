@@ -692,7 +692,7 @@ func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName,
 		return ""
 	}
 	meshIP := recorded
-	if meshIP == "" || !withinMesh(meshIP, mesh.Spec.MeshCIDR) {
+	if meshIP == "" || !meship.Contains(meshIP, mesh.Spec.MeshCIDR) {
 		if meshIP != "" {
 			log.Info("recorded mesh IP is not inside the mesh CIDR, re-deriving from the peer name",
 				"peer", peerName, "recorded", meshIP, "meshCIDR", mesh.Spec.MeshCIDR)
@@ -717,36 +717,6 @@ func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName,
 	}
 	spec.AllowedIPs = append([]string{meshIP}, extra...)
 	return meshIP
-}
-
-// withinMesh reports whether address is a single host address ("a.b.c.d/32")
-// that meshCIDR can actually hand out. The network and broadcast addresses are
-// inside the CIDR but are not assignable, and meship never returns them, so a
-// recorded value landing on either is treated as stale rather than honoured.
-func withinMesh(address, meshCIDR string) bool {
-	ip, ipnet, err := net.ParseCIDR(address)
-	if err != nil {
-		return false
-	}
-	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
-		return false
-	}
-	_, mesh, err := net.ParseCIDR(meshCIDR)
-	if err != nil || !mesh.Contains(ip) {
-		return false
-	}
-	ip4, base := ip.To4(), mesh.IP.To4()
-	if ip4 == nil || base == nil {
-		return false
-	}
-	if ip4.Equal(base) {
-		return false
-	}
-	broadcast := make(net.IP, 4)
-	for i := range broadcast {
-		broadcast[i] = base[i] | ^mesh.Mask[i]
-	}
-	return !ip4.Equal(broadcast)
 }
 
 // applyNodeInternalIP, when WireKubeMesh.spec.autoAllowedIPs.includeNodeInternalIP

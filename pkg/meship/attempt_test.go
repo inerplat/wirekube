@@ -237,3 +237,51 @@ func broadcastOf(ipnet *net.IPNet) net.IP {
 	}
 	return out
 }
+
+func TestContains(t *testing.T) {
+	for _, c := range []struct {
+		address string
+		want    bool
+	}{
+		{"198.18.18.1/32", true},
+		{"198.18.18.254/32", true},
+		{"198.18.18.0/32", false},   // the network address
+		{"198.18.18.255/32", false}, // the broadcast address
+		{"198.18.19.1/32", false},   // outside
+		{"198.18.18.1/24", false},   // not a host address
+		{"198.18.18.1", false},      // no prefix length
+		{"198.18.18.1/32 ", false},  // trailing space
+		{"fd00::1/128", false},      // IPv6
+		{"", false},
+	} {
+		if got := Contains(c.address, liveMesh); got != c.want {
+			t.Errorf("Contains(%q, %q) = %v, want %v", c.address, liveMesh, got, c.want)
+		}
+	}
+	for _, meshCIDR := range []string{"", "not-a-cidr", "fd00::/64", "10.0.0.0/31"} {
+		if Contains("198.18.18.1/32", meshCIDR) {
+			t.Errorf("Contains accepted mesh CIDR %q", meshCIDR)
+		}
+	}
+}
+
+// TestContainsAcceptsEveryAddressTheWalkProduces is the invariant that ties
+// the two halves together: a recorded address is rejected as stale only when
+// the walk could not have produced it.
+func TestContainsAcceptsEveryAddressTheWalkProduces(t *testing.T) {
+	for _, cidr := range []string{"10.0.0.0/30", "10.1.2.0/28", "192.168.7.0/24", "172.16.0.0/20"} {
+		capacity, err := Capacity(cidr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for attempt := range capacity {
+			address, err := IPForNameAttempt("alice", cidr, attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !Contains(address, cidr) {
+				t.Fatalf("attempt %d in %s produced %s, which Contains rejects", attempt, cidr, address)
+			}
+		}
+	}
+}

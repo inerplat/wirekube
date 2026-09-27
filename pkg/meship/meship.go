@@ -88,6 +88,34 @@ func Capacity(meshCIDR string) (int, error) {
 	return int(size - 2), nil
 }
 
+// Contains reports whether address is a host address that meshCIDR can hand
+// out — the inverse question to IPForNameAttempt, and the check every caller
+// needs before honouring a recorded or requested address.
+//
+// It is stricter than net.IPNet.Contains: the network and broadcast addresses
+// are inside the CIDR but are not assignable, and IPForNameAttempt never
+// returns them, so an address landing on either did not come from here and
+// must not be treated as though it had.
+func Contains(address, meshCIDR string) bool {
+	ip, ipnet, err := net.ParseCIDR(address)
+	if err != nil {
+		return false
+	}
+	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
+		return false
+	}
+	base, size, err := parseMesh(meshCIDR)
+	if err != nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	value := uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+	return value > base && value < base+size-1
+}
+
 // parseMesh validates meshCIDR and returns its network address as a 32-bit
 // integer along with the size of its address space.
 func parseMesh(meshCIDR string) (base, size uint32, err error) {

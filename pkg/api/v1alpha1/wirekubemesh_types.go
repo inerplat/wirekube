@@ -55,6 +55,24 @@ type WireKubeMeshSpec struct {
 	// +kubebuilder:validation:Pattern=`^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$`
 	MeshCIDR string `json:"meshCIDR,omitempty"`
 
+	// AddressAllocation selects how a peer's mesh address is chosen.
+	//
+	// "hash" (the default) is the historical behaviour: the address is a hash
+	// of the peer name reduced into MeshCIDR, computed independently by every
+	// agent. It needs no coordination but is not collision-free, and two names
+	// that land on the same /32 both advertise it.
+	//
+	// "allocator" keeps the hash as the first choice and arbitrates conflicts
+	// through Lease claims, so a second claimant moves to another address
+	// instead. It is not the default because it must not be turned on until
+	// every agent in the fleet honours WireKubePeer.status.meshIP — an older
+	// agent would keep forcing the hash back and fight the allocation. Flip it
+	// once the rollout has converged.
+	// +optional
+	// +kubebuilder:validation:Enum=hash;allocator
+	// +kubebuilder:default=hash
+	AddressAllocation string `json:"addressAllocation,omitempty"`
+
 	// ServiceCIDRs pins the Service ClusterIP range(s) advertised to
 	// external peers. When empty the controller discovers them from the
 	// cluster's ServiceCIDR objects (networking.k8s.io), which every
@@ -362,4 +380,19 @@ type WireKubeMeshList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []WireKubeMesh `json:"items"`
+}
+
+// Address allocation modes for WireKubeMeshSpec.AddressAllocation.
+const (
+	// AddressAllocationHash derives each peer's address from its name alone.
+	AddressAllocationHash = "hash"
+	// AddressAllocationAllocator arbitrates addresses through Lease claims.
+	AddressAllocationAllocator = "allocator"
+)
+
+// UsesAddressAllocator reports whether this mesh arbitrates addresses through
+// claims. An empty value means the field predates the allocator, which is the
+// same thing as opting out of it.
+func (s WireKubeMeshSpec) UsesAddressAllocator() bool {
+	return s.AddressAllocation == AddressAllocationAllocator
 }
