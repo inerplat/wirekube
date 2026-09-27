@@ -79,6 +79,20 @@ type PortPrediction struct {
 
 // WireKubePeerStatus defines the observed state of WireKubePeer
 type WireKubePeerStatus struct {
+	// MeshIP is the /32 overlay address this peer holds, in CIDR notation.
+	// It is the record of an allocation, not a request: whoever allocated the
+	// address writes it here, and the owning agent then keeps reproducing it
+	// as spec.allowedIPs[0] instead of re-deriving one from the peer name.
+	//
+	// The name-derived address is only a first choice — two names can hash
+	// into the same /32 — so an allocator that resolved a collision needs
+	// somewhere durable to say which address won. Without it, every agent
+	// restart would recompute the hash and move the peer back onto the
+	// contested address. Empty means no allocation was ever recorded, and the
+	// agent falls back to the hash.
+	// +optional
+	MeshIP string `json:"meshIP,omitempty"`
+
 	// Connected indicates whether this peer currently has a usable transport
 	// path to all configured remote peers. The preferred path may be direct
 	// or relay; relay-backed connectivity still counts as connected.
