@@ -66,6 +66,10 @@ type Reaper struct {
 	// whose only consequence is how soon an unusable address becomes usable
 	// again. Losing it to a restart or a leader change only delays a reclaim.
 	orphanedSince map[string]time.Time
+
+	// reportedMeshes is the set of meshes with live occupancy series, so a
+	// mesh that disappears can have its series withdrawn rather than frozen.
+	reportedMeshes map[string]struct{}
 }
 
 var _ manager.Runnable = (*Reaper)(nil)
@@ -143,6 +147,7 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 		}
 	}
 
+	reported := make(map[string]struct{}, len(meshList.Items))
 	for i := range meshList.Items {
 		mesh := &meshList.Items[i]
 		capacity, err := meship.Capacity(mesh.Spec.MeshCIDR)
@@ -152,7 +157,18 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 			continue
 		}
 		setOccupancy(mesh.Name, capacity, byMesh[mesh.Name])
+		reported[mesh.Name] = struct{}{}
 	}
+	// Drop the series of a mesh that has gone away. Left behind, its last
+	// reading keeps being scraped as though the pool were still there, and an
+	// alert on free addresses would sit quietly on a mesh that no longer
+	// exists.
+	for name := range r.reportedMeshes {
+		if _, ok := reported[name]; !ok {
+			clearOccupancy(name)
+		}
+	}
+	r.reportedMeshes = reported
 	return nil
 }
 

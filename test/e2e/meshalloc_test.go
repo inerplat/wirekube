@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestAllocateKeepsTheHashedAddress(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := a.Allocate(context.Background(), name, "")
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: name})
 		if err != nil {
 			t.Fatalf("Allocate(%q): %v", name, err)
 		}
@@ -86,12 +87,12 @@ func TestAllocateKeepsTheHashedAddress(t *testing.T) {
 // address back, not a new one, and without depending on anything it stored.
 func TestAllocateIsIdempotent(t *testing.T) {
 	a := newAllocator(t, "198.18.18.0/24")
-	first, err := a.Allocate(context.Background(), "worker1", "")
+	first, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := range 5 {
-		got, err := a.Allocate(context.Background(), "worker1", "")
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
 		if err != nil {
 			t.Fatalf("Allocate call %d: %v", i, err)
 		}
@@ -112,11 +113,11 @@ func TestAllocateMovesTheSecondClaimant(t *testing.T) {
 	first, second := collidingNames(t, cidr)
 	a := newAllocator(t, cidr)
 
-	won, err := a.Allocate(context.Background(), first, "")
+	won, err := a.Allocate(context.Background(), meshalloc.Request{Holder: first})
 	if err != nil {
 		t.Fatal(err)
 	}
-	moved, err := a.Allocate(context.Background(), second, "")
+	moved, err := a.Allocate(context.Background(), meshalloc.Request{Holder: second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +128,7 @@ func TestAllocateMovesTheSecondClaimant(t *testing.T) {
 		t.Errorf("%q reported attempt 0 but did not get its hashed address", second)
 	}
 	// And the loser's address is sticky from then on.
-	again, err := a.Allocate(context.Background(), second, "")
+	again, err := a.Allocate(context.Background(), meshalloc.Request{Holder: second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +150,7 @@ func TestAllocateHonoursAFreePreferredAddress(t *testing.T) {
 	if hashed == preferred {
 		t.Fatal("test vector is useless: worker1 already hashes to the preferred address")
 	}
-	got, err := a.Allocate(context.Background(), "worker1", preferred)
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1", Preferred: preferred})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ func TestAllocateIgnoresAnUnusablePreferredAddress(t *testing.T) {
 	}
 	for _, preferred := range []string{"10.9.9.9/32", "198.18.18.0/32", "198.18.18.255/32", "garbage"} {
 		a.Namespace = allocNamespace(t) // a fresh pool per case
-		got, err := a.Allocate(context.Background(), "worker1", preferred)
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1", Preferred: preferred})
 		if err != nil {
 			t.Fatalf("preferred %q: %v", preferred, err)
 		}
@@ -182,11 +183,11 @@ func TestAllocateIgnoresAnUnusablePreferredAddress(t *testing.T) {
 // somebody else holds it now, so it takes another rather than duplicating.
 func TestAllocateTakenPreferredAddressMoves(t *testing.T) {
 	a := newAllocator(t, "198.18.18.0/24")
-	held, err := a.Allocate(context.Background(), "incumbent", "")
+	held, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "incumbent"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := a.Allocate(context.Background(), "latecomer", held.Address)
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "latecomer", Preferred: held.Address})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +209,7 @@ func TestAllocateExhaustsExactly(t *testing.T) {
 	seen := make(map[string]string, capacity)
 	for i := range capacity {
 		name := fmt.Sprintf("peer-%d", i)
-		got, err := a.Allocate(context.Background(), name, "")
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: name})
 		if err != nil {
 			t.Fatalf("filling slot %d: %v", i, err)
 		}
@@ -220,7 +221,7 @@ func TestAllocateExhaustsExactly(t *testing.T) {
 	if len(seen) != capacity {
 		t.Fatalf("filled %d of %d addresses", len(seen), capacity)
 	}
-	if _, err := a.Allocate(context.Background(), "one-too-many", ""); !errors.Is(err, meshalloc.ErrExhausted) {
+	if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "one-too-many"}); !errors.Is(err, meshalloc.ErrExhausted) {
 		t.Fatalf("Allocate on a full mesh returned %v, want ErrExhausted", err)
 	}
 }
@@ -238,7 +239,7 @@ func TestAllocateFindsTheLastFreeAddress(t *testing.T) {
 	var free string
 	for i := range capacity {
 		name := fmt.Sprintf("filler-%d", i)
-		got, err := a.Allocate(context.Background(), name, "")
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: name})
 		if err != nil {
 			t.Fatalf("filling slot %d: %v", i, err)
 		}
@@ -249,7 +250,7 @@ func TestAllocateFindsTheLastFreeAddress(t *testing.T) {
 			}
 		}
 	}
-	got, err := a.Allocate(context.Background(), "latecomer", "")
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "latecomer"})
 	if err != nil {
 		t.Fatalf("Allocate into a mesh with one free address: %v", err)
 	}
@@ -274,7 +275,7 @@ func TestAllocateConcurrentCallersNeverShare(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			name := fmt.Sprintf("racer-%d", i)
-			result, err := a.Allocate(context.Background(), name, "")
+			result, err := a.Allocate(context.Background(), meshalloc.Request{Holder: name})
 			if err != nil {
 				errs[i] = err
 				return
@@ -312,7 +313,7 @@ func TestAllocateConcurrentSamePeerConverges(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i], errs[i] = a.Allocate(context.Background(), "worker1", "")
+			results[i], errs[i] = a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
 		}()
 	}
 	wg.Wait()
@@ -323,7 +324,7 @@ func TestAllocateConcurrentSamePeerConverges(t *testing.T) {
 	}
 	// A converged allocation leaves one claim; the duplicate collapse in
 	// heldClaim is what gets it there.
-	settled, err := a.Allocate(context.Background(), "worker1", "")
+	settled, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +341,7 @@ func TestAllocateConcurrentSamePeerConverges(t *testing.T) {
 
 func TestReleaseFreesTheAddressForSomebodyElse(t *testing.T) {
 	a := newAllocator(t, "198.18.18.0/24")
-	held, err := a.Allocate(context.Background(), "worker1", "")
+	held, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +355,7 @@ func TestReleaseFreesTheAddressForSomebodyElse(t *testing.T) {
 	if err := a.Release(context.Background(), "worker1"); err != nil {
 		t.Fatalf("second Release: %v", err)
 	}
-	got, err := a.Allocate(context.Background(), "successor", held.Address)
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "successor", Preferred: held.Address})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +368,7 @@ func TestReleaseFreesTheAddressForSomebodyElse(t *testing.T) {
 // its address was reassigned must not take the new holder's claim with it.
 func TestReleaseLeavesAnotherHoldersClaimAlone(t *testing.T) {
 	a := newAllocator(t, "198.18.18.0/24")
-	if _, err := a.Allocate(context.Background(), "keeper", ""); err != nil {
+	if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "keeper"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Release(context.Background(), "stranger"); err != nil {
@@ -386,7 +387,7 @@ func TestAllocateRejectsAnIncompleteAllocator(t *testing.T) {
 		"no cidr":      {Client: k8sClient, Namespace: "x", MeshName: "default"},
 		"bad cidr":     {Client: k8sClient, Namespace: "x", MeshName: "default", MeshCIDR: "198.18.18.0/31"},
 	} {
-		if _, err := a.Allocate(context.Background(), "worker1", ""); err == nil {
+		if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err == nil {
 			t.Errorf("%s: Allocate succeeded", name)
 		}
 	}
@@ -490,7 +491,7 @@ func TestAllocateCostIsBounded(t *testing.T) {
 
 	// An empty mesh: one list to check for an existing claim, one create.
 	counter.reset()
-	if _, err := a.Allocate(context.Background(), "first", ""); err != nil {
+	if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "first"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := counter.total(); got > 3 {
@@ -500,7 +501,7 @@ func TestAllocateCostIsBounded(t *testing.T) {
 
 	// The steady state — an agent restarting — must not write at all.
 	counter.reset()
-	if _, err := a.Allocate(context.Background(), "first", ""); err != nil {
+	if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "first"}); err != nil {
 		t.Fatal(err)
 	}
 	if counter.creates != 0 {
@@ -513,7 +514,7 @@ func TestAllocateCostIsBounded(t *testing.T) {
 	var lastFree string
 	for i := 1; i < capacity; i++ {
 		name := fmt.Sprintf("filler-%d", i)
-		got, err := a.Allocate(context.Background(), name, "")
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: name})
 		if err != nil {
 			t.Fatalf("filling slot %d: %v", i, err)
 		}
@@ -527,7 +528,7 @@ func TestAllocateCostIsBounded(t *testing.T) {
 
 	// One address free out of 254. The naive walk would cost 253 creates.
 	counter.reset()
-	got, err := a.Allocate(context.Background(), "latecomer", "")
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "latecomer"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +544,7 @@ func TestAllocateCostIsBounded(t *testing.T) {
 
 	// And a genuinely full mesh reports exhaustion at the same bounded cost.
 	counter.reset()
-	if _, err := a.Allocate(context.Background(), "one-too-many", ""); !errors.Is(err, meshalloc.ErrExhausted) {
+	if _, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "one-too-many"}); !errors.Is(err, meshalloc.ErrExhausted) {
 		t.Fatalf("Allocate on a full mesh returned %v, want ErrExhausted", err)
 	}
 	if total := counter.total(); total > 600 {
@@ -551,4 +552,115 @@ func TestAllocateCostIsBounded(t *testing.T) {
 	}
 	t.Logf("exhaustion in a full %s: %d API calls (%d list, %d create, %d get)",
 		cidr, counter.total(), counter.lists, counter.creates, counter.gets)
+}
+
+// TestAllocateSurvivesAFreeFormHolder. An external peer's display name is
+// free-form text, and a holder that is not a valid label value does not merely
+// fail the create — it fails the list, where an unparseable selector surfaces
+// as an error that looks nothing like the label that caused it. The label is
+// only a selector shortcut, so reducing it is fine; producing an invalid one
+// is not.
+func TestAllocateSurvivesAFreeFormHolder(t *testing.T) {
+	a := newAllocator(t, "198.18.18.0/24")
+	seen := make(map[string]string)
+	for _, holder := range []string{
+		"Alice's Laptop",
+		"집 데스크톱",
+		"dev box #2",
+		"-leading-dash-",
+		"...",
+		strings.Repeat("long", 40),
+	} {
+		got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: holder})
+		if err != nil {
+			t.Errorf("Allocate(%q): %v", holder, err)
+			continue
+		}
+		if prev, ok := seen[got.Address]; ok {
+			t.Errorf("%s handed to both %q and %q", got.Address, prev, holder)
+		}
+		seen[got.Address] = holder
+
+		// And it has to be able to find its own claim again, which is the part
+		// a lossy label would break if the read and the write disagreed.
+		again, err := a.Allocate(context.Background(), meshalloc.Request{Holder: holder})
+		if err != nil {
+			t.Errorf("re-Allocate(%q): %v", holder, err)
+			continue
+		}
+		if again.Address != got.Address {
+			t.Errorf("%q moved from %s to %s", holder, got.Address, again.Address)
+		}
+		if !again.Adopted {
+			t.Errorf("%q did not find its own claim", holder)
+		}
+	}
+}
+
+// TestAllocateSeparatesTheHolderFromTheHashName. An external peer's address
+// comes from its display name and must keep doing so — moving it would
+// renumber peers that are up — while the claim is held under the resource
+// name, which is what the reaper looks up and what is safe in a label.
+func TestAllocateSeparatesTheHolderFromTheHashName(t *testing.T) {
+	a := newAllocator(t, "198.18.18.0/24")
+	const displayName = "Alice's Laptop"
+	want, err := meship.IPForName(displayName, a.MeshCIDR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "laptop-cr", Name: displayName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Address != want {
+		t.Errorf("address = %s, want the one the display name hashes to, %s", got.Address, want)
+	}
+	// The resource name holds it, so the reaper — which knows resource names,
+	// not display names — sees the claim as answered for.
+	if holder := claimHolder(t, a.Namespace, got.Address, a.MeshName); holder != "laptop-cr" {
+		t.Errorf("holder = %q, want the resource name", holder)
+	}
+}
+
+// TestAllocateDropsAClaimTheCIDRNoLongerCovers. After the mesh CIDR moves, a
+// claim made under the old one is not an allocation, it is a leftover.
+// Adopting it would hand back an address the mesh cannot route, and the caller
+// would fall back to an unclaimed one — a duplicate, which is the whole point
+// of the package.
+func TestAllocateDropsAClaimTheCIDRNoLongerCovers(t *testing.T) {
+	a := newAllocator(t, "198.18.18.0/24")
+	held, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.MeshCIDR = "198.18.19.0/24"
+	got, err := a.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meship.Contains(got.Address, a.MeshCIDR) {
+		t.Fatalf("got %s, which %s cannot route", got.Address, a.MeshCIDR)
+	}
+	if got.Address == held.Address {
+		t.Fatalf("kept %s from the previous CIDR", held.Address)
+	}
+	// The stale claim goes back; leaving it would hold an address nobody can
+	// use, and nothing else collects a claim whose holder is still present.
+	if n := countClaims(t, a.Namespace); n != 1 {
+		t.Errorf("%d claims, want only the new one", n)
+	}
+}
+
+func claimHolder(t *testing.T, namespace, address, mesh string) string {
+	t.Helper()
+	lease := &coordinationv1.Lease{}
+	key := client.ObjectKey{Namespace: namespace, Name: meshalloc.ClaimName(mesh, address)}
+	if err := k8sClient.Get(context.Background(), key, lease); err != nil {
+		t.Fatalf("get claim: %v", err)
+	}
+	if lease.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *lease.Spec.HolderIdentity
 }

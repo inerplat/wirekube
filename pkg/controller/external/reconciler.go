@@ -105,9 +105,8 @@ type Reconciler struct {
 // node's address is moved instead of being handed a duplicate — the case that
 // used to be written straight into status.assignedMeshIP with no check at all.
 //
-// The claim is held under the display name rather than the resource name,
-// because the display name is what the address derives from and what the
-// reaper looks for.
+// The claim is held under the resource name, which the reaper looks up, while
+// the address still derives from the display name.
 func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, error) {
 	if !mesh.Spec.UsesAddressAllocator() {
 		return meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
@@ -122,9 +121,19 @@ func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.Wi
 		MeshName:  mesh.Name,
 		MeshCIDR:  mesh.Spec.MeshCIDR,
 	}
+	// The claim is held under the resource name and derived from the display
+	// name. They differ on purpose: the address has always come from the
+	// display name and moving it would renumber peers that are up, but the
+	// display name is free-form text — a space or an apostrophe in it would
+	// make an invalid label value and fail every claim read and write.
+	//
 	// The address already published is the preference, so a peer that is up
 	// and connected is not renumbered by the switch to the allocator.
-	result, err := allocator.Allocate(ctx, cr.Spec.DisplayName, cr.Status.AssignedMeshIP)
+	result, err := allocator.Allocate(ctx, meshalloc.Request{
+		Holder:    cr.Name,
+		Name:      cr.Spec.DisplayName,
+		Preferred: cr.Status.AssignedMeshIP,
+	})
 	if err != nil {
 		return "", err
 	}

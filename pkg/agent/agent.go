@@ -780,7 +780,7 @@ func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireK
 		MeshName:  mesh.Name,
 		MeshCIDR:  mesh.Spec.MeshCIDR,
 	}
-	result, err := allocator.Allocate(ctx, peerName, recorded)
+	result, err := allocator.Allocate(ctx, meshalloc.Request{Holder: peerName, Preferred: recorded})
 	if err != nil {
 		a.log.Error(err, "claiming a mesh address; keeping the recorded one",
 			"peer", peerName, "recorded", recorded)
