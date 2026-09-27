@@ -50,6 +50,7 @@ spec:
 | `interfaceName` | string | No | `wire_kube` | Name of the WireGuard network interface |
 | `mtu` | int | No | `1420` | Interface MTU. 1420 accounts for WireGuard overhead (40B IPv6 or 20B IPv4 + 8B UDP + 32B WG) |
 | `meshCIDR` | string | No | - | Private CIDR used for mesh overlay addresses. Each node gets a deterministic `/32` inside this range, derived from an FNV-1a hash of the node name. The overlay IP becomes the primary AllowedIPs entry and is assigned to the `wire_kube` TUN. Choose a range that does not overlap with node, pod, service, VPC, proxy, or corporate networks. When empty, peers use only manually managed AllowedIPs. |
+| `addressAllocation` | string | No | `hash` | How a peer's `/32` is chosen: `hash` computes it from the peer name alone, `allocator` keeps the hash as the first choice and arbitrates conflicts through claims so a second claimant moves instead of advertising a duplicate. See [Mesh address allocation](#mesh-address-allocation). |
 | `serviceCIDRs` | []string | No | - | Service ClusterIP range(s) advertised to external peers. When empty the controller discovers them from the cluster's `ServiceCIDR` objects (`networking.k8s.io`, tried newest group version first). Set this on clusters too old to serve that API, or to advertise a narrower range than the cluster allocates from. In-cluster peers do not use this: they reach ClusterIPs through their own node. |
 | `autoAllowedIPs.includeNodeInternalIP` | bool | No | `false` | When `true`, the agent also appends the node's **private** address to `spec.allowedIPs` (resolved from `Node.status.addresses` first, then from local interfaces as a fallback). Public IPs are never auto-advertised — doing so would hijack SSH / apiserver routes on the next tunnel flap. Operators can override the picked address with the `wirekube.io/internal-ip` annotation on the Node. |
 | `stunServers` | []string | No | - | STUN servers for public endpoint discovery. **Minimum 2 required** — the agent compares mapped ports across servers to detect Symmetric NAT (RFC 5780). |
@@ -138,6 +139,7 @@ spec:
 | `transportMode` | string | Aggregate transport state derived from `peerTransports`: `direct`, `relay`, or `mixed`. |
 | `peerTransports` | map[string]string | Per-peer transport mode. Key is peer CRD name (e.g., `node-worker7`), value is `direct` or `relay`. |
 | `endpointDiscoveryMethod` | string | How the endpoint was discovered: `stun`, `annotation`, `ipv6`, `aws-imds`, `upnp`, `internal` |
+| `meshIP` | string | The `/32` this peer holds, in CIDR notation. It is a record, not a request: the agent reproduces it as `spec.allowedIPs[0]` instead of re-deriving the name hash, which is what lets an allocated address survive a restart. Empty means nothing was ever recorded and the hash is used. |
 | `lastHandshake` | time | Timestamp of the last successful WireGuard handshake |
 
 Transport mode values:
@@ -159,6 +161,65 @@ The `natType` and `transportMode` fields are shown as `NAT` and `Mode` columns i
 ### Naming Convention
 
 Agent-managed peer resources use the Kubernetes Node name directly (for example, Node `worker-a` owns WireKubePeer `worker-a`).
+
+### Mesh address allocation
+
+A peer's overlay `/32` is an FNV-1a hash of its name reduced into `meshCIDR`.
+That needs no coordination — every agent computes the same answer — but it is
+not injective: two names can land on the same address, and both peers then
+advertise it. Widening `meshCIDR` moves the birthday bound, it does not remove
+the case. For a `/24` the bound is around 16 names; for a `/10`, around 2048.
+
+`spec.addressAllocation` selects what happens then.
+
+| Value | Behaviour |
+|-------|-----------|
+| `hash` (default) | The hash is the address. A collision is not detected, and both peers advertise the same `/32`. |
+| `allocator` | The hash is the first choice. Claiming it is a `Lease` create named after the address, so the API server arbitrates: exactly one peer wins, and the loser walks to its next candidate. |
+
+Under `allocator`:
+
+- **Nobody is renumbered by turning it on.** The first candidate is the hashed
+  address, and the peer's existing `status.meshIP` is preferred over it, so an
+  uncontended mesh keeps every address exactly where it was.
+- **The address is sticky.** A peer adopts the claim it already holds before
+  anything is written, so a restart cannot drift it onto an address that has
+  since been freed.
+- **Retries are bounded.** After 32 probes the claims are listed once and the
+  search becomes exact, so the last free address in a full `/24` costs a
+  measured 67 API calls rather than 253.
+- **Exhaustion is reported, not retried.** When every address is claimed the
+  enrolment fails with a terminal error. Nothing frees up on its own; widen
+  `meshCIDR`.
+
+Claims are `Lease` objects in the namespace WireKube runs in, labelled
+`wirekube.io/claim=address`:
+
+```console
+$ kubectl -n wirekube-system get leases -l wirekube.io/claim=address
+NAME                             HOLDER    AGE
+wirekube-default-198-18-18-74    master    31d
+wirekube-default-198-18-18-83    worker1   31d
+```
+
+They carry no `ownerReference` on purpose: an enrolment tool claims an address
+*before* the node that will advertise it exists, and garbage collection would
+delete a claim whose owner is not there yet. A leader-elected sweep collects
+them instead, once no peer has answered for the holder for 15 minutes (or for
+`spec.leaseDurationSeconds`, if the claim sets one), or at once if `meshCIDR`
+has moved out from under the address.
+
+#### Turning it on
+
+The switch must not be flipped until every agent in the fleet honours
+`WireKubePeer.status.meshIP`. An older agent recomputes the hash on every
+upsert and would drag an allocated peer back onto the contested address.
+
+```bash
+kubectl get wirekubepeers -o custom-columns=NAME:.metadata.name,MESHIP:.status.meshIP
+# every row populated → the rollout has converged
+kubectl patch wirekubemesh default --type=merge -p '{"spec":{"addressAllocation":"allocator"}}'
+```
 
 ---
 
