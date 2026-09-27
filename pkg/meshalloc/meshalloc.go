@@ -34,6 +34,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/inerplat/wirekube/pkg/meship"
@@ -87,10 +88,17 @@ var ErrExhausted = errors.New("meshalloc: every address in the mesh CIDR is clai
 
 // Allocator claims mesh addresses as Leases in a single namespace.
 type Allocator struct {
-	// Client reads and creates the claim Leases. It must not be a cached
-	// client that filters Leases, because a claim has to be visible to the
-	// Get that follows an AlreadyExists.
+	// Client creates and deletes the claim Leases.
 	Client client.Client
+	// Reader serves the reads that decide an allocation. It must not be
+	// cached. A cached read can still be serving a claim that has since been
+	// deleted, or miss one just created, and both mistakes end the same way:
+	// the Get after an AlreadyExists sees the previous holder, this caller
+	// concludes the claim is its own, and two peers advertise one address.
+	//
+	// Leave it nil when Client is already uncached; a controller-runtime
+	// manager's client is not, and should pass mgr.GetAPIReader().
+	Reader client.Reader
 	// Namespace holds the claim Leases. It is the namespace WireKube itself
 	// runs in, so the claims are cleaned up with the installation.
 	Namespace string
@@ -328,7 +336,7 @@ func (a *Allocator) claim(ctx context.Context, peerName, address string, attempt
 	}
 
 	existing := &coordinationv1.Lease{}
-	if getErr := a.Client.Get(ctx, client.ObjectKeyFromObject(lease), existing); getErr != nil {
+	if getErr := a.reader().Get(ctx, client.ObjectKeyFromObject(lease), existing); getErr != nil {
 		if apierrors.IsNotFound(getErr) {
 			// The holder released it between the create and the read. Report
 			// it as taken rather than retrying here; the caller's walk comes
@@ -392,7 +400,7 @@ func (a *Allocator) list(ctx context.Context, extra ...client.ListOption) (*coor
 		client.MatchingLabels{ClaimLabel: ClaimAddress, MeshLabel: a.MeshName},
 	}, extra...)
 	claims := &coordinationv1.LeaseList{}
-	if err := a.Client.List(ctx, claims, options...); err != nil {
+	if err := a.reader().List(ctx, claims, options...); err != nil {
 		return nil, fmt.Errorf("list mesh address claims in %s: %w", a.Namespace, err)
 	}
 	return claims, nil
@@ -437,13 +445,25 @@ func (a *Allocator) validate() error {
 	if a.MeshCIDR == "" {
 		return fmt.Errorf("meshalloc: the mesh does not set spec.meshCIDR")
 	}
-	// The claim name carries the mesh name, so a long enough mesh name would
-	// push it past the object-name limit and fail every create. Check it once
-	// here against the longest address rather than at each create.
-	if longest := ClaimName(a.MeshName, "255.255.255.255/32"); len(longest) > 253 {
+	// The mesh name goes into the claim's name and into a label value, and it
+	// is checked once here rather than at each create because the API server's
+	// own rejection names a requirement rather than the mesh behind it.
+	if longest := ClaimName(a.MeshName, "255.255.255.255/32"); len(longest) > validation.DNS1123SubdomainMaxLength {
 		return fmt.Errorf("meshalloc: mesh name %q is too long to name address claims", a.MeshName)
 	}
+	for _, problem := range validation.IsValidLabelValue(a.MeshName) {
+		return fmt.Errorf("meshalloc: mesh name %q cannot label address claims: %s", a.MeshName, problem)
+	}
 	return nil
+}
+
+// reader is the uncached read path, falling back to Client for callers whose
+// client is already uncached.
+func (a *Allocator) reader() client.Reader {
+	if a.Reader != nil {
+		return a.Reader
+	}
+	return a.Client
 }
 
 // ClaimName is the Lease name that arbitrates address within mesh. Two callers
