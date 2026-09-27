@@ -113,6 +113,9 @@ rules:
   - patch
   - update
 # Leader election for the embedded WireKubeExternalPeer reconciler.
+# Also the mesh address claims: a claim is a Lease named after the address, so
+# creating it is how two peers racing for one address are arbitrated, and the
+# leader's sweep deletes the ones whose holder is gone.
 - apiGroups:
   - coordination.k8s.io
   resources:

@@ -120,6 +120,9 @@ rules:
 # agent pod runs the reconciler manager but only the leader actually
 # reconciles, preventing N-fold relay-port allocations across the
 # DaemonSet replicas.
+# Also the mesh address claims: a claim is a Lease named after the address, so
+# creating it is how two peers racing for one address are arbitrated, and the
+# leader's sweep deletes the ones whose holder is gone.
 - apiGroups:
   - coordination.k8s.io
   resources:

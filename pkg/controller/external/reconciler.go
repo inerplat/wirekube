@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/meshalloc"
 	"github.com/inerplat/wirekube/pkg/meship"
 )
 
@@ -91,7 +92,47 @@ type Reconciler struct {
 	// Now is injectable for deterministic TTL tests; production callers
 	// leave it nil and the reconciler falls back to time.Now.
 	Now func() time.Time
+	// ClaimNamespace holds the mesh address claim Leases. Empty falls back to
+	// wirekube-system, matching the agent.
+	ClaimNamespace string
 }
+
+// allocateMeshIP resolves the external peer's overlay address.
+//
+// On a mesh still set to hash allocation this is the historical
+// meship.IPForName of the display name. On a mesh switched to the allocator it
+// claims the address, so an external peer whose display name hashes onto a
+// node's address is moved instead of being handed a duplicate — the case that
+// used to be written straight into status.assignedMeshIP with no check at all.
+//
+// The claim is held under the display name rather than the resource name,
+// because the display name is what the address derives from and what the
+// reaper looks for.
+func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, error) {
+	if !mesh.Spec.UsesAddressAllocator() {
+		return meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
+	}
+	namespace := r.ClaimNamespace
+	if namespace == "" {
+		namespace = defaultClaimNamespace
+	}
+	allocator := &meshalloc.Allocator{
+		Client:    r.Client,
+		Namespace: namespace,
+		MeshName:  mesh.Name,
+		MeshCIDR:  mesh.Spec.MeshCIDR,
+	}
+	// The address already published is the preference, so a peer that is up
+	// and connected is not renumbered by the switch to the allocator.
+	result, err := allocator.Allocate(ctx, cr.Spec.DisplayName, cr.Status.AssignedMeshIP)
+	if err != nil {
+		return "", err
+	}
+	return result.Address, nil
+}
+
+// defaultClaimNamespace matches the agent's fallback.
+const defaultClaimNamespace = "wirekube-system"
 
 // SetupWithManager registers the reconciler with controller-runtime. It
 // is intentionally separate from the constructor so the test suite can
@@ -249,8 +290,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			requeueShort)
 	}
 
-	// 5. Deterministic /32 allocation.
-	meshIP, err := meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
+	// 5. /32 allocation.
+	meshIP, err := r.allocateMeshIP(ctx, cr, mesh)
 	if err != nil {
 		return r.failValidation(ctx, cr, reasonValidationFailed,
 			fmt.Sprintf("compute mesh IP: %v", err))

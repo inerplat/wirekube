@@ -22,6 +22,7 @@ import (
 	"github.com/inerplat/wirekube/pkg/agent/nat"
 	agentrelay "github.com/inerplat/wirekube/pkg/agent/relay"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/meshalloc"
 	"github.com/inerplat/wirekube/pkg/meship"
 	relayproto "github.com/inerplat/wirekube/pkg/relay"
 	"github.com/inerplat/wirekube/pkg/wireguard"
@@ -595,7 +596,7 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 				PersistentKeepalive: defaultPeerKeepaliveSeconds,
 			},
 		}
-		assigned := applyMeshIP(a.log, mesh, name, "", &peer.Spec)
+		assigned := applyMeshIP(a.log, mesh, name, a.allocateMeshIP(ctx, mesh, name, ""), &peer.Spec)
 		applyNodeInternalIP(a.log, mesh, node, &peer.Spec)
 		if createErr := a.client.Create(ctx, peer); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return fmt.Errorf("creating own WireKubePeer: %w", createErr)
@@ -624,7 +625,7 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if !hasNodeOwnerReference(existing.OwnerReferences, node) {
 		existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
 	}
-	assigned := applyMeshIP(a.log, mesh, name, existing.Status.MeshIP, &existing.Spec)
+	assigned := applyMeshIP(a.log, mesh, name, a.allocateMeshIP(ctx, mesh, name, existing.Status.MeshIP), &existing.Spec)
 	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
 	existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
@@ -752,6 +753,54 @@ func containsString(items []string, value string) bool {
 		}
 	}
 	return false
+}
+
+// allocateMeshIP resolves which address this peer should hold, returning the
+// value applyMeshIP treats as already recorded.
+//
+// On a mesh still set to hash allocation it returns recorded unchanged, which
+// leaves the behaviour exactly as it was. On a mesh switched to the allocator
+// it claims the address, passing recorded through so a peer already in the
+// mesh keeps the address it is advertising rather than being renumbered the
+// moment the switch is flipped.
+//
+// An allocator failure falls back to recorded rather than to the name hash.
+// The hash is where a collision would put two peers in the first place, and an
+// API error is exactly when the peer cannot check whether that is the case, so
+// keeping the address it already has is the only safe answer. A peer with no
+// record yet gets "" and applyMeshIP derives the hash, which is what it would
+// have done anyway.
+func (a *Agent) allocateMeshIP(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh, peerName, recorded string) string {
+	if mesh == nil || !mesh.Spec.UsesAddressAllocator() {
+		return recorded
+	}
+	allocator := &meshalloc.Allocator{
+		Client:    a.client,
+		Namespace: a.claimNamespace(),
+		MeshName:  mesh.Name,
+		MeshCIDR:  mesh.Spec.MeshCIDR,
+	}
+	result, err := allocator.Allocate(ctx, peerName, recorded)
+	if err != nil {
+		a.log.Error(err, "claiming a mesh address; keeping the recorded one",
+			"peer", peerName, "recorded", recorded)
+		return recorded
+	}
+	if recorded != "" && result.Address != recorded {
+		a.log.Info("mesh address reassigned: another peer holds the recorded one",
+			"peer", peerName, "was", recorded, "now", result.Address, "attempt", result.Attempt)
+	}
+	return result.Address
+}
+
+// claimNamespace is where address claims live. It is the namespace the agent
+// runs in, so the claims are removed with the installation; the fallback
+// matches relayNamespace in cmd/agent for a build running outside a pod.
+func (a *Agent) claimNamespace() string {
+	if a.podNamespace != "" {
+		return a.podNamespace
+	}
+	return "wirekube-system"
 }
 
 // recordMeshIP publishes the address this peer settled on to status.meshIP, so
