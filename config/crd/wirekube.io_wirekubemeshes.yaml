@@ -60,6 +60,26 @@ spec:
           spec:
             description: WireKubeMeshSpec defines the desired state of WireKubeMesh
             properties:
+              addressAllocation:
+                default: hash
+                description: |-
+                  AddressAllocation selects how a peer's mesh address is chosen.
+
+                  "hash" (the default) is the historical behaviour: the address is a hash
+                  of the peer name reduced into MeshCIDR, computed independently by every
+                  agent. It needs no coordination but is not collision-free, and two names
+                  that land on the same /32 both advertise it.
+
+                  "allocator" keeps the hash as the first choice and arbitrates conflicts
+                  through Lease claims, so a second claimant moves to another address
+                  instead. It is not the default because it must not be turned on until
+                  every agent in the fleet honours WireKubePeer.status.meshIP — an older
+                  agent would keep forcing the hash back and fight the allocation. Flip it
+                  once the rollout has converged.
+                enum:
+                - hash
+                - allocator
+                type: string
               apiServerURL:
                 description: |-
                   APIServerURL is the URL of the Kubernetes API server (e.g. "https://10.0.0.1:6443").

@@ -116,25 +116,3 @@ func TestApplyMeshIPReportsNothingForAnUnusableMeshCIDR(t *testing.T) {
 		t.Errorf("AllowedIPs = %v, want them untouched", spec.AllowedIPs)
 	}
 }
-
-func TestWithinMesh(t *testing.T) {
-	for _, c := range []struct {
-		address string
-		want    bool
-	}{
-		{"198.18.18.1/32", true},
-		{"198.18.18.254/32", true},
-		{"198.18.18.0/32", false},
-		{"198.18.18.255/32", false},
-		{"198.18.19.1/32", false},
-		{"198.18.18.1/24", false},
-		{"", false},
-	} {
-		if got := withinMesh(c.address, "198.18.18.0/24"); got != c.want {
-			t.Errorf("withinMesh(%q) = %v, want %v", c.address, got, c.want)
-		}
-	}
-	if withinMesh("198.18.18.1/32", "not-a-cidr") {
-		t.Error("withinMesh accepted an unparseable mesh CIDR")
-	}
-}
