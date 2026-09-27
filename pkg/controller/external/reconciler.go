@@ -107,9 +107,20 @@ type Reconciler struct {
 //
 // The claim is held under the resource name, which the reaper looks up, while
 // the address still derives from the display name.
-func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, error) {
+//
+// The second return reports whether the error, if any, is terminal.
+func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, bool, error) {
 	if !mesh.Spec.UsesAddressAllocator() {
-		return meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
+		// An address already issued is kept, exactly as an agent keeps
+		// status.meshIP. Turning the allocator off must not renumber a peer it
+		// had moved: the client is connected on the issued address, and
+		// putting it back on the hash recreates the collision that moved it.
+		// Only an address the mesh can no longer route is re-derived.
+		if meship.Contains(cr.Status.AssignedMeshIP, mesh.Spec.MeshCIDR) {
+			return cr.Status.AssignedMeshIP, false, nil
+		}
+		address, err := meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
+		return address, true, err
 	}
 	namespace := r.ClaimNamespace
 	if namespace == "" {
@@ -140,9 +151,14 @@ func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.Wi
 		Preferred: cr.Status.AssignedMeshIP,
 	})
 	if err != nil {
-		return "", err
+		// Exhaustion and a misconfigured mesh are terminal: nothing frees up
+		// on its own and retrying changes nothing. Anything else is the API
+		// server having a bad moment, and must be requeued rather than parked
+		// in Failed, where no further event is guaranteed once the status has
+		// settled and the peer would stay broken after the cluster recovered.
+		return "", errors.Is(err, meshalloc.ErrExhausted) || apierrors.IsInvalid(err), err
 	}
-	return result.Address, nil
+	return result.Address, false, nil
 }
 
 // defaultClaimNamespace matches the agent's fallback.
@@ -305,8 +321,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// 5. /32 allocation.
-	meshIP, err := r.allocateMeshIP(ctx, cr, mesh)
+	meshIP, terminal, err := r.allocateMeshIP(ctx, cr, mesh)
 	if err != nil {
+		if !terminal {
+			// Returning the error requeues with backoff. Marking it Failed
+			// here would settle the status, and nothing is guaranteed to
+			// reconcile this peer again once the API server recovers.
+			return ctrl.Result{}, fmt.Errorf("allocate mesh IP for %s: %w", cr.Name, err)
+		}
 		return r.failValidation(ctx, cr, reasonValidationFailed,
 			fmt.Sprintf("compute mesh IP: %v", err))
 	}
