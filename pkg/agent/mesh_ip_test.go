@@ -212,8 +212,12 @@ func TestAllocateMeshIPAdoptsAPreClaimedAddress(t *testing.T) {
 	c := allocatorTestClient(t)
 	mesh := allocatorMesh("198.18.18.0/24")
 	const preClaimed = "198.18.18.177/32"
+	// The enrolment tool claims under the same holder identity the agent will
+	// look for, which is the whole point of the prefix being one definition.
 	enroller := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: mesh.Spec.MeshCIDR}
-	if _, err := enroller.Allocate(context.Background(), meshalloc.Request{Holder: "worker1", Preferred: preClaimed}); err != nil {
+	if _, err := enroller.Allocate(context.Background(), meshalloc.Request{
+		Holder: meshalloc.HolderForPeer("worker1"), Name: "worker1", Preferred: preClaimed,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,7 +307,9 @@ func TestUpsertOwnPeerRecordsTheAllocatedAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	incumbent := &meshalloc.Allocator{Client: c, Namespace: "wirekube-system", MeshName: "default", MeshCIDR: mesh.Spec.MeshCIDR}
-	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{Holder: "squatter", Preferred: contested}); err != nil {
+	if _, err := incumbent.Allocate(context.Background(), meshalloc.Request{
+		Holder: meshalloc.HolderForPeer("squatter"), Name: "squatter", Preferred: contested,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -338,4 +344,60 @@ func TestUpsertOwnPeerRecordsTheAllocatedAddress(t *testing.T) {
 	if peer.Spec.AllowedIPs[0] != settled {
 		t.Errorf("second upsert moved worker1 from %s to %s", settled, peer.Spec.AllowedIPs[0])
 	}
+}
+
+// TestUpsertOwnPeerFailsWhenTheRecordCannotBeWritten. upsertOwnPeer runs once
+// per agent process, and nothing else writes status.meshIP, so a lost patch on
+// an arbitrating mesh leaves the record empty for the life of the pod. Turning
+// the allocator off after that puts the peer straight back onto the address it
+// was moved off, which somebody else is now using.
+func TestUpsertOwnPeerFailsWhenTheRecordCannotBeWritten(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker1", UID: "node-uid-1"}}
+	c := allocatorTestClient(t, node)
+	a := &Agent{log: testr.New(t), client: unwritableStatus{c}, nodeName: "worker1", podNamespace: "wirekube-system"}
+	if err := a.upsertOwnPeer(context.Background(), allocatorMesh("198.18.18.0/24"), node, "worker1", "pubkey", nil); err == nil {
+		t.Fatal("the record was lost and setup carried on")
+	}
+}
+
+// TestUpsertOwnPeerToleratesALostRecordOnAHashMesh. There the record is only
+// groundwork for a future switch, and the operator's own check before flipping
+// is what catches a gap, so it must not fail an enrollment that is otherwise
+// fine.
+func TestUpsertOwnPeerToleratesALostRecordOnAHashMesh(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker1", UID: "node-uid-1"}}
+	c := allocatorTestClient(t, node)
+	mesh := &wirekubev1alpha1.WireKubeMesh{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+		Spec:       wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: "198.18.18.0/24"},
+	}
+	a := &Agent{log: testr.New(t), client: unwritableStatus{c}, nodeName: "worker1", podNamespace: "wirekube-system"}
+	if err := a.upsertOwnPeer(context.Background(), mesh, node, "worker1", "pubkey", nil); err != nil {
+		t.Fatalf("a lost record failed a hash-mesh enrollment: %v", err)
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "worker1"}, peer); err != nil {
+		t.Fatal(err)
+	}
+	if len(peer.Spec.AllowedIPs) == 0 {
+		t.Error("the peer came up with no address")
+	}
+}
+
+// unwritableStatus is a status subresource that rejects writes, which is what
+// a webhook, a quota or a brief apiserver fault looks like from here.
+type unwritableStatus struct {
+	client.Client
+}
+
+func (c unwritableStatus) Status() client.SubResourceWriter {
+	return failingStatusWriter{c.Client.Status()}
+}
+
+type failingStatusWriter struct {
+	client.SubResourceWriter
+}
+
+func (failingStatusWriter) Patch(context.Context, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+	return apierrors.NewServiceUnavailable("the server is currently unable to handle the request")
 }

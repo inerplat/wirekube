@@ -55,14 +55,15 @@ const (
 const (
 	conditionReady = "Ready"
 
-	reasonReconciled            = "Reconciled"
-	reasonValidationFailed      = "ValidationFailed"
-	reasonInvalidPublicKey      = "InvalidPublicKey"
-	reasonMeshNotFound          = "MeshNotFound"
-	reasonIngressPeerNotReady   = "IngressPeerNotReady"
-	reasonIngressProbeFailed    = "IngressProbeFailed"
-	reasonNoReadyIngressPeer    = "NoReadyIngressPeer"
-	reasonRelayEndpointNotReady = "RelayEndpointNotReady"
+	reasonReconciled             = "Reconciled"
+	reasonValidationFailed       = "ValidationFailed"
+	reasonInvalidPublicKey       = "InvalidPublicKey"
+	reasonMeshNotFound           = "MeshNotFound"
+	reasonMeshAddressesExhausted = "MeshAddressesExhausted"
+	reasonIngressPeerNotReady    = "IngressPeerNotReady"
+	reasonIngressProbeFailed     = "IngressProbeFailed"
+	reasonNoReadyIngressPeer     = "NoReadyIngressPeer"
+	reasonRelayEndpointNotReady  = "RelayEndpointNotReady"
 )
 
 // Reconciler reconciles WireKubeExternalPeer objects. It is platform-
@@ -107,9 +108,7 @@ type Reconciler struct {
 //
 // The claim is held under the resource name, which the reaper looks up, while
 // the address still derives from the display name.
-//
-// The second return reports whether the error, if any, is terminal.
-func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, bool, error) {
+func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, mesh *wirekubev1alpha1.WireKubeMesh) (string, error) {
 	if !mesh.Spec.UsesAddressAllocator() {
 		// An address already issued is kept, exactly as an agent keeps
 		// status.meshIP. Turning the allocator off must not renumber a peer it
@@ -117,10 +116,13 @@ func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.Wi
 		// putting it back on the hash recreates the collision that moved it.
 		// Only an address the mesh can no longer route is re-derived.
 		if meship.Contains(cr.Status.AssignedMeshIP, mesh.Spec.MeshCIDR) {
-			return cr.Status.AssignedMeshIP, false, nil
+			return cr.Status.AssignedMeshIP, nil
 		}
 		address, err := meship.IPForName(cr.Spec.DisplayName, mesh.Spec.MeshCIDR)
-		return address, true, err
+		if err != nil {
+			return "", fmt.Errorf("%w: %s", meshalloc.ErrInvalidMesh, err)
+		}
+		return address, nil
 	}
 	namespace := r.ClaimNamespace
 	if namespace == "" {
@@ -137,28 +139,24 @@ func (r *Reconciler) allocateMeshIP(ctx context.Context, cr *wirekubev1alpha1.Wi
 		MeshName:  mesh.Name,
 		MeshCIDR:  mesh.Spec.MeshCIDR,
 	}
-	// The claim is held under the resource name and derived from the display
-	// name. They differ on purpose: the address has always come from the
-	// display name and moving it would renumber peers that are up, but the
-	// display name is free-form text — a space or an apostrophe in it would
-	// make an invalid label value and fail every claim read and write.
+	// The claim is held under the resource name, prefixed by its kind, and
+	// derived from the display name. All three differ on purpose: the address
+	// has always come from the display name and moving it would renumber peers
+	// that are up; the display name is free-form text and would not survive as
+	// a label value; and an external peer can share a name with a node, so
+	// without the kind the two would adopt each other's claims.
 	//
 	// The address already published is the preference, so a peer that is up
 	// and connected is not renumbered by the switch to the allocator.
 	result, err := allocator.Allocate(ctx, meshalloc.Request{
-		Holder:    cr.Name,
+		Holder:    meshalloc.HolderForExternalPeer(cr.Name),
 		Name:      cr.Spec.DisplayName,
 		Preferred: cr.Status.AssignedMeshIP,
 	})
 	if err != nil {
-		// Exhaustion and a misconfigured mesh are terminal: nothing frees up
-		// on its own and retrying changes nothing. Anything else is the API
-		// server having a bad moment, and must be requeued rather than parked
-		// in Failed, where no further event is guaranteed once the status has
-		// settled and the peer would stay broken after the cluster recovered.
-		return "", errors.Is(err, meshalloc.ErrExhausted) || apierrors.IsInvalid(err), err
+		return "", err
 	}
-	return result.Address, false, nil
+	return result.Address, nil
 }
 
 // defaultClaimNamespace matches the agent's fallback.
@@ -321,16 +319,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// 5. /32 allocation.
-	meshIP, terminal, err := r.allocateMeshIP(ctx, cr, mesh)
-	if err != nil {
-		if !terminal {
-			// Returning the error requeues with backoff. Marking it Failed
-			// here would settle the status, and nothing is guaranteed to
-			// reconcile this peer again once the API server recovers.
-			return ctrl.Result{}, fmt.Errorf("allocate mesh IP for %s: %w", cr.Name, err)
-		}
+	//
+	// The three outcomes need three different answers. A mesh the allocator
+	// cannot work with at all — an unparseable CIDR, a mesh name that cannot
+	// label a claim — is a spec problem, and Failed says so. An exhausted pool
+	// is not: it is a wait for capacity, and the reaper frees addresses as
+	// peers go away, so parking it in Failed would leave the peer broken after
+	// the pool had room again. Anything else is the API server having a bad
+	// moment and has to be requeued rather than settled.
+	meshIP, err := r.allocateMeshIP(ctx, cr, mesh)
+	switch {
+	case err == nil:
+	case errors.Is(err, meshalloc.ErrInvalidMesh):
 		return r.failValidation(ctx, cr, reasonValidationFailed,
 			fmt.Sprintf("compute mesh IP: %v", err))
+	case errors.Is(err, meshalloc.ErrExhausted):
+		return r.markPending(ctx, cr, reasonMeshAddressesExhausted,
+			fmt.Sprintf("%v; widen the WireKubeMesh spec.meshCIDR", err), requeueLong)
+	default:
+		return ctrl.Result{}, fmt.Errorf("allocate mesh IP for %s: %w", cr.Name, err)
 	}
 
 	// 6. Ingress peer pick.
