@@ -595,10 +595,13 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 				PersistentKeepalive: defaultPeerKeepaliveSeconds,
 			},
 		}
-		applyMeshIP(a.log, mesh, name, &peer.Spec)
+		assigned := applyMeshIP(a.log, mesh, name, "", &peer.Spec)
 		applyNodeInternalIP(a.log, mesh, node, &peer.Spec)
 		if createErr := a.client.Create(ctx, peer); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return fmt.Errorf("creating own WireKubePeer: %w", createErr)
+		}
+		if err := a.recordMeshIP(ctx, name, assigned); err != nil {
+			a.log.V(1).Info("recording mesh IP", "error", err, "peer", name)
 		}
 		if method != "" {
 			if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
@@ -621,11 +624,14 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 	if !hasNodeOwnerReference(existing.OwnerReferences, node) {
 		existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
 	}
-	applyMeshIP(a.log, mesh, name, &existing.Spec)
+	assigned := applyMeshIP(a.log, mesh, name, existing.Status.MeshIP, &existing.Spec)
 	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
 	existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
 	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
 		return fmt.Errorf("patching own WireKubePeer: %w", patchErr)
+	}
+	if err := a.recordMeshIP(ctx, name, assigned); err != nil {
+		a.log.V(1).Info("recording mesh IP", "error", err, "peer", name)
 	}
 	if method != "" {
 		if err := a.updateDiscoveryMethod(ctx, name, method); err != nil {
@@ -669,22 +675,38 @@ func hasNodeOwnerReference(refs []metav1.OwnerReference, node *corev1.Node) bool
 	return false
 }
 
-// applyMeshIP ensures the deterministic mesh IP is the first entry in AllowedIPs.
+// applyMeshIP ensures this peer's mesh IP is the first entry in AllowedIPs and
+// returns the address it settled on ("" when it left AllowedIPs alone).
 // If meshCIDR is not configured, AllowedIPs is left unchanged so that manually
 // configured peers continue to work. Gateway-injected CIDRs beyond the mesh IP
 // are preserved so that injectGatewayRoutes and applyMeshIP don't fight each other.
-func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName string, spec *wirekubev1alpha1.WireKubePeerSpec) {
+//
+// recorded is status.meshIP, the address an allocator already handed this peer.
+// It wins over the name-derived one. The hash can only ever be a first choice —
+// two names can reduce into the same /32 — so once something has resolved a
+// collision, recomputing the hash here would drag the loser straight back onto
+// the contested address on every restart. A recorded address outside the mesh
+// CIDR is stale (the CIDR was widened or moved) and is re-derived.
+func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName, recorded string, spec *wirekubev1alpha1.WireKubePeerSpec) string {
 	if mesh == nil || mesh.Spec.MeshCIDR == "" {
-		return
+		return ""
 	}
-	meshIP, err := meship.IPForName(peerName, mesh.Spec.MeshCIDR)
-	if err != nil {
-		log.Error(err, "computing mesh IP", "peer", peerName, "meshCIDR", mesh.Spec.MeshCIDR)
-		return
+	meshIP := recorded
+	if meshIP == "" || !withinMesh(meshIP, mesh.Spec.MeshCIDR) {
+		if meshIP != "" {
+			log.Info("recorded mesh IP is not inside the mesh CIDR, re-deriving from the peer name",
+				"peer", peerName, "recorded", meshIP, "meshCIDR", mesh.Spec.MeshCIDR)
+		}
+		derived, err := meship.IPForName(peerName, mesh.Spec.MeshCIDR)
+		if err != nil {
+			log.Error(err, "computing mesh IP", "peer", peerName, "meshCIDR", mesh.Spec.MeshCIDR)
+			return ""
+		}
+		meshIP = derived
 	}
 	// If mesh IP is already first entry, preserve the rest (gateway CIDRs etc).
 	if len(spec.AllowedIPs) > 0 && spec.AllowedIPs[0] == meshIP {
-		return
+		return meshIP
 	}
 	// Replace only the first entry; keep any gateway-injected CIDRs that follow.
 	extra := []string{}
@@ -694,6 +716,37 @@ func applyMeshIP(log logr.Logger, mesh *wirekubev1alpha1.WireKubeMesh, peerName 
 		}
 	}
 	spec.AllowedIPs = append([]string{meshIP}, extra...)
+	return meshIP
+}
+
+// withinMesh reports whether address is a single host address ("a.b.c.d/32")
+// that meshCIDR can actually hand out. The network and broadcast addresses are
+// inside the CIDR but are not assignable, and meship never returns them, so a
+// recorded value landing on either is treated as stale rather than honoured.
+func withinMesh(address, meshCIDR string) bool {
+	ip, ipnet, err := net.ParseCIDR(address)
+	if err != nil {
+		return false
+	}
+	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
+		return false
+	}
+	_, mesh, err := net.ParseCIDR(meshCIDR)
+	if err != nil || !mesh.Contains(ip) {
+		return false
+	}
+	ip4, base := ip.To4(), mesh.IP.To4()
+	if ip4 == nil || base == nil {
+		return false
+	}
+	if ip4.Equal(base) {
+		return false
+	}
+	broadcast := make(net.IP, 4)
+	for i := range broadcast {
+		broadcast[i] = base[i] | ^mesh.Mask[i]
+	}
+	return !ip4.Equal(broadcast)
 }
 
 // applyNodeInternalIP, when WireKubeMesh.spec.autoAllowedIPs.includeNodeInternalIP
@@ -729,6 +782,30 @@ func containsString(items []string, value string) bool {
 		}
 	}
 	return false
+}
+
+// recordMeshIP publishes the address this peer settled on to status.meshIP, so
+// the next upsert honours it instead of re-deriving the name hash. It is the
+// write half of the read in applyMeshIP; the agent only ever writes its own
+// peer, and only when the value actually changes, so a steady-state mesh does
+// not generate status traffic.
+//
+// A failure here is logged and not fatal: the address is already in AllowedIPs
+// and carrying traffic, and the next upsert retries the record.
+func (a *Agent) recordMeshIP(ctx context.Context, name, address string) error {
+	if address == "" {
+		return nil
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	if err := a.client.Get(ctx, client.ObjectKey{Name: name}, peer); err != nil {
+		return err
+	}
+	if peer.Status.MeshIP == address {
+		return nil
+	}
+	patch := client.MergeFrom(peer.DeepCopy())
+	peer.Status.MeshIP = address
+	return a.client.Status().Patch(ctx, peer, patch)
 }
 
 func (a *Agent) updateDiscoveryMethod(ctx context.Context, name, method string) error {

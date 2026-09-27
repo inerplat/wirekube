@@ -263,6 +263,20 @@ spec:
                   - mac
                   type: object
                 type: array
+              meshIP:
+                description: |-
+                  MeshIP is the /32 overlay address this peer holds, in CIDR notation.
+                  It is the record of an allocation, not a request: whoever allocated the
+                  address writes it here, and the owning agent then keeps reproducing it
+                  as spec.allowedIPs[0] instead of re-deriving one from the peer name.
+
+                  The name-derived address is only a first choice — two names can hash
+                  into the same /32 — so an allocator that resolved a collision needs
+                  somewhere durable to say which address won. Without it, every agent
+                  restart would recompute the hash and move the peer back onto the
+                  contested address. Empty means no allocation was ever recorded, and the
+                  agent falls back to the hash.
+                type: string
               natType:
                 description: |-
                   NATType indicates the NAT mapping behavior detected on this node via STUN.
