@@ -69,8 +69,9 @@ func IPForNameAttempt(name, meshCIDR string, attempt int) (string, error) {
 	index := start
 	if attempt > 0 {
 		step := stepForName(name, usable)
-		// uint64 keeps the multiplication from wrapping before the modulo.
-		index = uint32((uint64(start) + uint64(step)*uint64(uint32(attempt))%uint64(usable)) % uint64(usable))
+		// Reducing the attempt first keeps the multiplication inside 64 bits
+		// for any attempt a caller can pass, not just ones below the capacity.
+		index = uint32((uint64(start) + uint64(step)*(uint64(attempt)%uint64(usable))) % uint64(usable))
 	}
 
 	ipInt := base + index + 1

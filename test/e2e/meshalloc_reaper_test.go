@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -85,7 +86,7 @@ func (f *reaperFixture) addPeer(name string) *wirekubev1alpha1.WireKubePeer {
 func TestReaperKeepsAClaimWhosePeerExists(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), "worker1", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(72 * time.Hour)
@@ -101,7 +102,7 @@ func TestReaperKeepsAClaimWhosePeerExists(t *testing.T) {
 // machine that is still booting.
 func TestReaperGivesAnEnrolmentItsGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), "enrolling", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "enrolling"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -124,7 +125,7 @@ func TestReaperGivesAnEnrolmentItsGrace(t *testing.T) {
 
 func TestReaperReclaimsAnOrphanAfterTheGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), "abandoned", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -141,7 +142,7 @@ func TestReaperReclaimsAnOrphanAfterTheGrace(t *testing.T) {
 func TestReaperGraceRunsFromTheDisappearance(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	peer := f.addPeer("long-lived")
-	if _, err := f.allocator.Allocate(context.Background(), "long-lived", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "long-lived"}); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(30 * 24 * time.Hour)
@@ -167,7 +168,7 @@ func TestReaperGraceRunsFromTheDisappearance(t *testing.T) {
 // long default.
 func TestReaperHonoursAClaimsOwnGrace(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), "slow-enrolment", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "slow-enrolment"}); err != nil {
 		t.Fatal(err)
 	}
 	setLeaseDuration(t, f.allocator.Namespace, "slow-enrolment", 3600)
@@ -191,7 +192,7 @@ func TestReaperHonoursAClaimsOwnGrace(t *testing.T) {
 func TestReaperReclaimsAnAddressOutsideTheCIDR(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("resident")
-	if _, err := f.allocator.Allocate(context.Background(), "resident", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "resident"}); err != nil {
 		t.Fatal(err)
 	}
 	// The operator moves the mesh to a different range.
@@ -225,7 +226,7 @@ func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), external) })
 
-	if _, err := f.allocator.Allocate(context.Background(), "someones-laptop", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "someones-laptop"}); err != nil {
 		t.Fatal(err)
 	}
 	f.advance(48 * time.Hour)
@@ -238,7 +239,7 @@ func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 func TestReaperReclaimsAClaimWithNoMesh(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), "worker1", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
 		t.Fatal(err)
 	}
 	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: f.mesh}}
@@ -255,14 +256,14 @@ func TestReaperReclaimsAClaimWithNoMesh(t *testing.T) {
 // reclaiming is that the address goes back into the pool.
 func TestReaperReclaimedAddressIsReusable(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	held, err := f.allocator.Allocate(context.Background(), "abandoned", "")
+	held, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
 	f.advance(11 * time.Minute)
 	f.sweep()
-	got, err := f.allocator.Allocate(context.Background(), "successor", held.Address)
+	got, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "successor", Preferred: held.Address})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +277,7 @@ func TestReaperReclaimedAddressIsReusable(t *testing.T) {
 // early one.
 func TestReaperSurvivesALeaderChange(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
-	if _, err := f.allocator.Allocate(context.Background(), "abandoned", ""); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
 	f.sweep()
@@ -319,4 +320,75 @@ func setLeaseDuration(t *testing.T, namespace, peer string, seconds int32) {
 	if err := k8sClient.Update(context.Background(), lease); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestReaperWithdrawsTheSeriesOfADeletedMesh. A frozen gauge is worse than no
+// gauge: an alert on free addresses would sit quietly on a pool that no longer
+// exists.
+func TestReaperWithdrawsTheSeriesOfADeletedMesh(t *testing.T) {
+	f := newReaperFixture(t, "198.18.18.0/24")
+	f.addPeer("worker1")
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	if got := gaugeValue(t, "wirekube_mesh_addresses_allocated", f.mesh); got != 1 {
+		t.Fatalf("allocated = %v, want 1", got)
+	}
+
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: f.mesh}}
+	if err := k8sClient.Delete(context.Background(), mesh); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	if metricExists(t, "wirekube_mesh_addresses_allocated", f.mesh) {
+		t.Error("the deleted mesh still reports a pool")
+	}
+}
+
+func gaugeValue(t *testing.T, name, mesh string) float64 {
+	t.Helper()
+	// promauto registers into the default registry, which is what the agent
+	// serves at /metrics via promhttp.Handler.
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "mesh" && label.GetValue() == mesh {
+					return metric.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("no %s series for mesh %q", name, mesh)
+	return 0
+}
+
+func metricExists(t *testing.T, name, mesh string) bool {
+	t.Helper()
+	// promauto registers into the default registry, which is what the agent
+	// serves at /metrics via promhttp.Handler.
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "mesh" && label.GetValue() == mesh {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
