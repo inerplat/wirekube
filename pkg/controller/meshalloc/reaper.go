@@ -151,8 +151,10 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 	for i := range meshList.Items {
 		mesh := &meshList.Items[i]
 		capacity, err := meship.Capacity(mesh.Spec.MeshCIDR)
-		if err != nil {
-			// A mesh with no usable CIDR has no pool to report on.
+		if err != nil || !mesh.Spec.UsesAddressAllocator() {
+			// No usable CIDR, or nothing arbitrating: either way there is no
+			// pool. Reporting one for a hash mesh would show every address
+			// free while every peer is using one.
 			clearOccupancy(mesh.Name)
 			continue
 		}
@@ -176,11 +178,20 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 func (r *Reaper) shouldReclaim(claim *coordinationv1.Lease, mesh *wirekubev1alpha1.WireKubeMesh, holders map[string]struct{}) (string, bool) {
 	address := claim.Annotations[meshalloc.AddressAnnotation]
 	if mesh == nil {
+		// A missing mesh is not proof the mesh was deleted. The list comes
+		// from an informer, and an operator re-applying the chart deletes and
+		// recreates the object, so a sweep landing in that window would
+		// otherwise reclaim every claim in the namespace at once while every
+		// peer is still up and advertising its address. The grace makes the
+		// absence have to persist.
+		if reclaim := r.pastGrace(claim); !reclaim {
+			return "", false
+		}
 		return "the mesh it was claimed in no longer exists", true
 	}
 	if address == "" || !meship.Contains(address, mesh.Spec.MeshCIDR) {
 		// The CIDR moved or shrank under the claim. The address can never be
-		// handed out again, so holding it serves nobody — and the peer that
+		// handed out again, so holding it serves nobody, and the peer that
 		// held it has already been renumbered by the allocator.
 		return fmt.Sprintf("%s is outside the mesh CIDR %s", address, mesh.Spec.MeshCIDR), true
 	}
@@ -200,12 +211,17 @@ func (r *Reaper) shouldReclaim(claim *coordinationv1.Lease, mesh *wirekubev1alph
 	// No peer holds it. Give the holder the grace period to appear: an
 	// enrolment claims the address before the machine that will advertise it
 	// has finished booting.
-	since := r.orphanedAt(claim)
-	grace := r.grace(claim)
-	if r.now().Sub(since) < grace {
+	if !r.pastGrace(claim) {
 		return "", false
 	}
-	return fmt.Sprintf("no peer named %q has existed for %s", holder, grace), true
+	return fmt.Sprintf("no peer named %q has existed for %s", holder, r.grace(claim)), true
+}
+
+// pastGrace reports whether a claim has looked unclaimable for long enough to
+// act on. Everything that reclaims goes through it, so no single lagging read
+// can delete a claim on its own.
+func (r *Reaper) pastGrace(claim *coordinationv1.Lease) bool {
+	return r.now().Sub(r.orphanedAt(claim)) >= r.grace(claim)
 }
 
 // orphanedAt is when this claim started looking orphaned: the later of when it
@@ -277,13 +293,13 @@ func (r *Reaper) peerNames(ctx context.Context) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("list WireKubeExternalPeer: %w", err)
 	}
 	for i := range external.Items {
-		peer := &external.Items[i]
-		names[peer.Name] = struct{}{}
-		// The reconciler allocates under the display name, which is what the
-		// address is derived from and therefore what holds the claim.
-		if peer.Spec.DisplayName != "" {
-			names[peer.Spec.DisplayName] = struct{}{}
-		}
+		// Only the resource name. An external peer's address derives from its
+		// display name, but the claim is held under the resource name, so
+		// adding display names would protect nothing and would widen the set
+		// with operator-supplied text: a peer whose display name happens to
+		// match a decommissioned node would keep that node's orphaned claim
+		// alive forever, which is the one thing this sweep exists to collect.
+		names[external.Items[i].Name] = struct{}{}
 	}
 	return names, nil
 }

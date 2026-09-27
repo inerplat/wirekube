@@ -27,6 +27,10 @@ type reaperFixture struct {
 }
 
 func newReaperFixture(t *testing.T, cidr string) *reaperFixture {
+	return newReaperFixtureWith(t, cidr, wirekubev1alpha1.AddressAllocationAllocator)
+}
+
+func newReaperFixtureWith(t *testing.T, cidr, allocation string) *reaperFixture {
 	t.Helper()
 	namespace := allocNamespace(t)
 	meshName := sanitize(t.Name())
@@ -35,7 +39,10 @@ func newReaperFixture(t *testing.T, cidr string) *reaperFixture {
 	}
 	mesh := &wirekubev1alpha1.WireKubeMesh{
 		ObjectMeta: metav1.ObjectMeta{Name: meshName},
-		Spec:       wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: cidr},
+		Spec: wirekubev1alpha1.WireKubeMeshSpec{
+			MeshCIDR:          cidr,
+			AddressAllocation: allocation,
+		},
 	}
 	if err := k8sClient.Create(context.Background(), mesh); err != nil {
 		t.Fatalf("create mesh: %v", err)
@@ -210,14 +217,15 @@ func TestReaperReclaimsAnAddressOutsideTheCIDR(t *testing.T) {
 	}
 }
 
-// TestReaperKeepsAnExternalPeersClaim: external peers hold their address under
-// the display name the address is derived from, not under the resource name.
+// TestReaperKeepsAnExternalPeersClaim. An external peer's address derives from
+// its display name but the claim is held under the resource name, which is
+// what the reaper looks up.
 func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 	f := newReaperFixture(t, "198.18.18.0/24")
 	external := &wirekubev1alpha1.WireKubeExternalPeer{
 		ObjectMeta: metav1.ObjectMeta{Name: "laptop-cr"},
 		Spec: wirekubev1alpha1.WireKubeExternalPeerSpec{
-			DisplayName: "someones-laptop",
+			DisplayName: "Someone's Laptop",
 			PublicKey:   "0000000000000000000000000000000000000000000=",
 		},
 	}
@@ -226,29 +234,17 @@ func TestReaperKeepsAnExternalPeersClaim(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), external) })
 
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "someones-laptop"}); err != nil {
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{
+		Holder: external.Name,
+		Name:   external.Spec.DisplayName,
+	}); err != nil {
 		t.Fatal(err)
 	}
+	f.sweep()
 	f.advance(48 * time.Hour)
 	f.sweep()
 	if n := f.claims(); n != 1 {
 		t.Errorf("%d claims, want the external peer's kept", n)
-	}
-}
-
-func TestReaperReclaimsAClaimWithNoMesh(t *testing.T) {
-	f := newReaperFixture(t, "198.18.18.0/24")
-	f.addPeer("worker1")
-	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
-		t.Fatal(err)
-	}
-	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: f.mesh}}
-	if err := k8sClient.Delete(context.Background(), mesh); err != nil {
-		t.Fatal(err)
-	}
-	f.sweep()
-	if n := f.claims(); n != 0 {
-		t.Errorf("%d claims, want claims for a deleted mesh reclaimed", n)
 	}
 }
 
@@ -391,4 +387,114 @@ func metricExists(t *testing.T, name, mesh string) bool {
 		}
 	}
 	return false
+}
+
+// TestReaperWaitsOutAMissingMesh. A mesh absent from one list is not proof it
+// was deleted: the list comes from an informer, and re-applying the chart
+// deletes and recreates the object. Without a grace here, a sweep landing in
+// that window would reclaim every claim in the namespace while every peer was
+// still up and advertising its address.
+func TestReaperWaitsOutAMissingMesh(t *testing.T) {
+	f := newReaperFixture(t, "198.18.18.0/24")
+	f.addPeer("worker1")
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: f.mesh}}
+	if err := k8sClient.Delete(context.Background(), mesh); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	if n := f.claims(); n != 1 {
+		t.Fatalf("%d claims, want the claim to survive a mesh that has only just gone", n)
+	}
+	// Recreating it inside the grace leaves the claim untouched.
+	mesh = &wirekubev1alpha1.WireKubeMesh{
+		ObjectMeta: metav1.ObjectMeta{Name: f.mesh},
+		Spec:       wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: "198.18.18.0/24"},
+	}
+	if err := k8sClient.Create(context.Background(), mesh); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(48 * time.Hour)
+	f.sweep()
+	if n := f.claims(); n != 1 {
+		t.Errorf("%d claims, want the claim kept once the mesh came back", n)
+	}
+}
+
+// TestReaperReclaimsAfterTheMeshStaysGone keeps the other half honest: the
+// grace delays the reclaim, it does not cancel it.
+func TestReaperReclaimsAfterTheMeshStaysGone(t *testing.T) {
+	f := newReaperFixture(t, "198.18.18.0/24")
+	f.addPeer("worker1")
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	mesh := &wirekubev1alpha1.WireKubeMesh{ObjectMeta: metav1.ObjectMeta{Name: f.mesh}}
+	if err := k8sClient.Delete(context.Background(), mesh); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	f.advance(11 * time.Minute)
+	f.sweep()
+	if n := f.claims(); n != 0 {
+		t.Errorf("%d claims, want them reclaimed once the mesh stayed gone", n)
+	}
+}
+
+// TestReaperDoesNotTreatADisplayNameAsAHolder. Claims are held under resource
+// names. Counting free-form display names as live holders would keep the
+// orphaned claim of a decommissioned node alive forever whenever somebody
+// invited an external peer under that node's name.
+func TestReaperDoesNotTreatADisplayNameAsAHolder(t *testing.T) {
+	f := newReaperFixture(t, "198.18.18.0/24")
+	if _, err := f.allocator.Allocate(context.Background(), meshalloc.Request{Holder: "worker1"}); err != nil {
+		t.Fatal(err)
+	}
+	external := &wirekubev1alpha1.WireKubeExternalPeer{
+		ObjectMeta: metav1.ObjectMeta{Name: "someones-laptop"},
+		Spec: wirekubev1alpha1.WireKubeExternalPeerSpec{
+			DisplayName: "worker1",
+			PublicKey:   "0000000000000000000000000000000000000000000=",
+		},
+	}
+	if err := k8sClient.Create(context.Background(), external); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), external) })
+
+	f.sweep()
+	f.advance(11 * time.Minute)
+	f.sweep()
+	if n := f.claims(); n != 0 {
+		t.Errorf("%d claims, want the orphan reclaimed despite a display name that matches it", n)
+	}
+}
+
+// TestReaperReportsNoPoolForAHashMesh. A mesh that does not arbitrate has no
+// claims to count, so publishing a pool for it would read as every address
+// free while every peer is using one.
+func TestReaperReportsNoPoolForAHashMesh(t *testing.T) {
+	f := newReaperFixtureWith(t, "198.18.18.0/24", wirekubev1alpha1.AddressAllocationHash)
+	f.sweep()
+	if metricExists(t, "wirekube_mesh_addresses_capacity", f.mesh) {
+		t.Error("a hash mesh reported a pool")
+	}
+
+	mesh := &wirekubev1alpha1.WireKubeMesh{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: f.mesh}, mesh); err != nil {
+		t.Fatal(err)
+	}
+	mesh.Spec.AddressAllocation = wirekubev1alpha1.AddressAllocationAllocator
+	if err := k8sClient.Update(context.Background(), mesh); err != nil {
+		t.Fatal(err)
+	}
+	f.sweep()
+	if got := gaugeValue(t, "wirekube_mesh_addresses_capacity", f.mesh); got != 254 {
+		t.Errorf("capacity = %v, want 254 once the mesh arbitrates", got)
+	}
 }

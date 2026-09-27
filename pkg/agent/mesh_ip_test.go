@@ -9,6 +9,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -164,7 +165,11 @@ func TestAllocateMeshIPIsInertUntilTheMeshOptsIn(t *testing.T) {
 		{Spec: wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: "198.18.18.0/24"}},
 		{Spec: wirekubev1alpha1.WireKubeMeshSpec{MeshCIDR: "198.18.18.0/24", AddressAllocation: wirekubev1alpha1.AddressAllocationHash}},
 	} {
-		if got := a.allocateMeshIP(context.Background(), mesh, "worker1", "198.18.18.9/32"); got != "198.18.18.9/32" {
+		got, err := a.allocateMeshIP(context.Background(), mesh, "worker1", "198.18.18.9/32")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "198.18.18.9/32" {
 			t.Errorf("returned %q, want the recorded address passed straight through", got)
 		}
 	}
@@ -184,7 +189,10 @@ func TestAllocateMeshIPClaimsWhenTheMeshOptsIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := a.allocateMeshIP(context.Background(), allocatorMesh("198.18.18.0/24"), "worker1", "")
+	got, err := a.allocateMeshIP(context.Background(), allocatorMesh("198.18.18.0/24"), "worker1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != want {
 		t.Errorf("returned %q, want the hashed %q", got, want)
 	}
@@ -210,7 +218,11 @@ func TestAllocateMeshIPAdoptsAPreClaimedAddress(t *testing.T) {
 	}
 
 	a := &Agent{log: testr.New(t), client: c, nodeName: "worker1", podNamespace: "wirekube-system"}
-	if got := a.allocateMeshIP(context.Background(), mesh, "worker1", ""); got != preClaimed {
+	got, err := a.allocateMeshIP(context.Background(), mesh, "worker1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != preClaimed {
 		t.Errorf("returned %q, want the pre-claimed %q", got, preClaimed)
 	}
 	claims := &coordinationv1.LeaseList{}
@@ -226,11 +238,55 @@ func TestAllocateMeshIPAdoptsAPreClaimedAddress(t *testing.T) {
 // would put this peer back on the address a collision would have moved it off,
 // which is the one outcome worse than not allocating at all.
 func TestAllocateMeshIPKeepsTheRecordWhenTheAPIFails(t *testing.T) {
-	a := &Agent{log: testr.New(t), client: nil, nodeName: "worker1", podNamespace: "wirekube-system"}
+	a := &Agent{log: testr.New(t), client: failingClient{allocatorTestClient(t)}, nodeName: "worker1", podNamespace: "wirekube-system"}
 	const recorded = "198.18.18.177/32"
-	if got := a.allocateMeshIP(context.Background(), allocatorMesh("198.18.18.0/24"), "worker1", recorded); got != recorded {
+	got, err := a.allocateMeshIP(context.Background(), allocatorMesh("198.18.18.0/24"), "worker1", recorded)
+	if err != nil {
+		t.Fatalf("a peer that already has an address should not fail: %v", err)
+	}
+	if got != recorded {
 		t.Errorf("returned %q, want the recorded %q kept", got, recorded)
 	}
+}
+
+// TestAllocateMeshIPFailsRatherThanTakeAnUnclaimedAddress. allocateMeshIP runs
+// once per agent process, from setup. A peer with nothing recorded that fell
+// through to the name hash here would sit on an address nobody claimed until
+// the pod restarted, so the error has to reach setup, which Run retries.
+func TestAllocateMeshIPFailsRatherThanTakeAnUnclaimedAddress(t *testing.T) {
+	a := &Agent{log: testr.New(t), client: failingClient{allocatorTestClient(t)}, nodeName: "worker1", podNamespace: "wirekube-system"}
+	got, err := a.allocateMeshIP(context.Background(), allocatorMesh("198.18.18.0/24"), "worker1", "")
+	if err == nil {
+		t.Fatalf("returned %q instead of failing", got)
+	}
+	if got != "" {
+		t.Errorf("returned %q alongside the error", got)
+	}
+}
+
+// TestUpsertOwnPeerFailsWhenTheAddressCannotBeClaimed carries that through to
+// setup rather than registering a peer on an address it does not hold.
+func TestUpsertOwnPeerFailsWhenTheAddressCannotBeClaimed(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker1", UID: "node-uid-1"}}
+	c := allocatorTestClient(t, node)
+	a := &Agent{log: testr.New(t), client: failingClient{c}, nodeName: "worker1", podNamespace: "wirekube-system"}
+	if err := a.upsertOwnPeer(context.Background(), allocatorMesh("198.18.18.0/24"), node, "worker1", "pubkey", nil); err == nil {
+		t.Fatal("upsertOwnPeer registered a peer without claiming its address")
+	}
+	peer := &wirekubev1alpha1.WireKubePeer{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "worker1"}, peer); err == nil {
+		t.Errorf("the peer was created anyway, advertising %v", peer.Spec.AllowedIPs)
+	}
+}
+
+// failingClient rejects every write, which is what a throttled or briefly
+// unavailable API server looks like to the allocator.
+type failingClient struct {
+	client.Client
+}
+
+func (c failingClient) Create(context.Context, client.Object, ...client.CreateOption) error {
+	return apierrors.NewServiceUnavailable("the server is currently unable to handle the request")
 }
 
 // TestUpsertOwnPeerRecordsTheAllocatedAddress ties the two halves together:
