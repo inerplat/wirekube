@@ -15,12 +15,14 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -28,6 +30,7 @@ import (
 	agentpkg "github.com/inerplat/wirekube/pkg/agent"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	externalctrl "github.com/inerplat/wirekube/pkg/controller/external"
+	meshallocctrl "github.com/inerplat/wirekube/pkg/controller/meshalloc"
 	relayendpointctrl "github.com/inerplat/wirekube/pkg/controller/relayendpoint"
 	"github.com/inerplat/wirekube/pkg/wireguard"
 )
@@ -290,6 +293,18 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 		LeaderElection:          true,
 		LeaderElectionID:        "wirekube-external-peer.wirekube.io",
 		LeaderElectionNamespace: os.Getenv("POD_NAMESPACE"),
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				// Mesh address claims are Leases, and reading one through the
+				// manager's client starts an informer on the kind. Left
+				// cluster-wide that would cache every kubelet Lease in
+				// kube-node-lease — one per node, each renewed every ten
+				// seconds — to watch the handful of claims that live here.
+				&coordinationv1.Lease{}: {
+					Namespaces: map[string]cache.Config{relayNamespace: {}},
+				},
+			},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("create external-peer manager: %w", err)
@@ -305,6 +320,7 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 		RelayResolver: func(ctx context.Context, mesh *wirekubev1alpha1.WireKubeMesh) externalctrl.RelayController {
 			return relayControllerFromMesh(ctx, mgr.GetClient(), mesh, relayNamespace)
 		},
+		ClaimNamespace: relayNamespace,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup external-peer reconciler: %w", err)
@@ -319,6 +335,19 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 	}
 	if err := endpointSync.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup relay-endpoint reconciler: %w", err)
+	}
+
+	// Mesh address claims have no ownerReference — an enrolment claims an
+	// address before the peer that will hold it exists — so nothing else
+	// collects the ones whose holder went away. The sweep rides this
+	// manager's leader election so exactly one agent runs it.
+	reaper := &meshallocctrl.Reaper{
+		Client:    mgr.GetClient(),
+		Namespace: relayNamespace,
+		Log:       log.WithName("meshalloc"),
+	}
+	if err := mgr.Add(reaper); err != nil {
+		return fmt.Errorf("setup mesh address reaper: %w", err)
 	}
 
 	go func() {
