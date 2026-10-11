@@ -49,6 +49,7 @@ The job runs on the target node and performs:
 - Removes WireKube iptables rules
 - Flushes all routes in the WireKube routing table (table 22347)
 - Removes ip rules (fwmark and table lookup)
+- Removes gateway IPsec state: table 22348 and its rule, `wkx*` interfaces, and the `WIREKUBE-IPSEC-GUARD` chain
 - Deletes the WireGuard interface (`wire_kube`)
 - Removes key material from `/var/lib/wirekube`
 
@@ -88,6 +89,15 @@ ip link delete "$IFACE"
 
 # Remove key material
 rm -rf /var/lib/wirekube
+
+# Remove gateway IPsec state, if the node terminated tunnels
+ip route flush table 22348
+while ip rule del prio 198 table 22348 2>/dev/null; do :; done
+for link in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^wkx'); do ip link delete "$link"; done
+for hook in FORWARD OUTPUT; do
+  while iptables -D "$hook" -j WIREKUBE-IPSEC-GUARD 2>/dev/null; do :; done
+done
+iptables -F WIREKUBE-IPSEC-GUARD; iptables -X WIREKUBE-IPSEC-GUARD
 
 # Clean up iptables (if KUBE-FIREWALL chain exists)
 iptables -t filter -D KUBE-FIREWALL \

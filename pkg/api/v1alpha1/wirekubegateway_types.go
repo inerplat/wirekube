@@ -31,6 +31,17 @@ type WireKubeGatewaySpec struct {
 	// +optional
 	SNAT *GatewaySNAT `json:"snat,omitempty"`
 
+	// IPsec lists site-to-site IPsec tunnels the active peer terminates
+	// toward the networks in Routes, for example to a cloud VPN gateway.
+	// Requires IPsec enabled on the agents (chart value agent.ipsec.enabled,
+	// wirekubectl --ipsec). With tunnels set, status.ready means at least one
+	// of them is Established.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=8
+	IPsec []GatewayIPsecTunnel `json:"ipsec,omitempty"`
+
 	// HealthCheck verifies that the target network is reachable through the gateway.
 	// When the health check fails, traffic is rerouted to the next peer in PeerRefs.
 	// +optional
@@ -104,6 +115,17 @@ type WireKubeGatewayStatus struct {
 	// +optional
 	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 
+	// IPsecSummary is a one-line tunnel state for kubectl get, such as
+	// "1/2 Established".
+	// +optional
+	IPsecSummary string `json:"ipsecSummary,omitempty"`
+
+	// IPsec reports each tunnel in spec.ipsec.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	IPsec []GatewayIPsecTunnelStatus `json:"ipsec,omitempty"`
+
 	// Conditions reflect the current state of the gateway.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
@@ -115,6 +137,7 @@ type WireKubeGatewayStatus struct {
 // +kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.activePeer`
 // +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`
 // +kubebuilder:printcolumn:name="Routes",type=integer,JSONPath=`.status.routesInjected`
+// +kubebuilder:printcolumn:name="IPsec",type=string,JSONPath=`.status.ipsecSummary`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // WireKubeGateway defines a virtual gateway in the WireKube mesh.

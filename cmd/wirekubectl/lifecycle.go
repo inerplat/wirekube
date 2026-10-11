@@ -42,6 +42,9 @@ type lifecycleFlags struct {
 	excludeCIDRs       []string
 	dryRun             bool
 	adopt              bool
+	ipsec              bool
+	charonImage        string
+	charonNodeSelector map[string]string
 }
 
 type componentStatus struct {
@@ -259,6 +262,9 @@ func doctorCmd() *cobra.Command {
 					add("relay-reachability", reachable, message)
 				}
 			}
+			if ok, message, relevant := checkIPsecTunnels(cmd.Context(), c); relevant {
+				add("ipsec", ok, message)
+			}
 			return writeDoctorResult(cmd, result)
 		},
 	}
@@ -323,6 +329,10 @@ func inspectInstallation(ctx context.Context, c client.Client, inventory *intern
 		}
 	}
 	addComponent(agent)
+
+	if inventory.Options.IPsec {
+		addComponent(inspectCharon(ctx, c, inventory))
+	}
 
 	mesh := &wirekubev1alpha1.WireKubeMesh{}
 	meshErr := c.Get(ctx, client.ObjectKey{Name: "default"}, mesh)
@@ -751,6 +761,9 @@ func addLifecycleFlags(cmd *cobra.Command, flags *lifecycleFlags) {
 	cmd.Flags().StringSliceVar(&flags.excludeCIDRs, "exclude-cidr", nil, "CIDR that automatic mesh selection must avoid; may be repeated")
 	cmd.Flags().BoolVar(&flags.dryRun, "dry-run", false, "inspect and print the plan without mutating the cluster")
 	cmd.Flags().BoolVar(&flags.adopt, "adopt", false, "explicitly adopt conflicting existing resources, taking over their field ownership")
+	cmd.Flags().BoolVar(&flags.ipsec, "ipsec", false, "add the strongSwan charon DaemonSet so WireKubeGateway spec.ipsec tunnels are terminated")
+	cmd.Flags().StringVar(&flags.charonImage, "charon-image", "", "charon image (default: the --image repository with a -charon suffix and the same tag)")
+	cmd.Flags().StringToStringVar(&flags.charonNodeSelector, "charon-node-selector", nil, "node labels (key=value,...) of the nodes that run charon and listen on UDP 500/4500, typically the gateway nodes (default: every agent node)")
 }
 
 func buildInstallationPlan(cmd *cobra.Command, flags *lifecycleFlags) (internalinstall.Plan, internalinstall.Options, internalinstall.Installer, error) {
@@ -760,6 +773,18 @@ func buildInstallationPlan(cmd *cobra.Command, flags *lifecycleFlags) (internali
 		return internalinstall.Plan{}, internalinstall.Options{}, internalinstall.Installer{}, err
 	}
 	return buildInstallationPlanWithClient(cmd, flags, c, factory, internalinstall.Installer{Client: c})
+}
+
+// charonImageFor returns the --charon-image value, or the charon image
+// released with this CLI when the agent image is the released default.
+func charonImageFor(flags *lifecycleFlags) string {
+	if image := strings.TrimSpace(flags.charonImage); image != "" || !flags.ipsec {
+		return image
+	}
+	if internalversion.DefaultCharonImage != "" && flags.image == internalversion.DefaultImage {
+		return internalversion.DefaultCharonImage
+	}
+	return ""
 }
 
 func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, c client.Client, factory *internalconfig.Factory, installer internalinstall.Installer) (internalinstall.Plan, internalinstall.Options, internalinstall.Installer, error) {
@@ -772,7 +797,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 		return internalinstall.Plan{}, internalinstall.Options{}, installer, err
 	}
 	installOptions := internalinstall.Options{
-		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ImagePullSecrets: flags.imagePullSecrets, ExcludeCIDRs: flags.excludeCIDRs, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version,
+		Namespace: options.namespace, Image: flags.image, Relay: flags.relay, RelayEndpoint: flags.relayEndpoint, RelayUDPEndpoint: flags.relayUDPEndpoint, RelayTransport: flags.relayTransport, RelayUDP: flags.relayUDP, RelayUDPConfigured: flags.relayUDPConfigured || cmd.Flags().Changed("relay-udp"), PreviousResources: flags.previousResources, MeshCIDR: flags.meshCIDR, NodeAddresses: flags.nodeAddresses, ListenPort: flags.listenPort, ImagePullSecrets: flags.imagePullSecrets, ExcludeCIDRs: flags.excludeCIDRs, DryRun: flags.dryRun, Adopt: flags.adopt, Timeout: options.timeout, Context: contextName, ClusterServer: server, AgentAPIServer: flags.agentAPIServer, WireKubeVersion: internalversion.Version, IPsec: flags.ipsec, CharonImage: charonImageFor(flags), CharonNodeSelector: flags.charonNodeSelector,
 	}
 	plan, normalized, err := (internalinstall.Planner{Client: c, Discovery: discovery, AccessReviewer: internalinstall.SelfSubjectAccessReviewer{Client: c}}).Build(cmd.Context(), installOptions)
 	return plan, normalized, installer, err
@@ -836,6 +861,18 @@ func applyStoredLifecycleDefaults(cmd *cobra.Command, flags *lifecycleFlags, sto
 	}
 	if !cmd.Flags().Changed("image") && strings.TrimSpace(flags.image) == "" {
 		flags.image = stored.Image
+	}
+	if !cmd.Flags().Changed("ipsec") {
+		flags.ipsec = stored.IPsec
+	}
+	// The charon image follows the agent image, which an upgrade moves to the
+	// CLI's default even without --image. Keep the stored one only while the
+	// agent image is unchanged.
+	if !cmd.Flags().Changed("charon-image") && flags.image == stored.Image {
+		flags.charonImage = stored.CharonImage
+	}
+	if !cmd.Flags().Changed("charon-node-selector") {
+		flags.charonNodeSelector = stored.CharonNodeSelector
 	}
 }
 

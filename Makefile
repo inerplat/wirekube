@@ -1,4 +1,5 @@
 IMG ?= inerplat/wirekube
+CHARON_IMG ?= $(IMG)-charon
 VERSION ?= v0.0.22-dev.1
 
 GO = go
@@ -55,6 +56,15 @@ docker-build:
 .PHONY: docker-push
 docker-push:
 	docker buildx build --platform linux/amd64,linux/arm64 -t $(IMG):$(VERSION) --push .
+
+# strongSwan image for gateway IPsec, tagged like the agent image.
+.PHONY: docker-build-charon
+docker-build-charon:
+	docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.charon -t $(CHARON_IMG):$(VERSION) --load .
+
+.PHONY: docker-push-charon
+docker-push-charon:
+	docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.charon -t $(CHARON_IMG):$(VERSION) --push .
 
 .PHONY: podman-build
 podman-build:
@@ -145,6 +155,12 @@ kind-e2e-flannel:
 kind-e2e-calico:
 	WIREKUBE_E2E_CNI_MODE=calico $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
 
+# kind-e2e-ipsec: gateway IPsec against a simulated remote site. Needs the
+# charon image (make docker-build-charon).
+.PHONY: kind-e2e-ipsec
+kind-e2e-ipsec:
+	WIREKUBE_E2E_IPSEC=1 $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -run TestIPsecGateway -timeout 30m
+
 .PHONY: kind-e2e-all
 kind-e2e-all:
 	WIREKUBE_E2E_CNI_MODE=cilium-kube-proxy $(GO) test -tags kind_e2e -v ./test/kind_e2e/... -timeout 30m
@@ -184,3 +200,4 @@ help:
 	@echo "  kind-e2e-flannel   Run kind-based e2e tests with Flannel CNI"
 	@echo "  kind-e2e-calico    Run kind-based e2e tests with Calico CNI"
 	@echo "  kind-e2e-all       Run e2e in all CNI modes (Cilium + Flannel + Calico)"
+	@echo "  kind-e2e-ipsec     Run the gateway IPsec e2e against a simulated remote site"

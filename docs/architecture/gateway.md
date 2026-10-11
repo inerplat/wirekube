@@ -27,6 +27,9 @@ from client peers, decrypts it, and forwards it into the local network.
 Return traffic is SNATed so that the destination sees the gateway's IP as the
 source, ensuring correct return path.
 
+To reach a network through its IPsec gateway instead of a node inside it, add
+tunnels under `spec.ipsec`; see [Site-to-Site IPsec](ipsec.md).
+
 ## CRD: WireKubeGateway
 
 ```yaml

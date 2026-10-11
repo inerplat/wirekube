@@ -26,6 +26,9 @@ spec:
     - jsonPath: .status.routesInjected
       name: Routes
       type: integer
+    - jsonPath: .status.ipsecSummary
+      name: IPsec
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -105,6 +108,182 @@ spec:
                 - enabled
                 - target
                 type: object
+              ipsec:
+                description: |-
+                  IPsec lists site-to-site IPsec tunnels the active peer terminates
+                  toward the networks in Routes, for example to a cloud VPN gateway.
+                  Requires IPsec enabled on the agents (chart value agent.ipsec.enabled,
+                  wirekubectl --ipsec). With tunnels set, status.ready means at least one
+                  of them is Established.
+                items:
+                  description: |-
+                    GatewayIPsecTunnel is a site-to-site IPsec tunnel terminated by the
+                    gateway's active peer. Mesh traffic for the gateway's routes reaches that
+                    peer through WireGuard and leaves through the tunnel; return traffic comes
+                    back the same way. The gateway should not enable SNAT: the remote side
+                    routes the local traffic selectors back through the tunnel.
+                  properties:
+                    dataplane:
+                      default: Auto
+                      description: Dataplane selects how traffic is steered into the
+                        tunnel.
+                      enum:
+                      - Auto
+                      - XFRMInterface
+                      - Policy
+                      type: string
+                    dpd:
+                      description: DPD configures dead peer detection.
+                      properties:
+                        action:
+                          description: Action taken when the remote peer is declared
+                            dead.
+                          enum:
+                          - restart
+                          - clear
+                          - trap
+                          type: string
+                        delaySeconds:
+                          description: DelaySeconds between DPD checks when the tunnel
+                            is idle. Defaults to 30.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      type: object
+                    esp:
+                      description: ESP configures the CHILD_SA.
+                      properties:
+                        lifetimeSeconds:
+                          description: LifetimeSeconds is the CHILD_SA rekey time.
+                            Defaults to 3600.
+                          format: int32
+                          minimum: 120
+                          type: integer
+                        proposals:
+                          description: |-
+                            Proposals are strongSwan ESP proposals. Defaults to
+                            "aes256-sha256-modp2048".
+                          items:
+                            pattern: ^[a-z0-9]+(-[a-z0-9]+)*$
+                            type: string
+                          type: array
+                      type: object
+                    forceEncapsulation:
+                      description: |-
+                        ForceEncapsulation forces UDP encapsulation (NAT-T on port 4500) even
+                        when no NAT is detected. Useful when a firewall passes UDP but not ESP.
+                      type: boolean
+                    ike:
+                      description: IKE configures the IKE_SA.
+                      properties:
+                        lifetimeSeconds:
+                          description: LifetimeSeconds is the IKE_SA rekey time. Defaults
+                            to 28800.
+                          format: int32
+                          minimum: 120
+                          type: integer
+                        proposals:
+                          description: |-
+                            Proposals are strongSwan IKE proposals, for example
+                            "aes256-sha256-modp2048". Defaults to that single proposal.
+                          items:
+                            pattern: ^[a-z0-9]+(-[a-z0-9]+)*$
+                            type: string
+                          type: array
+                        version:
+                          description: Version is the IKE version.
+                          enum:
+                          - 1
+                          - 2
+                          format: int32
+                          type: integer
+                      type: object
+                    interfaceID:
+                      description: |-
+                        InterfaceID pins the XFRM interface ID. Zero derives a stable ID from
+                        the tunnel name. 4294967295 is reserved by strongSwan.
+                      format: int64
+                      maximum: 4294967294
+                      minimum: 0
+                      type: integer
+                    localID:
+                      description: |-
+                        LocalID is the IKE identity this side presents. Defaults to the IP
+                        address in the active peer's WireKubePeer endpoint, which is the
+                        address the remote gateway sees, also behind 1:1 NAT.
+                      type: string
+                    localTrafficSelectors:
+                      description: |-
+                        LocalTrafficSelectors are the networks on the mesh side that the remote
+                        gateway routes into the tunnel. Defaults to the mesh CIDR. Add pod
+                        CIDRs here when pods must reach the remote network directly.
+                      items:
+                        pattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
+                        type: string
+                      maxItems: 16
+                      type: array
+                    mtu:
+                      description: |-
+                        MTU of the XFRM interface. Defaults to 1400, which leaves room for ESP
+                        with NAT-T inside a 1500-byte underlay.
+                      format: int32
+                      maximum: 9000
+                      minimum: 576
+                      type: integer
+                    name:
+                      description: Name identifies the tunnel within the gateway.
+                      maxLength: 32
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    preSharedKeyRef:
+                      description: |-
+                        PreSharedKeyRef points at the pre-shared key. The Secret must live in
+                        the agent's namespace; the agent reads no Secret outside it.
+                      properties:
+                        key:
+                          description: Key within the Secret. Defaults to "psk".
+                          type: string
+                        name:
+                          description: Name of the Secret.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    remoteAddress:
+                      description: |-
+                        RemoteAddress is the public address (IP or DNS name) of the remote
+                        IPsec gateway, for example a cloud VPN gateway.
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[A-Za-z0-9]([-A-Za-z0-9.:]*[A-Za-z0-9])?$
+                      type: string
+                    remoteID:
+                      description: |-
+                        RemoteID is the IKE identity expected from the remote gateway.
+                        Defaults to RemoteAddress.
+                      type: string
+                    remoteTrafficSelectors:
+                      description: |-
+                        RemoteTrafficSelectors are the networks behind the remote gateway.
+                        Defaults to the gateway's routes, which is also what the mesh sends to
+                        the gateway peer.
+                      items:
+                        pattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
+                        type: string
+                      maxItems: 16
+                      type: array
+                  required:
+                  - name
+                  - preSharedKeyRef
+                  - remoteAddress
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               peerRefs:
                 description: |-
                   PeerRefs references WireKubePeer resources that serve as gateway nodes.
@@ -221,6 +400,89 @@ spec:
                   - type
                   type: object
                 type: array
+              ipsec:
+                description: IPsec reports each tunnel in spec.ipsec.
+                items:
+                  description: |-
+                    GatewayIPsecTunnelStatus is the observed state of one tunnel, written by
+                    the gateway's active peer.
+                  properties:
+                    carrier:
+                      description: |-
+                        Carrier is true on the tunnel the remote networks are routed into.
+                        Tunnels with identical remote selectors back each other up; only one
+                        carries traffic at a time.
+                      type: boolean
+                    dataplane:
+                      description: Dataplane is the steering mode in use on the active
+                        peer.
+                      enum:
+                      - Auto
+                      - XFRMInterface
+                      - Policy
+                      type: string
+                    ikeState:
+                      description: IKEState is the IKE_SA state reported by the IKE
+                        daemon.
+                      type: string
+                    installedChildSAs:
+                      description: InstalledChildSAs counts installed CHILD_SAs.
+                      format: int32
+                      type: integer
+                    interfaceID:
+                      description: InterfaceID is the XFRM interface ID in use.
+                      format: int64
+                      type: integer
+                    interfaceName:
+                      description: |-
+                        InterfaceName is the XFRM interface carrying the tunnel on the active
+                        peer; empty in Policy mode.
+                      type: string
+                    lastTransitionTime:
+                      description: LastTransitionTime is when Phase last changed.
+                      format: date-time
+                      type: string
+                    localID:
+                      description: LocalID is the IKE identity in use after defaulting.
+                      type: string
+                    localTrafficSelectors:
+                      description: |-
+                        LocalTrafficSelectors and RemoteTrafficSelectors are the selectors the
+                        active peer applied, after defaulting.
+                      items:
+                        type: string
+                      type: array
+                    message:
+                      description: Message explains why the tunnel is not Established,
+                        when known.
+                      type: string
+                    name:
+                      description: Name of the tunnel in spec.ipsec.
+                      type: string
+                    phase:
+                      description: Phase summarises the tunnel state.
+                      enum:
+                      - Pending
+                      - Connecting
+                      - Established
+                      - Error
+                      type: string
+                    remoteTrafficSelectors:
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              ipsecSummary:
+                description: |-
+                  IPsecSummary is a one-line tunnel state for kubectl get, such as
+                  "1/2 Established".
+                type: string
               lastHealthCheck:
                 description: LastHealthCheck is the timestamp of the last health check
                   probe.

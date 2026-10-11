@@ -64,7 +64,13 @@ func Render(options Options) (*Bundle, error) {
 			objects = append(objects, relayUDPService(options, labels))
 		}
 	}
+	if options.IPsec {
+		objects = append(objects, agentIPsecRole(options, labels), agentIPsecRoleBinding(options, labels))
+	}
 	objects = append(objects, agentDaemonSet(options, labels))
+	if options.IPsec {
+		objects = append(objects, charonDaemonSet(options, labels))
+	}
 
 	bundle := &Bundle{CRDs: crds, Objects: objects}
 	for _, crd := range crds {
@@ -176,6 +182,21 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 	if apiServer := agentAPIServerURL(options); apiServer != "" {
 		env = append(env, corev1.EnvVar{Name: "WIREKUBE_KUBE_APISERVER", Value: apiServer})
 	}
+	containers := []corev1.Container{agentContainer(options, env)}
+	volumes := []corev1.Volume{
+		{Name: "wireguard-keys", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/wirekube", Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate)}}},
+		{Name: "host-proc-sys-net", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/proc/sys/net", Type: hostPathTypePtr(corev1.HostPathDirectory)}}},
+		{Name: "dev-net-tun", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev/net/tun", Type: hostPathTypePtr(corev1.HostPathCharDev)}}},
+		{Name: "relay-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", Audience: "wirekube-relay", ExpirationSeconds: int64Ptr(3600)}}}}}},
+	}
+	if options.IPsec {
+		containers[0].Env = append(containers[0].Env,
+			corev1.EnvVar{Name: "WIREKUBE_ENABLE_IPSEC", Value: "true"},
+			corev1.EnvVar{Name: "WIREKUBE_IPSEC_VICI_SOCKET", Value: ipsecRunDir + "/charon.vici"},
+		)
+		containers[0].VolumeMounts = append(containers[0].VolumeMounts, corev1.VolumeMount{Name: "ipsec-run", MountPath: ipsecRunDir})
+		volumes = append([]corev1.Volume{ipsecRunVolume()}, volumes...)
+	}
 	return &appsv1.DaemonSet{
 		TypeMeta:   typeMeta(appsv1.SchemeGroupVersion.String(), "DaemonSet"),
 		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent", Namespace: options.Namespace, Labels: componentLabels},
@@ -209,34 +230,110 @@ func agentDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet
 							{Key: "wirekube.io/proxy-node", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
 						}}},
 					}}},
-					Containers: []corev1.Container{{
-						Name:            "agent",
-						Image:           options.Image,
-						ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.Image)),
-						Command:         []string{"wirekube-agent"},
-						Args:            []string{"--node-name=$(NODE_NAME)"},
-						Env:             env,
-						SecurityContext: &corev1.SecurityContext{
-							Privileged:      boolPtr(true),
-							AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined},
-							Capabilities:    &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "SYS_MODULE"}},
-						},
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "wireguard-keys", MountPath: "/var/lib/wirekube"},
-							{Name: "host-proc-sys-net", MountPath: "/host/proc/sys/net"},
-							{Name: "dev-net-tun", MountPath: "/dev/net/tun"},
-							{Name: "relay-token", MountPath: "/var/run/secrets/wirekube-relay", ReadOnly: true},
-						},
-					}},
-					Volumes: []corev1.Volume{
-						{Name: "wireguard-keys", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/wirekube", Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate)}}},
-						{Name: "host-proc-sys-net", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/proc/sys/net", Type: hostPathTypePtr(corev1.HostPathDirectory)}}},
-						{Name: "dev-net-tun", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev/net/tun", Type: hostPathTypePtr(corev1.HostPathCharDev)}}},
-						{Name: "relay-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", Audience: "wirekube-relay", ExpirationSeconds: int64Ptr(3600)}}}}}},
-					},
+					Containers: containers,
+					Volumes:    volumes,
 				},
 			},
 		},
+	}
+}
+
+// ipsecRunDir is the host directory holding charon's vici socket.
+const ipsecRunDir = "/run/wirekube-ipsec"
+
+func agentContainer(options Options, env []corev1.EnvVar) corev1.Container {
+	return corev1.Container{
+		Name:            "agent",
+		Image:           options.Image,
+		ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.Image)),
+		Command:         []string{"wirekube-agent"},
+		Args:            []string{"--node-name=$(NODE_NAME)"},
+		Env:             env,
+		SecurityContext: &corev1.SecurityContext{
+			Privileged:      boolPtr(true),
+			AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined},
+			Capabilities:    &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "SYS_MODULE"}},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "wireguard-keys", MountPath: "/var/lib/wirekube"},
+			{Name: "host-proc-sys-net", MountPath: "/host/proc/sys/net"},
+			{Name: "dev-net-tun", MountPath: "/dev/net/tun"},
+			{Name: "relay-token", MountPath: "/var/run/secrets/wirekube-relay", ReadOnly: true},
+		},
+	}
+}
+
+func ipsecRunVolume() corev1.Volume {
+	return corev1.Volume{Name: "ipsec-run", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: ipsecRunDir, Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate)}}}
+}
+
+// charonDaemonSet runs the strongSwan IKE daemon the agent drives over the
+// vici socket. It is separate from the agent so an agent restart keeps the
+// established SAs, and so only the CharonNodeSelector nodes listen for IKE.
+func charonDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSet {
+	componentLabels := copyLabels(labels)
+	componentLabels["app.kubernetes.io/component"] = "charon"
+	selectorLabels := map[string]string{"app.kubernetes.io/name": CharonDaemonSetName}
+	podLabels := copyLabels(selectorLabels)
+	podLabels["app.kubernetes.io/component"] = "charon"
+	podLabels["app.kubernetes.io/part-of"] = "wirekube"
+	podLabels["app.kubernetes.io/managed-by"] = "wirekubectl"
+	return &appsv1.DaemonSet{
+		TypeMeta:   typeMeta(appsv1.SchemeGroupVersion.String(), "DaemonSet"),
+		ObjectMeta: metav1.ObjectMeta{Name: CharonDaemonSetName, Namespace: options.Namespace, Labels: componentLabels},
+		Spec: appsv1.DaemonSetSpec{
+			Selector:       &metav1.LabelSelector{MatchLabels: selectorLabels},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1))}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken: boolPtr(false),
+					ImagePullSecrets:             imagePullSecretRefs(options),
+					HostNetwork:                  true,
+					DNSPolicy:                    corev1.DNSDefault,
+					PriorityClassName:            "system-node-critical",
+					// charon deletes its IKE_SAs on SIGTERM; leave time for the
+					// DELETE exchanges to reach the remote gateways.
+					TerminationGracePeriodSeconds: int64Ptr(10),
+					Tolerations:                   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+					NodeSelector:                  options.CharonNodeSelector,
+					Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{
+							{Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}},
+							{Key: "wirekube.io/proxy-node", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}},
+						}}},
+					}}},
+					Containers: []corev1.Container{{
+						Name:            "charon",
+						Image:           options.CharonImage,
+						ImagePullPolicy: corev1.PullPolicy(ImagePullPolicyFor(options.CharonImage)),
+						SecurityContext: &corev1.SecurityContext{
+							Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}},
+						},
+						VolumeMounts: []corev1.VolumeMount{{Name: "ipsec-run", MountPath: ipsecRunDir}},
+					}},
+					Volumes: []corev1.Volume{ipsecRunVolume()},
+				},
+			},
+		},
+	}
+}
+
+// agentIPsecRole lets the agent read pre-shared keys in its own namespace.
+func agentIPsecRole(options Options, labels map[string]string) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "Role"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent-ipsec", Namespace: options.Namespace, Labels: labels},
+		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}},
+	}
+}
+
+func agentIPsecRoleBinding(options Options, labels map[string]string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "RoleBinding"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent-ipsec", Namespace: options.Namespace, Labels: labels},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "wirekube-agent-ipsec"},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: "wirekube-agent", Namespace: options.Namespace}},
 	}
 }
 

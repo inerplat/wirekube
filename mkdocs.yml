@@ -68,6 +68,7 @@ nav:
     - Relay System: architecture/relay.md
     - WebSocket Relay: architecture/websocket-relay.md
     - Virtual Gateway: architecture/gateway.md
+    - Site-to-Site IPsec: architecture/ipsec.md
     - CNI Compatibility: architecture/cni-compatibility.md
   - Operations:
     - Deployment Topologies: operations/topologies.md

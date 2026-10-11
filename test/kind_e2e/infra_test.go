@@ -212,6 +212,15 @@ func setupCluster(_ context.Context) error {
 	if err := loadImageToAllNodes(wireKubeImage()); err != nil {
 		return err
 	}
+	if ipsecEnabled() {
+		if err := checkImageExists(charonImage()); err != nil {
+			return err
+		}
+		fmt.Println("e2e: loading charon image into nodes…")
+		if err := loadImageToAllNodes(charonImage()); err != nil {
+			return err
+		}
+	}
 
 	fmt.Println("e2e: enforcing VPC isolation (iptables)…")
 	if err := enforceVPCIsolation(); err != nil {
@@ -230,7 +239,17 @@ func disableInterVPCMasquerade() error {
 	for _, n := range nodeConfigs {
 		subnets = append(subnets, n.subnet)
 	}
+	if ipsecEnabled() {
+		// The simulated remote IPsec gateway sits on its own network and
+		// must see the nodes' real addresses, like a remote site would.
+		subnets = append(subnets, ipsecSiteWAN().subnet)
+	}
+	return allowCrossNetwork(subnets)
+}
 
+// allowCrossNetwork lets the given container networks reach each other
+// routed through the host, without masquerade.
+func allowCrossNetwork(subnets []string) error {
 	rt := containerRuntime()
 	if rt == "podman" {
 		for _, src := range subnets {
@@ -410,6 +429,9 @@ func teardownCluster() {
 				`find /var/log/pods -name "*.log" -path "*wirekube-relay*" -exec tail -30 {} \;`)
 			fmt.Println(out)
 		}
+	}
+	if ipsecEnabled() {
+		teardownIPsecSite()
 	}
 	for i := len(nodeConfigs) - 1; i >= 0; i-- {
 		ctrExec("rm", "-f", nodeConfigs[i].name) //nolint:errcheck
@@ -1041,6 +1063,15 @@ func loadImageToAllNodes(image string) error {
 	// from inside the container's tmpfs mount.
 	const ctrTarPath = "/var/tmp/image.tar"
 	dockerRef := "docker.io/" + image
+	// Match refs of this image's repository only: the agent and charon
+	// images share a prefix (inerplat/wirekube, inerplat/wirekube-charon).
+	repo := image
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	sameRepo := func(ref string) bool {
+		return strings.Contains(ref, repo+":") || strings.Contains(ref, repo+"@")
+	}
 	for _, n := range nodeConfigs {
 		if _, err := ctrExec("cp", tarPath, n.name+":"+ctrTarPath); err != nil {
 			return fmt.Errorf("copy tar to %s: %w", n.name, err)
@@ -1053,7 +1084,7 @@ func loadImageToAllNodes(image string) error {
 			"ctr", "-n=k8s.io", "images", "ls", "-q")
 		for _, ref := range strings.Split(existingImages, "\n") {
 			ref = strings.TrimSpace(ref)
-			if strings.Contains(ref, "inerplat/wirekube") {
+			if sameRepo(ref) {
 				ctrExec("exec", n.name, "ctr", "-n=k8s.io", "images", "rm", ref) //nolint:errcheck
 			}
 		}
@@ -1068,7 +1099,7 @@ func loadImageToAllNodes(image string) error {
 			"ctr", "-n=k8s.io", "images", "ls", "-q")
 		for _, ref := range strings.Split(importedImages, "\n") {
 			ref = strings.TrimSpace(ref)
-			if strings.Contains(ref, "inerplat/wirekube") && ref != dockerRef {
+			if sameRepo(ref) && ref != dockerRef {
 				ctrExec("exec", n.name, "ctr", "-n=k8s.io", "images", "tag", ref, dockerRef) //nolint:errcheck
 			}
 		}
@@ -1145,6 +1176,12 @@ func deployWireKubeAgents(ctx context.Context) error {
 		return fmt.Errorf("deploy relay: %w", err)
 	}
 
+	if ipsecEnabled() {
+		if err := deployIPsecComponents(); err != nil {
+			return fmt.Errorf("deploy IPsec components: %w", err)
+		}
+	}
+
 	if err := applyDaemonSet(image); err != nil {
 		return fmt.Errorf("apply DaemonSet: %w", err)
 	}
@@ -1191,6 +1228,19 @@ func applyDaemonSet(image string) error {
 	content = strings.Replace(content,
 		"            - name: WIREKUBE_INTERFACE",
 		apiEnv+"\n            - name: WIREKUBE_INTERFACE", 1)
+	if ipsecEnabled() {
+		content = strings.Replace(content,
+			"            - name: WIREKUBE_INTERFACE",
+			"            - name: WIREKUBE_ENABLE_IPSEC\n              value: \"true\"\n"+
+				"            - name: WIREKUBE_IPSEC_VICI_SOCKET\n              value: "+ipsecRunDir+"/charon.vici\n"+
+				"            - name: WIREKUBE_INTERFACE", 1)
+		content = strings.Replace(content,
+			"          volumeMounts:\n",
+			"          volumeMounts:\n            - name: ipsec-run\n              mountPath: "+ipsecRunDir+"\n", 1)
+		content = strings.Replace(content,
+			"      volumes:\n",
+			"      volumes:\n        - name: ipsec-run\n          hostPath:\n            path: "+ipsecRunDir+"\n            type: DirectoryOrCreate\n", 1)
+	}
 
 	tmp, err := os.CreateTemp("", "wk-ds-*.yaml")
 	if err != nil {

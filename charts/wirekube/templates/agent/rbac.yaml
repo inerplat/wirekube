@@ -152,3 +152,41 @@ subjects:
 - kind: ServiceAccount
   name: wirekube-agent
   namespace: {{ .Release.Namespace }}
+{{- if .Values.agent.ipsec.enabled }}
+---
+# IPsec pre-shared keys are read from the release namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-agent-ipsec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-agent-ipsec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-agent-ipsec
+subjects:
+- kind: ServiceAccount
+  name: wirekube-agent
+  namespace: {{ .Release.Namespace }}
+{{- end }}

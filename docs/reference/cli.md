@@ -23,6 +23,8 @@ wirekube-agent --node-name <name> [flags]
 | `--mtu` | WireGuard interface MTU fallback | `1420` |
 | `--kube-apiserver` | Kubernetes API server URL override | `WIREKUBE_KUBE_APISERVER` |
 | `--metrics-addr` | Metrics and health HTTP listen address | `:9090` |
+| `--enable-ipsec` | Terminate WireKubeGateway `spec.ipsec` tunnels through charon | `WIREKUBE_ENABLE_IPSEC` or off |
+| `--ipsec-vici-socket` | charon's vici socket | `WIREKUBE_IPSEC_VICI_SOCKET` or `/var/run/charon.vici` |
 
 ### Environment Variables
 
@@ -114,6 +116,8 @@ wirekubectl external list
 wirekubectl external get <name>
 wirekubectl external invite <display-name> [flags]
 wirekubectl external revoke <display-name>
+wirekubectl ipsec status [gateway]
+wirekubectl ipsec remote-config <gateway> [--tunnel <name>]
 ```
 
 All commands accept `--kubeconfig`, `--context`, `--namespace`, `--timeout`, and `--output text|json`. `install` prints the plan and applies it in one run; it never prompts, so use `--dry-run` (or `manifest`, which renders the same resources) to see a plan without mutating the cluster. An unset `--relay` defaults to `load-balancer` and an unset `--mesh-cidr` is selected automatically, so automation that cares about either should pass them. `--image` is required unless the released CLI embeds its matching default image. Tag references are accepted; a digest pin (`IMAGE@sha256:DIGEST`) is optional but recommended, and every plan warns when the image is a mutable tag. `--exclude-cidr` records routes that best-effort automatic mesh CIDR selection must avoid.
@@ -137,5 +141,9 @@ WireKube supports one installation per cluster because the mesh, CRDs, and RBAC 
 `mesh init` creates the default mesh when it is absent. When the mesh already exists, it patches only flags explicitly provided on the command line and never replaces the complete spec.
 
 `uninstall` preserves CRDs and custom resources by default. `--purge` is rejected unless `--confirm-purge` is also present. `uninstall --dry-run` lists what would be deleted and what would be kept without touching the cluster; it deletes nothing, so run it first when the installation is carrying traffic.
+
+`--ipsec` turns on WireKubeGateway `spec.ipsec` tunnels. It deploys the `wirekube-charon` DaemonSet, enables IPsec in the agents, and lets the agent `get` Secrets in the installation namespace. `--charon-image` sets the charon image. By default a released CLI uses the charon image released with it, pinned by digest; otherwise the image is the `--image` repository with a `-charon` suffix and the same tag, and an `--image` without a tag needs `--charon-image`. `--charon-node-selector key=value,...` runs charon, and its UDP 500/4500 listeners, only on the labelled nodes, so label the `peerRefs` nodes of gateways with tunnels. `upgrade` keeps these settings unless they are given again, and derives the charon image again when the agent image changes. With IPsec on, `install` and `upgrade` also wait for the charon rollout and fail when the node selector matches no node, `status` and `doctor` report charon, and `doctor` fails while a tunnel is not established.
+
+`ipsec status` lists the tunnels with their node, phase, carrier, dataplane, CHILD_SA count and failure reason. It warns when a gateway is active on a node without a ready charon pod. `ipsec remote-config` prints the settings for the remote IPsec gateway, per tunnel and gateway node. For the pre-shared key it prints the command that reads it, not the key. See [Site-to-Site IPsec](../architecture/ipsec.md).
 
 `wirekubectl token create` is currently a placeholder that prints guidance and does not issue a token. The WSS relay uses Kubernetes `kubectl create token` and TokenReview instead.

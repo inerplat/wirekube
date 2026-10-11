@@ -325,7 +325,7 @@ func TestMACComparisonIsCaseInsensitive(t *testing.T) {
 func TestPeerLinkAddressesIsKeyedByPublicKey(t *testing.T) {
 	const pubKey = "cGVlci1saW5rLWFkZHJlc3MtdGVzdC1rZXk9PQ=="
 	peers := map[string]*wirekubev1alpha1.WireKubePeer{
-		"abeta-gds-05.ncp3": {
+		"gpu-node-05": {
 			Spec: wirekubev1alpha1.WireKubePeerSpec{PublicKey: pubKey},
 			Status: wirekubev1alpha1.WireKubePeerStatus{
 				LinkAddresses: []wirekubev1alpha1.LinkAddress{

@@ -110,6 +110,7 @@ func newRootCommand() *cobra.Command {
 		externalCmd(),
 		inviteCmd(),
 		revokeCmd(),
+		ipsecCmd(),
 	)
 	return root
 }

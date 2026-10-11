@@ -264,7 +264,7 @@ func TestRenderHonorsCustomListenPort(t *testing.T) {
 }
 
 func TestRenderAttachesImagePullSecretsToEveryPodSpec(t *testing.T) {
-	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{"ncloud-registry", "backup-registry"}, WireKubeVersion: "v1.0.0"})
+	bundle, err := Render(Options{Image: testImage, Relay: RelayLoadBalancer, RelayTransport: RelayTransportWSS, RelayEndpoint: "wss://relay.example.test/relay", MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{"private-registry", "backup-registry"}, WireKubeVersion: "v1.0.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,18 +283,18 @@ func TestRenderAttachesImagePullSecretsToEveryPodSpec(t *testing.T) {
 		}
 	}
 	for name, spec := range podSpecs {
-		if len(spec.ImagePullSecrets) != 2 || spec.ImagePullSecrets[0].Name != "ncloud-registry" || spec.ImagePullSecrets[1].Name != "backup-registry" {
+		if len(spec.ImagePullSecrets) != 2 || spec.ImagePullSecrets[0].Name != "private-registry" || spec.ImagePullSecrets[1].Name != "backup-registry" {
 			t.Fatalf("%s imagePullSecrets=%v, want both secrets in order", name, spec.ImagePullSecrets)
 		}
 	}
 }
 
 func TestNormalizeTrimsAndRejectsImagePullSecrets(t *testing.T) {
-	padded := Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{" ncloud-registry "}}
+	padded := Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{" private-registry "}}
 	if err := padded.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if padded.ImagePullSecrets[0] != "ncloud-registry" {
+	if padded.ImagePullSecrets[0] != "private-registry" {
 		t.Fatalf("imagePullSecrets=%v, want trimmed name", padded.ImagePullSecrets)
 	}
 	empty := Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", ImagePullSecrets: []string{"  "}}

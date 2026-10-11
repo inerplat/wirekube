@@ -164,6 +164,15 @@ func (p Planner) Build(ctx context.Context, options Options) (Plan, Options, err
 	if warning := ImageMutabilityWarning(options.Image); warning != "" {
 		plan.Warnings = append(plan.Warnings, warning)
 	}
+	if options.IPsec {
+		plan.Impact = append(plan.Impact,
+			"strongSwan charon DaemonSet ("+options.CharonImage+") listening on the host's UDP 500 and 4500 on "+charonNodesDescription(options),
+			"read access to Secrets in namespace "+options.Namespace+" for IPsec pre-shared keys",
+		)
+		if warning := ImageMutabilityWarning(options.CharonImage); warning != "" {
+			plan.Warnings = append(plan.Warnings, strings.Replace(warning, "image", "charon image", 1))
+		}
+	}
 	if liveListenPort > 0 && options.ListenPort != liveListenPort {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf("this apply changes the WireGuard listen port of the existing mesh from %d to %d; every agent re-binds and all peer endpoints must re-discover before traffic recovers", liveListenPort, options.ListenPort))
 	}
@@ -232,6 +241,16 @@ func installationAccessRequirements(options Options) []AccessRequirement {
 		{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings", Verb: "delete", Name: "wirekube-agent"},
 		{Group: "wirekube.io", Resource: "wirekubemeshes", Verb: "get", Name: "default"},
 		{Group: "wirekube.io", Resource: "wirekubemeshes", Verb: "patch", Name: "default"},
+	}
+	if options.IPsec {
+		for _, resource := range []string{"roles", "rolebindings"} {
+			for _, verb := range []string{"get", "patch", "delete"} {
+				requirements = append(requirements, AccessRequirement{Group: "rbac.authorization.k8s.io", Resource: resource, Verb: verb, Namespace: options.Namespace, Name: "wirekube-agent-ipsec"})
+			}
+		}
+		for _, verb := range []string{"get", "patch", "delete"} {
+			requirements = append(requirements, AccessRequirement{Group: "apps", Resource: "daemonsets", Verb: verb, Namespace: options.Namespace, Name: CharonDaemonSetName})
+		}
 	}
 	for _, name := range []string{"wirekubemeshes.wirekube.io", "wirekubepeers.wirekube.io", "wirekubegateways.wirekube.io", "wirekubeexternalpeers.wirekube.io"} {
 		requirements = append(requirements,
@@ -486,4 +505,21 @@ func (p Planner) liveMeshListenPort(ctx context.Context) int32 {
 		return 0
 	}
 	return mesh.Spec.ListenPort
+}
+
+// charonNodesDescription names the nodes the charon DaemonSet runs on.
+func charonNodesDescription(options Options) string {
+	if len(options.CharonNodeSelector) == 0 {
+		return "every agent node"
+	}
+	keys := make([]string, 0, len(options.CharonNodeSelector))
+	for k := range options.CharonNodeSelector {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	terms := make([]string, 0, len(keys))
+	for _, k := range keys {
+		terms = append(terms, k+"="+options.CharonNodeSelector[k])
+	}
+	return "nodes labelled " + strings.Join(terms, ",")
 }

@@ -112,7 +112,7 @@ func TestAllowedDestinations_DefaultsToEveryClusterRange(t *testing.T) {
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(),
 		newNode("node-a", "10.244.1.0/24"),
 		newNode("node-b", "10.244.2.0/24"),
-		newGateway("ncp", "172.20.0.0/16"),
+		newGateway("vpc", "172.20.0.0/16"),
 	)
 	r := &Reconciler{
 		Client: c,
@@ -172,7 +172,7 @@ func TestAllowedDestinations_ExplicitSpecWinsVerbatim(t *testing.T) {
 	})
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(),
 		newNode("node-a", "10.244.1.0/24"),
-		newGateway("ncp", "172.20.0.0/16"),
+		newGateway("vpc", "172.20.0.0/16"),
 	)
 	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost)}
 
@@ -291,7 +291,7 @@ func TestServiceCIDRs_UnservedClusterStillIssuesPeer(t *testing.T) {
 	cr := newExternalPeer(testExternalName)
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(),
 		newNode("node-a", "10.244.1.0/24"),
-		newGateway("ncp", "172.20.0.0/16"),
+		newGateway("vpc", "172.20.0.0/16"),
 	)
 	r := &Reconciler{
 		Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost),
@@ -317,7 +317,7 @@ func TestServiceCIDRs_UnservedClusterStillIssuesPeer(t *testing.T) {
 func TestAllowedDestinations_IncludesEveryGatewayRoute(t *testing.T) {
 	cr := newExternalPeer(testExternalName)
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(),
-		newGateway("ncp", "172.20.0.0/16", "172.21.0.0/16"),
+		newGateway("vpc", "172.20.0.0/16", "172.21.0.0/16"),
 		newGateway("onprem", "192.168.0.0/16"),
 	)
 	r := &Reconciler{Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost)}
@@ -371,7 +371,7 @@ func TestAllowedDestinations_DegradedReadKeepsExistingStatus(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(cr, newReadyMesh(), newIngressPeer(),
 			newNode("node-a", "10.244.1.0/24"),
-			newGateway("ncp", "172.20.0.0/16"),
+			newGateway("vpc", "172.20.0.0/16"),
 		).
 		WithStatusSubresource(
 			&wirekubev1alpha1.WireKubeExternalPeer{},
@@ -458,7 +458,7 @@ func TestAllowedDestinations_DegradedFirstIssuanceStillProceeds(t *testing.T) {
 func TestAllowedDestinations_SkipsGatewayThatExcludesTheIngressPeer(t *testing.T) {
 	// The agent refuses to install a gateway route on a node outside a
 	// non-empty clientRefs, so advertising it would blackhole the client.
-	gateway := newGateway("ncp", "172.20.0.0/16")
+	gateway := newGateway("vpc", "172.20.0.0/16")
 	gateway.Spec.PeerRefs = []string{"gateway-node"}
 	gateway.Spec.ClientRefs = []string{"some-other-node"}
 
@@ -478,7 +478,7 @@ func TestAllowedDestinations_SkipsGatewayThatExcludesTheIngressPeer(t *testing.T
 }
 
 func TestAllowedDestinations_KeepsGatewayThatListsTheIngressPeer(t *testing.T) {
-	gateway := newGateway("ncp", "172.20.0.0/16")
+	gateway := newGateway("vpc", "172.20.0.0/16")
 	gateway.Spec.ClientRefs = []string{"some-other-node", testIngressPeer}
 
 	cr := newExternalPeer(testExternalName)
@@ -498,7 +498,7 @@ func TestAllowedDestinations_KeepsGatewayThatListsTheIngressPeer(t *testing.T) {
 // the elected gateway peer carries the routes natively rather than as a client.
 // An external peer entering through that node must not lose the route.
 func TestAllowedDestinations_KeepsGatewayForItsElectedPeer(t *testing.T) {
-	gateway := newGateway("ncp", "172.20.0.0/16")
+	gateway := newGateway("vpc", "172.20.0.0/16")
 	gateway.Spec.PeerRefs = []string{testIngressPeer}
 	gateway.Spec.ClientRefs = []string{"worker1", "worker2"}
 	gateway.Status.ActivePeer = testIngressPeer
@@ -519,7 +519,7 @@ func TestAllowedDestinations_KeepsGatewayForItsElectedPeer(t *testing.T) {
 // elected peer has the routes injected, so a standby named in peerRefs but
 // excluded by clientRefs would blackhole until it happens to be elected.
 func TestAllowedDestinations_SkipsGatewayStandbyPeer(t *testing.T) {
-	gateway := newGateway("ncp", "172.20.0.0/16")
+	gateway := newGateway("vpc", "172.20.0.0/16")
 	gateway.Spec.PeerRefs = []string{"gateway-primary", testIngressPeer}
 	gateway.Spec.ClientRefs = []string{"worker1", "worker2"}
 	gateway.Status.ActivePeer = "gateway-primary"
