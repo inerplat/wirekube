@@ -1,0 +1,7 @@
+# strongSwan IKE daemon for the wirekube-charon DaemonSet, kept out of the
+# main image.
+FROM alpine:3.21
+LABEL org.opencontainers.image.licenses="GPL-2.0-or-later"
+RUN apk add --no-cache strongswan
+COPY hack/charon/strongswan.conf /etc/strongswan.conf
+ENTRYPOINT ["/usr/lib/strongswan/charon"]

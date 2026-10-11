@@ -60,6 +60,27 @@ agent:
       cpu: 200m
       memory: 256Mi
 
+  # Site-to-site IPsec (WireKubeGateway spec.ipsec). Deploys strongSwan as the
+  # wirekube-charon DaemonSet, listening on the host's UDP 500/4500.
+  ipsec:
+    enabled: false
+    charon:
+      # Nodes that run charon, on top of agent.nodeSelector. Include every
+      # peerRef of a gateway with tunnels.
+      nodeSelector: {}
+      image:
+        repository: inerplat/wirekube-charon
+        # Defaults to the agent image tag.
+        tag: ""
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 128Mi
+
   metrics:
     # Headless Service exposing the agent :9090/metrics endpoints.
     enabled: true

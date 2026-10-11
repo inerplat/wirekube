@@ -129,6 +129,12 @@ type Agent struct {
 	birthdayCh chan birthdayOutcome
 	// gwState tracks gateway configuration when this node serves as a VGW.
 	gwState *gatewayState
+	// ipsec is nil unless EnableIPsec was called.
+	ipsec *ipsecState
+	// ipsecDisabledCleaned and ipsecDisabledGuardClear let the IPsec-disabled
+	// path skip work it already did in this process.
+	ipsecDisabledCleaned    bool
+	ipsecDisabledGuardClear bool
 	// wasInterfacePreserved is set during setup when an existing WireGuard
 	// interface was reused. Used to shorten the initial relayRetry so that
 	// direct upgrade probing starts sooner after restart.
@@ -1259,6 +1265,9 @@ func (a *Agent) sync(ctx context.Context) error {
 	if err := a.setupGateway(ctx); err != nil {
 		a.log.Error(err, "gateway setup error")
 	}
+
+	// After setupGateway, so route injection and forwarding are in place.
+	a.setupIPsec(ctx)
 
 	// Delete legacy WireKubePeer CRs whose underlying Node has been removed.
 	// New CRs are protected by Node ownerReferences (set in upsertOwnPeer),

@@ -356,10 +356,10 @@ func TestUpgradePreservesStoredImagePullSecrets(t *testing.T) {
 	cmd.Flags().StringSlice("image-pull-secret", nil, "")
 	cmd.Flags().String("image", lifecycleTestImage, "")
 	flags := &lifecycleFlags{image: lifecycleTestImage}
-	stored := internalinstall.Options{ImagePullSecrets: []string{"ncloud-registry"}}
+	stored := internalinstall.Options{ImagePullSecrets: []string{"private-registry"}}
 
 	applyStoredLifecycleDefaults(cmd, flags, stored)
-	if len(flags.imagePullSecrets) != 1 || flags.imagePullSecrets[0] != "ncloud-registry" {
+	if len(flags.imagePullSecrets) != 1 || flags.imagePullSecrets[0] != "private-registry" {
 		t.Fatalf("imagePullSecrets=%v, want the stored secret", flags.imagePullSecrets)
 	}
 
@@ -482,5 +482,61 @@ func TestExternalPeerMTUFallsBackToDefault(t *testing.T) {
 	got := externalpeer.EffectiveMTU(&wirekubev1alpha1.WireKubeExternalPeer{})
 	if got != wirekubev1alpha1.DefaultExternalPeerMTU {
 		t.Fatalf("EffectiveMTU = %d, want %d", got, wirekubev1alpha1.DefaultExternalPeerMTU)
+	}
+}
+
+func TestUpgradeKeepsIPsecAndTracksTheCharonImage(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{}
+		cmd.Flags().String("image", lifecycleTestImage, "")
+		cmd.Flags().Bool("ipsec", false, "")
+		cmd.Flags().String("charon-image", "", "")
+		cmd.Flags().StringToString("charon-node-selector", nil, "")
+		return cmd
+	}
+	stored := internalinstall.Options{Image: "registry.example.test/wirekube:v1", IPsec: true, CharonImage: "registry.example.test/wirekube-charon:v1",
+		CharonNodeSelector: map[string]string{"role": "gw"}}
+
+	// Same agent image: IPsec, the stored charon image and its nodes are kept.
+	flags := &lifecycleFlags{image: stored.Image}
+	applyStoredLifecycleDefaults(newCmd(), flags, stored)
+	if !flags.ipsec || flags.charonImage != stored.CharonImage || flags.charonNodeSelector["role"] != "gw" {
+		t.Fatalf("ipsec=%v charon=%q nodes=%v; want all kept", flags.ipsec, flags.charonImage, flags.charonNodeSelector)
+	}
+
+	// An explicit selector replaces the stored one.
+	cmd := newCmd()
+	if err := cmd.Flags().Set("charon-node-selector", "zone=a"); err != nil {
+		t.Fatal(err)
+	}
+	flags = &lifecycleFlags{image: stored.Image, charonNodeSelector: map[string]string{"zone": "a"}}
+	applyStoredLifecycleDefaults(cmd, flags, stored)
+	if len(flags.charonNodeSelector) != 1 || flags.charonNodeSelector["zone"] != "a" {
+		t.Fatalf("nodes=%v; want the flag", flags.charonNodeSelector)
+	}
+
+	// The agent image moves to the released default: the charon image is
+	// left empty so it is derived from the new agent image.
+	flags = &lifecycleFlags{image: lifecycleTestImage}
+	applyStoredLifecycleDefaults(newCmd(), flags, stored)
+	if !flags.ipsec || flags.charonImage != "" {
+		t.Fatalf("ipsec=%v charon=%q; want ipsec kept and charon re-derived", flags.ipsec, flags.charonImage)
+	}
+}
+
+func TestReleasedCLIPinsTheCharonImage(t *testing.T) {
+	oldImage, oldCharon := internalversion.DefaultImage, internalversion.DefaultCharonImage
+	t.Cleanup(func() { internalversion.DefaultImage, internalversion.DefaultCharonImage = oldImage, oldCharon })
+	internalversion.DefaultImage = "inerplat/wirekube@sha256:1111"
+	internalversion.DefaultCharonImage = "inerplat/wirekube-charon@sha256:2222"
+
+	if got := charonImageFor(&lifecycleFlags{ipsec: true, image: internalversion.DefaultImage}); got != internalversion.DefaultCharonImage {
+		t.Errorf("released agent image: charon %q, want the released charon digest", got)
+	}
+	if got := charonImageFor(&lifecycleFlags{ipsec: true, image: "registry.example.test/wirekube:v2"}); got != "" {
+		t.Errorf("custom agent image: charon %q, want it derived later", got)
+	}
+	if got := charonImageFor(&lifecycleFlags{ipsec: true, image: internalversion.DefaultImage, charonImage: "x/charon:v9"}); got != "x/charon:v9" {
+		t.Errorf("explicit --charon-image: %q", got)
 	}
 }

@@ -1,0 +1,80 @@
+{{- if .Values.agent.ipsec.enabled }}
+# strongSwan IKE daemon the agent drives over /run/wirekube-ipsec. It runs
+# apart from the agent so an agent restart keeps the established SAs, and so
+# only agent.ipsec.charon.nodeSelector nodes listen on UDP 500/4500.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wirekube-charon
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.charon.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: charon
+    {{- include "wirekube.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: wirekube-charon
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "wirekube.charon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: charon
+        {{- include "wirekube.labels" . | nindent 8 }}
+    spec:
+      hostNetwork: true
+      dnsPolicy: Default
+      automountServiceAccountToken: false
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (merge (deepCopy .Values.agent.ipsec.charon.nodeSelector) .Values.agent.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: wirekube.io/proxy-node
+                    operator: NotIn
+                    values:
+                      - "true"
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+      # charon deletes its IKE_SAs on SIGTERM; give the DELETE exchanges time
+      # to reach the remote gateways.
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: charon
+          image: {{ include "wirekube.charonImage" . }}
+          imagePullPolicy: {{ .Values.agent.ipsec.charon.image.pullPolicy }}
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          volumeMounts:
+            - name: ipsec-run
+              mountPath: /run/wirekube-ipsec
+          resources:
+            {{- toYaml .Values.agent.ipsec.charon.resources | nindent 12 }}
+      volumes:
+        - name: ipsec-run
+          hostPath:
+            path: /run/wirekube-ipsec
+            type: DirectoryOrCreate
+{{- end }}

@@ -10,6 +10,7 @@ permissions:
 
 env:
   IMAGE_NAME: inerplat/wirekube
+  CHARON_IMAGE_NAME: inerplat/wirekube-charon
   E2E_IMAGE: inerplat/wirekube:release-${{ github.sha }}
 
 jobs:
@@ -152,6 +153,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # The chart and wirekubectl default the charon image to the agent's tag.
+  publish-charon-image:
+    needs: e2e
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.charon
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ contains(github.ref_name, '-dev.') && format('{0}:{1}', env.CHARON_IMAGE_NAME, github.ref_name) || format('{0}:{1},{0}:latest', env.CHARON_IMAGE_NAME, github.ref_name) }}
+          cache-from: type=gha,scope=charon
+          cache-to: type=gha,mode=max,scope=charon
+
   # The pins in config/ and charts/ name this tag, whose image did not exist
   # while the release-prep commit sat on main. CI checked them without -strict
   # and let the unresolved pin through. Now that the image is published, the
@@ -209,12 +239,13 @@ jobs:
   # pin check would hand users a wirekubectl that installs manifests the image
   # rejects.
   release-cli:
-    needs: [publish-image, verify-pins]
+    needs: [publish-image, publish-charon-image, verify-pins]
     # A skipped verify-pins must not skip the CLI with it. The binary carries
     # no manifest pins: it renders the workloads itself and takes its default
     # image from the digest publish-image produced, so that job is the only
-    # dependency it actually has. A failed verify-pins still stops the release.
-    if: ${{ !cancelled() && needs.publish-image.result == 'success' && needs.verify-pins.result != 'failure' }}
+    # dependency it actually has, besides the charon image its --ipsec
+    # default names. A failed verify-pins still stops the release.
+    if: ${{ !cancelled() && needs.publish-image.result == 'success' && needs.publish-charon-image.result == 'success' && needs.verify-pins.result != 'failure' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -230,9 +261,10 @@ jobs:
           VERSION: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
           IMAGE_DIGEST: ${{ needs.publish-image.outputs.digest }}
+          CHARON_DIGEST: ${{ needs.publish-charon-image.outputs.digest }}
         run: |
           build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          ldflags="-s -w -X github.com/inerplat/wirekube/internal/version.Version=${VERSION} -X github.com/inerplat/wirekube/internal/version.Commit=${COMMIT} -X github.com/inerplat/wirekube/internal/version.BuildDate=${build_date} -X github.com/inerplat/wirekube/internal/version.DefaultImage=${IMAGE_NAME}@${IMAGE_DIGEST}"
+          ldflags="-s -w -X github.com/inerplat/wirekube/internal/version.Version=${VERSION} -X github.com/inerplat/wirekube/internal/version.Commit=${COMMIT} -X github.com/inerplat/wirekube/internal/version.BuildDate=${build_date} -X github.com/inerplat/wirekube/internal/version.DefaultImage=${IMAGE_NAME}@${IMAGE_DIGEST} -X github.com/inerplat/wirekube/internal/version.DefaultCharonImage=${CHARON_IMAGE_NAME}@${CHARON_DIGEST}"
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$ldflags" -o dist/wirekubectl-darwin-arm64 ./cmd/wirekubectl
           CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-darwin-amd64 ./cmd/wirekubectl
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$ldflags" -o dist/wirekubectl-linux-amd64 ./cmd/wirekubectl

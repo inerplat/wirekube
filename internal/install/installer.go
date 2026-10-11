@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"time"
@@ -143,7 +144,10 @@ func sameInstallConfig(left, right Options) bool {
 		// Compare the resolved URL, not just the explicit flag: the kubeconfig server is
 		// the fallback source, so re-running install from a different kubeconfig entry
 		// would otherwise rewrite the agent DaemonSet without tripping this check.
-		agentAPIServerURL(left) == agentAPIServerURL(right)
+		agentAPIServerURL(left) == agentAPIServerURL(right) &&
+		left.IPsec == right.IPsec &&
+		left.CharonImage == right.CharonImage &&
+		maps.Equal(left.CharonNodeSelector, right.CharonNodeSelector)
 }
 
 // normalizedListenPort treats the zero value stored by pre-listen-port
@@ -471,6 +475,11 @@ func (i Installer) waitReady(ctx context.Context, options Options) error {
 	}); err != nil {
 		return fmt.Errorf("agent DaemonSet did not become ready; run wirekubectl doctor: %w", err)
 	}
+	if options.IPsec {
+		if err := i.waitCharonReady(ctx, options); err != nil {
+			return err
+		}
+	}
 	if err := poll(ctx, 2*time.Second, func() (bool, error) {
 		mesh := &wirekubev1alpha1.WireKubeMesh{}
 		if err := i.Client.Get(ctx, client.ObjectKey{Name: "default"}, mesh); err != nil {
@@ -790,4 +799,32 @@ func poll(ctx context.Context, interval time.Duration, condition func() (bool, e
 		case <-ticker.C:
 		}
 	}
+}
+
+// waitCharonReady waits for the charon DaemonSet to roll out. A selector
+// that matches no node is reported at once, since it never resolves itself.
+func (i Installer) waitCharonReady(ctx context.Context, options Options) error {
+	var noNodes bool
+	err := poll(ctx, 2*time.Second, func() (bool, error) {
+		ds := &appsv1.DaemonSet{}
+		if err := i.Client.Get(ctx, types.NamespacedName{Namespace: options.Namespace, Name: CharonDaemonSetName}, ds); err != nil {
+			return false, err
+		}
+		if ds.Status.ObservedGeneration < ds.Generation {
+			return false, nil
+		}
+		desired := ds.Status.DesiredNumberScheduled
+		if desired == 0 {
+			noNodes = true
+			return true, nil
+		}
+		return ds.Status.UpdatedNumberScheduled == desired && ds.Status.NumberReady == desired, nil
+	})
+	if err != nil {
+		return fmt.Errorf("charon DaemonSet did not become ready; run wirekubectl doctor: %w", err)
+	}
+	if noNodes {
+		return fmt.Errorf("no node matches the charon node selector %v; label the gateway nodes or change --charon-node-selector", options.CharonNodeSelector)
+	}
+	return nil
 }

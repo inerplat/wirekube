@@ -32,6 +32,7 @@ import (
 	externalctrl "github.com/inerplat/wirekube/pkg/controller/external"
 	meshallocctrl "github.com/inerplat/wirekube/pkg/controller/meshalloc"
 	relayendpointctrl "github.com/inerplat/wirekube/pkg/controller/relayendpoint"
+	"github.com/inerplat/wirekube/pkg/ipsec"
 	"github.com/inerplat/wirekube/pkg/wireguard"
 )
 
@@ -51,6 +52,8 @@ func main() {
 	var mtu int
 	var apiServer string
 	var metricsAddr string
+	var enableIPsec bool
+	var ipsecViciSocket string
 
 	var podName string
 	var podNamespace string
@@ -64,6 +67,8 @@ func main() {
 	flag.IntVar(&mtu, "mtu", 1420, "WireGuard interface MTU")
 	flag.StringVar(&apiServer, "kube-apiserver", os.Getenv("WIREKUBE_KUBE_APISERVER"), "Kubernetes API server URL (overrides in-cluster discovery)")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "Prometheus metrics listen address")
+	flag.BoolVar(&enableIPsec, "enable-ipsec", os.Getenv("WIREKUBE_ENABLE_IPSEC") == "true", "Terminate the spec.ipsec tunnels of gateways this node serves (needs a strongSwan charon)")
+	flag.StringVar(&ipsecViciSocket, "ipsec-vici-socket", ipsecSocketDefault(), "Path of the charon vici socket")
 
 	// Development=false → production encoder (json) + InfoLevel gate for V(1).
 	// This is the right default for steady-state agents; operators can still
@@ -184,8 +189,14 @@ func main() {
 		}
 	}()
 
-	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace, restConfig.Host)
 	ctx := ctrl.SetupSignalHandler()
+	a := agentpkg.NewAgent(log, k8sClient, engine, nodeName, podName, podNamespace, restConfig.Host)
+	if enableIPsec {
+		log.Info("IPsec tunnel termination enabled", "viciSocket", ipsecViciSocket)
+		failures := &ipsec.FailureWatcher{Socket: ipsecViciSocket}
+		go failures.Run(ctx)
+		a.EnableIPsec(&ipsec.ViciCharon{Socket: ipsecViciSocket}, failures)
+	}
 
 	// Start the WireKubeExternalPeer reconciler in a sibling controller-
 	// runtime manager. It allocates relay forwarder mappings through the
@@ -366,4 +377,11 @@ func relayControllerFromMesh(ctx context.Context, c client.Reader, mesh *wirekub
 		return externalctrl.NewFanoutRelayController(relayControlAddr, relayEndpoint)
 	}
 	return externalctrl.NewNoopRelayController(relayEndpoint)
+}
+
+func ipsecSocketDefault() string {
+	if v := os.Getenv("WIREKUBE_IPSEC_VICI_SOCKET"); v != "" {
+		return v
+	}
+	return ipsec.DefaultViciSocket
 }

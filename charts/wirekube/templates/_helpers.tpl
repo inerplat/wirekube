@@ -22,6 +22,12 @@ app.kubernetes.io/version: {{ include "wirekube.imageTag" . | trunc 63 | trimSuf
 {{- printf "%s:%s" .Values.image.repository (include "wirekube.imageTag" .) -}}
 {{- end }}
 
+{{/* The charon image follows the agent image tag unless pinned. */}}
+{{- define "wirekube.charonImage" -}}
+{{- $c := .Values.agent.ipsec.charon.image -}}
+{{- printf "%s:%s" $c.repository ($c.tag | default (include "wirekube.imageTag" .)) -}}
+{{- end }}
+
 {{/* Selector labels per component; kept minimal and immutable. */}}
 {{- define "wirekube.agent.selectorLabels" -}}
 app: wirekube-agent
@@ -34,4 +40,9 @@ app.kubernetes.io/name: wirekube-relay
 
 {{- define "wirekube.relayWs.selectorLabels" -}}
 app.kubernetes.io/name: wirekube-relay-ws
+{{- end }}
+
+{{- define "wirekube.charon.selectorLabels" -}}
+app: wirekube-charon
+app.kubernetes.io/name: wirekube-charon
 {{- end }}

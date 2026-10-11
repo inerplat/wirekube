@@ -108,6 +108,12 @@ spec:
             - name: WIREKUBE_KUBE_APISERVER
               value: {{ .Values.agent.kubeAPIServer | quote }}
             {{- end }}
+            {{- if .Values.agent.ipsec.enabled }}
+            - name: WIREKUBE_ENABLE_IPSEC
+              value: "true"
+            - name: WIREKUBE_IPSEC_VICI_SOCKET
+              value: /run/wirekube-ipsec/charon.vici
+            {{- end }}
             {{- with .Values.agent.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -132,9 +138,20 @@ spec:
             - name: relay-token
               mountPath: /var/run/secrets/wirekube-relay
               readOnly: true
+            {{- if .Values.agent.ipsec.enabled }}
+            - name: ipsec-run
+              mountPath: /run/wirekube-ipsec
+            {{- end }}
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
       volumes:
+        {{- if .Values.agent.ipsec.enabled }}
+        # charon's vici socket, created by the wirekube-charon DaemonSet.
+        - name: ipsec-run
+          hostPath:
+            path: /run/wirekube-ipsec
+            type: DirectoryOrCreate
+        {{- end }}
         - name: wireguard-keys
           hostPath:
             path: {{ .Values.agent.keysHostPath }}

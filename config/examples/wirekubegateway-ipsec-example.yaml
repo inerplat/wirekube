@@ -1,0 +1,29 @@
+# A gateway that reaches a remote network through its IPsec gateway.
+# See docs/architecture/ipsec.md. Requires agent.ipsec.enabled=true.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: site-psk
+  namespace: wirekube-system   # the agent reads keys from its own namespace only
+stringData:
+  psk: replace-with-the-pre-shared-key
+---
+apiVersion: wirekube.io/v1alpha1
+kind: WireKubeGateway
+metadata:
+  name: site-gw
+spec:
+  peerRefs: [node-a, node-b]
+  routes:
+    - cidr: 10.88.1.0/24
+      description: subnet behind the remote IPsec gateway
+  ipsec:
+    - name: primary
+      remoteAddress: 203.0.113.10
+      preSharedKeyRef:
+        name: site-psk
+      ike:
+        version: 2
+        proposals: [aes256-sha256-modp2048]
+      esp:
+        proposals: [aes256-sha256-modp2048]

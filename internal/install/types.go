@@ -16,6 +16,7 @@ const (
 	SchemaVersion       = "v1alpha1"
 	FieldManager        = "wirekubectl.wirekube.io"
 	InventoryName       = "wirekube-installation"
+	CharonDaemonSetName = "wirekube-charon"
 	InstallationIDLabel = "wirekube.io/installation-id"
 
 	RelayNone         = "none"
@@ -53,6 +54,13 @@ type Options struct {
 	ClusterServer      string
 	AgentAPIServer     string
 	WireKubeVersion    string
+	// IPsec deploys charon and lets the agents terminate spec.ipsec tunnels.
+	IPsec bool
+	// CharonImage is the charon image. Defaults to the agent image's
+	// repository with a "-charon" suffix and the same tag.
+	CharonImage string
+	// CharonNodeSelector limits the nodes that run charon.
+	CharonNodeSelector map[string]string
 }
 
 type Detection struct {
@@ -141,6 +149,20 @@ func (o *Options) Normalize() error {
 	}
 	if o.Relay == "" {
 		o.Relay = RelayLoadBalancer
+	}
+	o.CharonImage = strings.TrimSpace(o.CharonImage)
+	if o.IPsec && o.CharonImage == "" {
+		o.CharonImage = DefaultCharonImage(o.Image)
+		if o.CharonImage == "" {
+			return fmt.Errorf("--ipsec needs --charon-image when --image %q has no tag to derive it from", o.Image)
+		}
+	}
+	if !o.IPsec {
+		o.CharonImage = ""
+		o.CharonNodeSelector = nil
+	}
+	if len(o.CharonNodeSelector) == 0 {
+		o.CharonNodeSelector = nil
 	}
 	if o.AgentAPIServer = strings.TrimSpace(o.AgentAPIServer); o.AgentAPIServer != "" && !isInClusterAgentAPIServer(o.AgentAPIServer) {
 		if _, err := usableAgentAPIServer(o.AgentAPIServer); err != nil {
@@ -251,10 +273,21 @@ func ImageMutabilityWarning(image string) string {
 	return fmt.Sprintf("image %s is a mutable tag reference; workloads pull on every start, but Pods already running an older build keep it until the next rollout, so pin the image as IMAGE@sha256:DIGEST for deterministic rollouts", image)
 }
 
-// ImagePullPolicyFor keeps digest-pinned references on IfNotPresent (the
-// content cannot change, so the cache is always right) and forces tag
-// references to Always so a re-pushed tag is at least picked up whenever a
-// Pod starts instead of sticking to a stale node cache forever.
+// DefaultCharonImage derives the charon image from the agent image: the
+// same repository with a "-charon" suffix and the same tag. A digest cannot
+// be carried over, so an image without a tag yields "".
+func DefaultCharonImage(image string) string {
+	ref := strings.TrimSpace(image)
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+	colon := strings.LastIndex(ref, ":")
+	if colon <= strings.LastIndex(ref, "/") || colon == len(ref)-1 {
+		return ""
+	}
+	return ref[:colon] + "-charon" + ref[colon:]
+}
+
 func ImagePullPolicyFor(image string) string {
 	if digestPattern.MatchString(image) {
 		return "IfNotPresent"
