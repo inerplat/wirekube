@@ -133,6 +133,8 @@ func (h *darwinHost) Close() error {
 	return errors.Join(errs...)
 }
 
+func searchResolverName(ifName string) string { return "search.wirekube-connect-" + ifName }
+
 func processAlive(pid int) bool {
 	err := unix.Kill(pid, 0)
 	return err == nil || errors.Is(err, unix.EPERM)

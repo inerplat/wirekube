@@ -76,8 +76,6 @@ func resolverOwner(content string) (int, bool) {
 	return pid, true
 }
 
-func searchResolverName(ifName string) string { return "search.wirekube-connect-" + ifName }
-
 // staleResolverFiles lists files in dir that a connect session wrote and
 // whose process is gone. Unlike the tunnel interface and its routes, these
 // files outlive a killed process.
