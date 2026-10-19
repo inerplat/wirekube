@@ -322,6 +322,14 @@ func (b *WireKubeBind) SetRelayTransport(rt RelayTransport) {
 	b.relay = rt
 }
 
+// RelayTransport returns the relay transport the bind sends through, nil
+// before one is set.
+func (b *WireKubeBind) RelayTransport() RelayTransport {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.relay
+}
+
 // SetHeartbeatConfig gives the bind the local key pair and mesh MTU the
 // heartbeat needs: the key pair to derive per-peer heartbeat keys, the MTU to
 // size the MTU probe. The engine calls it right after constructing the bind.

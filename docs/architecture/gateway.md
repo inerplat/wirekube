@@ -64,11 +64,11 @@ spec:
 
 | Field | Description |
 |-------|-------------|
-| `peerRefs` | Ordered list of WireKubePeer names that can serve as gateway. First healthy peer is elected active. |
+| `peerRefs` | WireKubePeer names that can serve as gateway, most preferred first. See [High Availability](#high-availability). |
 | `clientRefs` | Peers that should route through this gateway. If empty, all mesh peers (except gateway peers and same-CIDR peers) are clients. |
 | `routes` | CIDR ranges reachable through the gateway. Injected into the active peer's AllowedIPs. |
 | `snat` | Source NAT configuration. When enabled, iptables MASQUERADE rules are added on the gateway node. |
-| `healthCheck` | TCP probe to verify target network reachability. Triggers failover on consecutive failures. |
+| `healthCheck` | Probe of the target network (TCP connect with a port, ICMP echo without) run by every peer in `peerRefs`. A peer failing `failureThreshold` probes in a row is not eligible. |
 
 ## How It Works
 
@@ -127,8 +127,10 @@ can route back to.
 
 ## High Availability
 
-Multiple peers can be listed in `peerRefs`. The agent uses priority-based
-election: the first healthy peer is elected active.
+Multiple peers can be listed in `peerRefs`, most preferred first. One
+controller, running in whichever agent holds the WireKube leader lease,
+decides every gateway's active peer and writes it to `status.activePeer`. All
+agents follow that field; none elects on its own.
 
 ```mermaid
 flowchart TD
@@ -142,11 +144,64 @@ flowchart TD
 
 ### Failover Behavior
 
-1. Each sync cycle, the agent checks all `peerRefs` for health (CRD exists, has public key)
-2. If the health check target is configured, a TCP probe is performed
-3. First healthy peer in list order becomes active
-4. Routes are injected into the new active peer and removed from the old one
-5. SNAT rules are updated on the respective nodes
+A peer is **eligible** while all of these hold:
+
+- its WireKubePeer exists and has a public key;
+- its agent has reported within the last 90 seconds (agents report every 30);
+- with `healthCheck` enabled, its own probe of the target has not failed
+  `failureThreshold` times in a row. Every peer in `peerRefs` probes, standbys
+  included, so the gateway never fails over to a node that cannot reach the
+  target either. Probes run at most once per agent sync.
+
+The controller re-evaluates on every gateway or peer change, and at least
+every 30 seconds:
+
+1. While the active peer is eligible, the gateway stays on it.
+2. When it is not, the gateway moves to the first eligible peer in `peerRefs`.
+3. When a peer earlier in `peerRefs` than the active one has been eligible for
+   2 minutes, the gateway returns to it. A flapping node therefore does not
+   drag the gateway back and forth.
+4. When no peer is eligible, the gateway stays where it is rather than
+   withdrawing its routes. The same holds when every agent stops reporting at
+   once, which points at status writes failing rather than every node dying:
+   the gateway stays on its current peer and does not fail back to one that
+   was already down.
+
+The controller also edits every peer's advertised routes itself. It adds the
+gateway's `routes` to the active peer's `allowedIPs` and removes them from
+every other peer, a dead one included, which could never withdraw its own.
+The active peer's agent then enables IP forwarding and SNAT, and terminates
+any IPsec tunnels.
+
+`status.peerHealth` records each peer's eligibility, and each node's probe
+results appear in its WireKubePeer `status.gatewayProbes`.
+
+### Upgrading From Agent-Elected Gateways
+
+Agents from before the election controller elect gateways themselves: they
+take the first `peerRefs` entry whose WireKubePeer exists, and that agent
+advertises the routes in its own WireKubePeer. The controller takes a gateway
+over only once every live peer in its `peerRefs` reports
+`status.gatewayElection` on its WireKubePeer, meaning it runs an agent that
+follows the controller. Peers that are gone or silent run no agent and do not
+hold this up.
+
+The controller then marks the gateway with the annotation
+`wirekube.io/gateway-election: controller`. Until a gateway is marked:
+
+- every agent, old or new, elects it the old way;
+- the controller does not touch its status or the routes advertised for it.
+
+During a rolling upgrade both kinds of agent therefore agree on every
+gateway.
+
+The controller re-checks this on every pass. If a node comes back still
+running an older agent, for example one that was down during the upgrade,
+the controller removes the annotation and hands the gateway back to the
+agents, since that agent will elect the gateway on its own regardless.
+
+The same failover rules decide which node fronts an external peer (see
+[Ingress failover](../reference/crds.md#ingress-failover)).
 
 ### Status
 

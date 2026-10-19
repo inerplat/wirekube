@@ -804,7 +804,7 @@ func buildInstallationPlanWithClient(cmd *cobra.Command, flags *lifecycleFlags, 
 }
 
 func kubeFactory() *internalconfig.Factory {
-	return internalconfig.New(internalconfig.Options{Kubeconfig: options.kubeconfig, Context: options.context, Namespace: options.namespace, Timeout: options.timeout}, scheme)
+	return internalconfig.New(internalconfig.Options{Kubeconfig: options.kubeconfig, Context: options.context, Namespace: options.namespace, Timeout: options.timeout, Overrides: &options.overrides}, scheme)
 }
 
 func targetCluster(factory *internalconfig.Factory) (string, string, error) {
@@ -820,11 +820,19 @@ func targetCluster(factory *internalconfig.Factory) (string, string, error) {
 	if contextConfig == nil {
 		return "", "", fmt.Errorf("context %q does not exist", contextName)
 	}
-	cluster := raw.Clusters[contextConfig.Cluster]
-	if cluster == nil {
-		return "", "", fmt.Errorf("cluster %q referenced by context %q does not exist", contextConfig.Cluster, contextName)
+	clusterName := contextConfig.Cluster
+	if options.overrides.Context.Cluster != "" {
+		clusterName = options.overrides.Context.Cluster
 	}
-	return contextName, cluster.Server, nil
+	cluster := raw.Clusters[clusterName]
+	if cluster == nil {
+		return "", "", fmt.Errorf("cluster %q referenced by context %q does not exist", clusterName, contextName)
+	}
+	server := cluster.Server
+	if options.overrides.ClusterInfo.Server != "" {
+		server = options.overrides.ClusterInfo.Server
+	}
+	return contextName, server, nil
 }
 
 func applyStoredLifecycleDefaults(cmd *cobra.Command, flags *lifecycleFlags, stored internalinstall.Options) {

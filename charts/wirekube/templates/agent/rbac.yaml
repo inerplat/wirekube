@@ -152,6 +152,53 @@ subjects:
 - kind: ServiceAccount
   name: wirekube-agent
   namespace: {{ .Release.Namespace }}
+---
+# The shared external ingress identity: external peers issued under it are
+# served by whichever node is healthy. The agent reads it, and the embedded
+# external-peer controller creates it on first use (create cannot be narrowed
+# to one name).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  resourceNames:
+  - wirekube-external-ingress
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wirekube.agent.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- include "wirekube.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-agent-external-ingress
+subjects:
+- kind: ServiceAccount
+  name: wirekube-agent
+  namespace: {{ .Release.Namespace }}
 {{- if .Values.agent.ipsec.enabled }}
 ---
 # IPsec pre-shared keys are read from the release namespace only.

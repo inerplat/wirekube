@@ -161,10 +161,13 @@ func tunnelSpec(name, remote, secret string) wirekubev1alpha1.GatewayIPsecTunnel
 // ipsecFixture: peers gw-a (preferred) and gw-b, gateway "site" with tunnel "vpn".
 func ipsecFixture(t *testing.T, node string, mutate func(*wirekubev1alpha1.WireKubeGateway), extra ...client.Object) (*Agent, *fakeCharon, *fakeDataplane, client.Client) {
 	t.Helper()
-	gw := &wirekubev1alpha1.WireKubeGateway{ObjectMeta: metav1.ObjectMeta{Name: "site"},
+	gw := &wirekubev1alpha1.WireKubeGateway{ObjectMeta: metav1.ObjectMeta{Name: "site",
+		Annotations: map[string]string{wirekubev1alpha1.GatewayElectionAnnotation: wirekubev1alpha1.GatewayElectionController}},
 		Spec: wirekubev1alpha1.WireKubeGatewaySpec{PeerRefs: []string{"gw-a", "gw-b"},
 			Routes: []wirekubev1alpha1.GatewayRoute{{CIDR: "10.77.1.0/24"}},
-			IPsec:  []wirekubev1alpha1.GatewayIPsecTunnel{tunnelSpec("vpn", "203.0.113.10", "vpn-psk")}}}
+			IPsec:  []wirekubev1alpha1.GatewayIPsecTunnel{tunnelSpec("vpn", "203.0.113.10", "vpn-psk")}},
+		// What the election controller decides for a healthy preferred peer.
+		Status: wirekubev1alpha1.WireKubeGatewayStatus{ActivePeer: "gw-a"}}
 	if mutate != nil {
 		mutate(gw)
 	}
@@ -187,6 +190,17 @@ func ipsecFixture(t *testing.T, node string, mutate func(*wirekubev1alpha1.WireK
 	a := &Agent{log: testr.New(t), client: c, nodeName: node, podNamespace: "wirekube-system"}
 	a.ipsec = &ipsecState{charon: ch, dataplane: dp, reported: map[[2]string]bool{}, keys: map[string][sha256.Size]byte{}}
 	return a, ch, dp, c
+}
+
+// electGateway moves the gateway the way the election controller does on a
+// failover.
+func electGateway(t *testing.T, c client.Client, peer string) {
+	t.Helper()
+	gw := getGateway(t, c)
+	gw.Status.ActivePeer = peer
+	if err := c.Status().Update(context.Background(), gw); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func getGateway(t *testing.T, c client.Client) *wirekubev1alpha1.WireKubeGateway {
@@ -296,9 +310,7 @@ func TestIPsecFailoverFollowsGatewayElection(t *testing.T) {
 	if len(ch.conns) != 0 {
 		t.Fatalf("gw-b loaded the tunnel while gw-a is elected")
 	}
-	if err := c.Delete(context.Background(), &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "gw-a"}}); err != nil {
-		t.Fatal(err)
-	}
+	electGateway(t, c, "gw-b")
 	a.setupIPsec(context.Background())
 	if tu := ch.conns[testKey]; tu == nil || tu.LocalID != "198.51.100.2" {
 		t.Fatalf("gw-b did not take over the tunnel with its own localID: %+v", tu)
@@ -566,9 +578,7 @@ func TestIPsecGuardCoversElectedTunnelsInEveryState(t *testing.T) {
 	if len(dp.guard) != 1 || dp.guard[0] != want {
 		t.Fatalf("failed tunnel not guarded: %v", dp.guard)
 	}
-	if err := c.Delete(context.Background(), &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "gw-a"}}); err != nil {
-		t.Fatal(err)
-	}
+	electGateway(t, c, "gw-b")
 	a.setupIPsec(context.Background())
 	if len(dp.guard) != 0 {
 		t.Fatalf("guard kept after the tunnel moved away: %v", dp.guard)
@@ -752,9 +762,7 @@ func TestIPsecMetricsFollowTheTunnels(t *testing.T) {
 		t.Fatalf("established gauge = %v", got)
 	}
 
-	if err := c.Delete(context.Background(), &wirekubev1alpha1.WireKubePeer{ObjectMeta: metav1.ObjectMeta{Name: "gw-a"}}); err != nil {
-		t.Fatal(err)
-	}
+	electGateway(t, c, "gw-b")
 	a.setupIPsec(context.Background())
 	if n := testutil.CollectAndCount(ipsecTunnelEstablished); n != 0 {
 		t.Errorf("%d tunnel series left after the tunnel moved away", n)

@@ -23,9 +23,9 @@ func WaitForActive(ctx context.Context, c client.Client, name string, timeout ti
 		}
 		switch cr.Status.Phase {
 		case wirekubev1alpha1.ExternalPeerPhaseActive:
-			if cr.Status.AssignedMeshIP == "" || cr.Status.RelayEndpoint == "" || cr.Status.IngressPublicKey == "" {
+			if cr.Status.AssignedMeshIP == "" || cr.Status.RelayEndpoint == "" || cr.ServerPublicKey() == "" {
 				return nil, fmt.Errorf("phase=Active but status incomplete: meshIP=%q endpoint=%q ingressPubKey-set=%v",
-					cr.Status.AssignedMeshIP, cr.Status.RelayEndpoint, cr.Status.IngressPublicKey != "")
+					cr.Status.AssignedMeshIP, cr.Status.RelayEndpoint, cr.ServerPublicKey() != "")
 			}
 			return cr, nil
 		case wirekubev1alpha1.ExternalPeerPhaseFailed:
@@ -72,7 +72,7 @@ func RenderConfig(privateKey string, cr *wirekubev1alpha1.WireKubeExternalPeer) 
 	fmt.Fprintf(&b, "Address = %s\n", cr.Status.AssignedMeshIP)
 	fmt.Fprintf(&b, "MTU = %d\n", mtu)
 	fmt.Fprintf(&b, "\n[Peer]\n")
-	fmt.Fprintf(&b, "PublicKey = %s\n", cr.Status.IngressPublicKey)
+	fmt.Fprintf(&b, "PublicKey = %s\n", cr.ServerPublicKey())
 	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "Endpoint = %s\n", cr.Status.RelayEndpoint)
 	fmt.Fprintf(&b, "PersistentKeepalive = 25\n")

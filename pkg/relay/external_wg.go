@@ -173,7 +173,9 @@ func (l *ExternalWGListener) forwardToIngress(token uint64, src netip.AddrPort, 
 	l.mu.Lock()
 	learned, learnedOK := l.byTokenIngress[token]
 	l.mu.Unlock()
-	if learnedOK {
+	// Handshake initiations always fan out: only the agent now serving the client
+	// can answer, so each handshake re-learns the ingress after it moves.
+	if learnedOK && !isWGInitiation(payload) {
 		if err := l.writeToIngress(learned, token, src, payload); err == nil {
 			return nil
 		}
@@ -238,8 +240,14 @@ func (l *ExternalWGListener) AllowsIngress(ingress [PubKeySize]byte) bool {
 	return l.fixedIngress == ([PubKeySize]byte{}) || l.fixedIngress == ingress
 }
 
-func (l *ExternalWGListener) BindTokenIngress(token uint64, ingress [PubKeySize]byte) {
+// BindTokenIngress pins token's flow to the agent that answered. Only a handshake
+// response or transport data counts: a cookie reply can come from any agent
+// sharing the ingress key that is merely under load.
+func (l *ExternalWGListener) BindTokenIngress(token uint64, ingress [PubKeySize]byte, payload []byte) {
 	if l.fixedIngress != ([PubKeySize]byte{}) {
+		return
+	}
+	if !isWGSessionReply(payload) {
 		return
 	}
 	l.mu.Lock()
@@ -248,6 +256,37 @@ func (l *ExternalWGListener) BindTokenIngress(token uint64, ingress [PubKeySize]
 		return
 	}
 	l.byTokenIngress[token] = ingress
+}
+
+// ForgetIngress drops every flow pinned to an agent that left this replica,
+// so their next packets fan out at once instead of first failing against
+// the departed agent.
+func (l *ExternalWGListener) ForgetIngress(ingress [PubKeySize]byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for token, key := range l.byTokenIngress {
+		if key == ingress {
+			delete(l.byTokenIngress, token)
+		}
+	}
+}
+
+func isWGInitiation(p []byte) bool {
+	return len(p) == wgInitiationLen && p[0] == wgMessageInitiation && p[1]|p[2]|p[3] == 0
+}
+
+// isWGSessionReply reports a handshake response or a transport data message.
+func isWGSessionReply(p []byte) bool {
+	if len(p) < 4 || p[1]|p[2]|p[3] != 0 {
+		return false
+	}
+	switch p[0] {
+	case wgMessageResponse:
+		return len(p) == wgResponseLen
+	case wgMessageTransport:
+		return len(p) >= wgTransportMinLen
+	}
+	return false
 }
 
 // SendToExternal writes a raw WireGuard response packet back to the UDP source

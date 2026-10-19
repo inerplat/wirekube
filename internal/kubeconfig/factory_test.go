@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 func TestFactorySelectsExplicitContext(t *testing.T) {
@@ -34,6 +36,31 @@ func TestFactorySelectsExplicitContext(t *testing.T) {
 	}
 	if namespace != "secondary-ns" {
 		t.Fatalf("namespace=%q", namespace)
+	}
+}
+
+func TestFactoryAppliesConnectionOverrides(t *testing.T) {
+	factory := New(Options{
+		Kubeconfig: writeKubeconfig(t),
+		Overrides: &clientcmd.ConfigOverrides{
+			Context:     clientcmdapi.Context{Cluster: "secondary"},
+			AuthInfo:    clientcmdapi.AuthInfo{Token: "override-token", Impersonate: "alice"},
+			ClusterInfo: clientcmdapi.Cluster{TLSServerName: "api.example.test"},
+		},
+	}, runtime.NewScheme())
+
+	config, err := factory.RESTConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Host != "https://secondary.example.test" {
+		t.Fatalf("--cluster ignored: host=%q", config.Host)
+	}
+	if config.BearerToken != "override-token" || config.Impersonate.UserName != "alice" {
+		t.Fatalf("auth overrides ignored: token=%q as=%q", config.BearerToken, config.Impersonate.UserName)
+	}
+	if config.TLSClientConfig.ServerName != "api.example.test" {
+		t.Fatalf("--tls-server-name ignored: %q", config.TLSClientConfig.ServerName)
 	}
 }
 

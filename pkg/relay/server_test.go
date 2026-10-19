@@ -2,7 +2,9 @@ package relay
 
 import (
 	"bufio"
+	"bytes"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -219,13 +221,15 @@ func TestServer_ExternalWGListenerLearnsDynamicIngress(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	wgInit, wgResp, wgData := wgMessage(1, 148), wgMessage(2, 92), wgMessage(4, 64)
+
 	external, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP external: %v", err)
 	}
 	defer external.Close()
 
-	if _, err := external.WriteToUDP([]byte("wg-init"), s.externalWG.conn.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := external.WriteToUDP(wgInit, s.externalWG.conn.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatalf("external WriteToUDP init: %v", err)
 	}
 	frameA := readFrameWithDeadline(t, ingressA)
@@ -244,14 +248,14 @@ func TestServer_ExternalWGListenerLearnsDynamicIngress(t *testing.T) {
 	if tokenA == 0 || tokenA != tokenB {
 		t.Fatalf("tokens = %d/%d, want same non-zero token", tokenA, tokenB)
 	}
-	if string(payloadA) != "wg-init" || string(payloadB) != "wg-init" {
-		t.Fatalf("payloads = %q/%q, want wg-init", string(payloadA), string(payloadB))
+	if !bytes.Equal(payloadA, wgInit) || !bytes.Equal(payloadB, wgInit) {
+		t.Fatal("fanout payloads differ from the initiation")
 	}
 
-	if err := WriteFrame(ingressB, MakeExternalDataFrame(tokenB, "", []byte("wg-response"))); err != nil {
+	if err := WriteFrame(ingressB, MakeExternalDataFrame(tokenB, "", wgResp)); err != nil {
 		t.Fatalf("WriteFrame external response: %v", err)
 	}
-	buf := make([]byte, 128)
+	buf := make([]byte, 256)
 	if err := external.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("external SetReadDeadline: %v", err)
 	}
@@ -259,11 +263,11 @@ func TestServer_ExternalWGListenerLearnsDynamicIngress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("external Read: %v", err)
 	}
-	if string(buf[:n]) != "wg-response" {
-		t.Fatalf("external response = %q", string(buf[:n]))
+	if !bytes.Equal(buf[:n], wgResp) {
+		t.Fatalf("external response = %x", buf[:n])
 	}
 
-	if _, err := external.WriteToUDP([]byte("wg-data"), s.externalWG.conn.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := external.WriteToUDP(wgData, s.externalWG.conn.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatalf("external WriteToUDP data: %v", err)
 	}
 	nextB := readFrameWithDeadline(t, ingressB)
@@ -271,14 +275,135 @@ func TestServer_ExternalWGListenerLearnsDynamicIngress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseExternalDataFrame learned B: %v", err)
 	}
-	if string(payload) != "wg-data" {
-		t.Fatalf("learned payload = %q, want wg-data", string(payload))
+	if !bytes.Equal(payload, wgData) {
+		t.Fatalf("learned payload = %x, want the data message", payload)
 	}
 	if err := ingressA.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline A: %v", err)
 	}
 	if frame, err := ReadFrame(ingressA); err == nil {
 		t.Fatalf("unexpected frame on unlearned ingress A: %#x", frame.Type)
+	}
+}
+
+// wgMessage builds a payload shaped like a WireGuard message of the given
+// type and length; the relay only ever looks at the type and the length.
+func wgMessage(typ byte, n int) []byte {
+	b := make([]byte, n)
+	b[0] = typ
+	for i := 4; i < n; i++ {
+		b[i] = byte(i)
+	}
+	return b
+}
+
+// TestServer_ExternalWGHandshakeReelectsIngress covers an ingress moving while
+// the old agent stays connected: data follows the pin until the next handshake,
+// whose answering agent takes the flow over. A cookie reply does not.
+func TestServer_ExternalWGHandshakeReelectsIngress(t *testing.T) {
+	s := NewServer()
+	if err := s.EnableExternalWGListener("127.0.0.1:0", [PubKeySize]byte{}); err != nil {
+		t.Fatalf("EnableExternalWGListener: %v", err)
+	}
+	defer s.externalWG.Close()
+
+	connect := func(key [PubKeySize]byte) net.Conn {
+		agent, relaySide := net.Pipe()
+		t.Cleanup(func() { agent.Close() })
+		go s.handleConn(relaySide)
+		if err := WriteFrame(agent, MakeRegisterFrame(key)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		return agent
+	}
+	a := connect(pubkey(9))
+	b := connect(pubkey(10))
+	deadline := time.Now().Add(time.Second)
+	for s.ConnectedPeers() != 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("agents did not register")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	external, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer external.Close()
+	relayAddr := s.externalWG.conn.LocalAddr().(*net.UDPAddr)
+	send := func(p []byte) {
+		t.Helper()
+		if _, err := external.WriteToUDP(p, relayAddr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recv := func(agent net.Conn) (uint64, []byte) {
+		t.Helper()
+		token, _, payload, err := ParseExternalDataFrame(readFrameWithDeadline(t, agent).Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token, payload
+	}
+	reply := func(agent net.Conn, token uint64, p []byte) {
+		t.Helper()
+		if err := WriteFrame(agent, MakeExternalDataFrame(token, "", p)); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 256)
+		_ = external.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := external.Read(buf); err != nil {
+			t.Fatalf("reply never reached the client: %v", err)
+		}
+	}
+	silent := func(agent net.Conn, who string) {
+		t.Helper()
+		_ = agent.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if frame, err := ReadFrame(agent); err == nil {
+			t.Fatalf("agent %s got an unexpected frame %#x", who, frame.Type)
+		}
+		_ = agent.SetReadDeadline(time.Time{})
+	}
+
+	// B serves the client first.
+	send(wgMessage(1, 148))
+	token, _ := recv(a)
+	recv(b)
+	reply(b, token, wgMessage(2, 92))
+	send(wgMessage(4, 64))
+	recv(b)
+	silent(a, "A")
+
+	// The ingress moves to A. A cookie from A proves nothing and moves nothing.
+	reply(a, token, wgMessage(3, 64))
+	send(wgMessage(4, 64))
+	recv(b)
+	silent(a, "A")
+
+	// The client re-handshakes; the initiation reaches both despite the pin,
+	// and A's response takes the flow over.
+	send(wgMessage(1, 148))
+	recv(a)
+	recv(b)
+	reply(a, token, wgMessage(2, 92))
+	send(wgMessage(4, 64))
+	recv(a)
+	silent(b, "B")
+}
+
+func TestExternalWGListenerForgetIngress(t *testing.T) {
+	l := &ExternalWGListener{
+		byToken:        map[uint64]netip.AddrPort{1: netip.MustParseAddrPort("192.0.2.1:1"), 2: netip.MustParseAddrPort("192.0.2.2:1")},
+		byTokenIngress: map[uint64][PubKeySize]byte{},
+	}
+	l.BindTokenIngress(1, pubkey(9), wgMessage(4, 32))
+	l.BindTokenIngress(2, pubkey(10), wgMessage(2, 92))
+	l.ForgetIngress(pubkey(9))
+	if _, ok := l.byTokenIngress[1]; ok {
+		t.Fatal("flow still pinned to the departed agent")
+	}
+	if got := l.byTokenIngress[2]; got != pubkey(10) {
+		t.Fatal("an unrelated flow lost its pin")
 	}
 }
 

@@ -112,6 +112,18 @@ The relay pool parses the incoming frame and invokes Bind delivery with the send
 
 The legacy `UDPProxy` implementation remains in the codebase as a fallback for engines without direct Bind delivery, but it is not the normal path of the bundled userspace engine.
 
+### External Peers
+
+External WireGuard clients reach the relay's shared UDP listener, which wraps each datagram in a `MsgExternalData` frame with a token for its source address. The relay never decrypts these packets. It sends each flow to the agent it has learned for it:
+
+- A handshake initiation always goes to every agent. Only the node serving that client's key can answer, and the agent whose handshake response or transport data comes back becomes the flow's agent.
+- Every later packet follows that agent. A cookie reply does not move the flow, because any agent sharing the ingress key can send one.
+- When an agent disconnects, the relay forgets the flows learned for it, and their next packets go to every agent again.
+
+Because each handshake re-learns the agent, a client whose ingress moved to another node is picked up by its next handshake. That happens at least every two minutes, and within seconds of its packets going unanswered.
+
+On the agent, an external packet goes to both of its WireGuard devices: the mesh device, which serves peers issued under the node's own key, and the shared ingress device (see [Ingress failover](../reference/crds.md#ingress-failover)). Each device drops packets it holds no key or session for. The shared device takes the packets bound for its peers off the mesh TUN before the mesh device sees them, and writes what it decrypts back into the same TUN, so kernel routing does not change.
+
 ## Relay Pool
 
 The relay pool manages connections to **multiple relay server instances** for

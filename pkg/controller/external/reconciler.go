@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/failover"
 	"github.com/inerplat/wirekube/pkg/meshalloc"
 	"github.com/inerplat/wirekube/pkg/meship"
 )
@@ -58,6 +60,7 @@ const (
 	reasonReconciled             = "Reconciled"
 	reasonValidationFailed       = "ValidationFailed"
 	reasonInvalidPublicKey       = "InvalidPublicKey"
+	reasonIngressIdentityRetired = "IngressIdentityRetired"
 	reasonMeshNotFound           = "MeshNotFound"
 	reasonMeshAddressesExhausted = "MeshAddressesExhausted"
 	reasonIngressPeerNotReady    = "IngressPeerNotReady"
@@ -79,6 +82,7 @@ const (
 //   - writes the relay shared raw-WireGuard endpoint into status.
 //   - on deletion, removes the finalizer.
 //   - on TTL expiry, deletes the CR.
+//   - on heartbeat expiry, deletes the CR (see ExternalPeerHeartbeatAnnotation).
 type Reconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
@@ -96,6 +100,14 @@ type Reconciler struct {
 	// ClaimNamespace holds the mesh address claim Leases. Empty falls back to
 	// wirekube-system, matching the agent.
 	ClaimNamespace string
+
+	heartbeats    heartbeatTracker
+	ingressHealth failover.Tracker
+
+	sharedKeyMu sync.Mutex
+	sharedKey   [32]byte
+	sharedKeyOK bool
+	sharedKeyAt time.Time
 }
 
 // allocateMeshIP resolves the external peer's overlay address.
@@ -277,9 +289,33 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// 1. Deletion path.
 	if cr.DeletionTimestamp != nil {
+		r.heartbeats.forget(cr.UID)
 		return r.handleDeletion(ctx, cr)
 	}
 
+	// 1b. Heartbeat expiry. It runs ahead of everything else because a
+	// session that has gone away should lose its access whatever state the
+	// peer is in, and its deadline bounds every requeue below.
+	heartbeatDue, expired := r.heartbeatDeadline(cr)
+	if expired {
+		if err := r.Delete(ctx, cr); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+	res, err := r.reconcilePeer(ctx, cr)
+	if err != nil || heartbeatDue == 0 || res.Requeue {
+		return res, err
+	}
+	if res.RequeueAfter == 0 || heartbeatDue < res.RequeueAfter {
+		res.RequeueAfter = heartbeatDue
+	}
+	return res, nil
+}
+
+// reconcilePeer runs the live-peer steps of Reconcile on a peer that is not
+// being deleted.
+func (r *Reconciler) reconcilePeer(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer) (ctrl.Result, error) {
 	// 2. Finalizer add.
 	if !hasFinalizer(cr, FinalizerName) {
 		cr.Finalizers = append(cr.Finalizers, FinalizerName)
@@ -340,11 +376,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("allocate mesh IP for %s: %w", cr.Name, err)
 	}
 
-	// 6. Ingress peer pick.
-	ingressPeerName, ingressPubKey, pendingResult, pendingErr, picked := r.pickIngressPeer(ctx, cr, relayCtl)
-	if !picked {
-		// pendingResult / pendingErr already set status; bubble up.
-		return pendingResult, pendingErr
+	// 6. Ingress peer pick. A peer issued under the shared identity can be served
+	// by any node, so it follows node health; one issued under a node's own key
+	// stays there, since no other node can answer its handshakes.
+	var (
+		ingressPeerName string
+		ingressPubKey   [32]byte
+		roaming         bool
+	)
+	shared, sharedOK := r.sharedIngressKey(ctx)
+	if !sharedOK || !roams(cr, shared) {
+		// The node-key path may only handle a peer issued under its node's
+		// key (or not issued at all): run on anything else it would write a
+		// node key into status that the client config does not carry.
+		pinned, err := r.pinnedToNodeKey(ctx, cr)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("check how %s was issued: %w", cr.Name, err)
+		}
+		if !pinned {
+			if !sharedOK {
+				return ctrl.Result{}, fmt.Errorf("shared external ingress identity unavailable for %s", cr.Name)
+			}
+			return r.markPending(ctx, cr, reasonIngressIdentityRetired,
+				"the client config names an ingress identity that no longer exists (the shared identity was rotated); re-issue this peer",
+				requeueLong)
+		}
+	}
+	if sharedOK && roams(cr, shared) {
+		name, pendingResult, pendingErr, picked := r.pickRoamingIngress(ctx, cr, relayCtl)
+		if !picked {
+			return pendingResult, pendingErr
+		}
+		if err := r.recordIssuedIngressKey(ctx, cr, shared); err != nil {
+			return ctrl.Result{}, err
+		}
+		ingressPeerName, ingressPubKey, roaming = name, shared, true
+	} else {
+		name, key, pendingResult, pendingErr, picked := r.pickIngressPeer(ctx, cr, relayCtl)
+		if !picked {
+			// pendingResult / pendingErr already set status; bubble up.
+			return pendingResult, pendingErr
+		}
+		ingressPeerName, ingressPubKey = name, key
 	}
 
 	// 7. Resolve effective AllowedDestinations.
@@ -382,6 +455,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// 9. TTL handling.
+	var requeue time.Duration
 	if cr.Spec.TTL != nil && cr.Spec.TTL.Duration > 0 {
 		expiry := cr.CreationTimestamp.Time.Add(cr.Spec.TTL.Duration)
 		now := r.now()
@@ -391,19 +465,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 			return ctrl.Result{}, nil
 		}
-		requeue := expiry.Sub(now)
-		// A degraded read has no watch event to bring it back, so retry
-		// sooner than the TTL deadline when that lands first.
-		if destinationsDegraded && requeueLong < requeue {
-			requeue = requeueLong
-		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		requeue = expiry.Sub(now)
 	}
 
-	if destinationsDegraded {
-		return ctrl.Result{RequeueAfter: requeueLong}, nil
+	// A degraded read has no watch event to bring it back, and a node going
+	// silent produces no event at all, so both are polled: a roaming peer
+	// has to notice its ingress dying to move off it.
+	if (destinationsDegraded || roaming) && (requeue == 0 || requeueLong < requeue) {
+		requeue = requeueLong
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 // statusUpdate captures every field patched on the Active path. Grouping
@@ -437,19 +508,43 @@ func (r *Reconciler) pickIngressPeer(ctx context.Context, cr *wirekubev1alpha1.W
 		return r.resolveNamedIngressPeer(ctx, cr, cr.Spec.IngressPeer, "spec.ingressPeer", relayCtl)
 	}
 
+	candidates, probed, res, err, ok := r.ingressCandidates(ctx, cr, relayCtl, ingressHeartbeatThreshold, false)
+	if !ok {
+		return "", zero, res, err, false
+	}
+	if len(candidates) > 0 {
+		best := candidates[0]
+		return best.name, best.pubKey, ctrl.Result{}, nil, true
+	}
+	res, err = r.markNoIngress(ctx, cr, probed)
+	return "", zero, res, err, false
+}
+
+func (r *Reconciler) markNoIngress(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, probed bool) (ctrl.Result, error) {
+	msg := "no ready WireKubePeer with a usable publicKey found"
+	if probed {
+		msg = "no ready WireKubePeer reachable from every relay replica"
+	}
+	return r.markPending(ctx, cr, reasonNoReadyIngressPeer, msg, requeueLong)
+}
+
+// ingressCandidates returns the nodes able to front an external peer now, best
+// first: usable key, reported within fresh, reachable from every relay replica,
+// and with sharedOnly, serving the shared identity. ok=false means already Pending.
+func (r *Reconciler) ingressCandidates(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, relayCtl RelayController, fresh time.Duration, sharedOnly bool) ([]ingressCandidate, bool, ctrl.Result, error, bool) {
 	peerList := &wirekubev1alpha1.WireKubePeerList{}
 	if err := r.List(ctx, peerList); err != nil {
-		return "", zero, ctrl.Result{}, fmt.Errorf("list WireKubePeer: %w", err), false
+		return nil, false, ctrl.Result{}, fmt.Errorf("list WireKubePeer: %w", err), false
 	}
 	load, err := r.activeIngressLoad(ctx, cr.Name)
 	if err != nil {
-		return "", zero, ctrl.Result{}, err, false
+		return nil, false, ctrl.Result{}, err, false
 	}
 	latencies, probed, probeErr := r.probeIngressLatencies(ctx, relayCtl, peerList)
 	if probeErr != nil {
 		res, retErr := r.markPending(ctx, cr, reasonIngressProbeFailed,
 			fmt.Sprintf("relay ingress probe failed: %v", probeErr), requeueShort)
-		return "", zero, res, retErr, false
+		return nil, probed, res, retErr, false
 	}
 
 	// Heartbeats are the only signal that survives a node whose agent stopped:
@@ -460,23 +555,23 @@ func (r *Reconciler) pickIngressPeer(ctx context.Context, cr *wirekubev1alpha1.W
 	// the tie-break falls through to name ordering — which is how a dead node
 	// alphabetically ahead of the live ones wins and every client bound to it
 	// silently fails to hand shake.
-	liveByName := freshlyReportedPeers(peerList, r.now())
+	live := failover.Live(peerList.Items, r.now(), fresh, cr.Status.IngressPeerName)
 
 	candidates := make([]ingressCandidate, 0, len(peerList.Items))
 	for i := range peerList.Items {
 		peer := &peerList.Items[i]
 		pubKey, ok, err := decodeIngressPeerPubKey(peer)
 		if err != nil {
-			return "", zero, ctrl.Result{}, err, false
+			return nil, probed, ctrl.Result{}, err, false
 		}
 		if !ok {
 			continue
 		}
-		// Only enforced once some peer publishes a heartbeat. A fleet still
-		// running agents that predate the field reports nothing at all, and
-		// excluding everyone there would strand external peers that work
-		// today.
-		if len(liveByName) > 0 && !liveByName[peer.Name] {
+		if sharedOnly && !peer.Status.SharedExternalIngress {
+			continue
+		}
+		// Liveness is only judged once some peer reports; see failover.Live.
+		if !live(peer.Name) {
 			continue
 		}
 		latency, reachable := latencies[pubKey]
@@ -498,30 +593,19 @@ func (r *Reconciler) pickIngressPeer(ctx context.Context, cr *wirekubev1alpha1.W
 			score:   latency + time.Duration(load[peer.Name])*ingressLoadPenalty,
 		})
 	}
-	if len(candidates) > 0 {
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].score != candidates[j].score {
-				return candidates[i].score < candidates[j].score
-			}
-			if candidates[i].load != candidates[j].load {
-				return candidates[i].load < candidates[j].load
-			}
-			if candidates[i].latency != candidates[j].latency {
-				return candidates[i].latency < candidates[j].latency
-			}
-			return candidates[i].name < candidates[j].name
-		})
-		best := candidates[0]
-		return best.name, best.pubKey, ctrl.Result{}, nil, true
-	}
-
-	msg := "no ready WireKubePeer with a usable publicKey found"
-	if probed {
-		msg = "no ready WireKubePeer reachable from every relay replica"
-	}
-	res, retErr := r.markPending(ctx, cr, reasonNoReadyIngressPeer,
-		msg, requeueLong)
-	return "", zero, res, retErr, false
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score < candidates[j].score
+		}
+		if candidates[i].load != candidates[j].load {
+			return candidates[i].load < candidates[j].load
+		}
+		if candidates[i].latency != candidates[j].latency {
+			return candidates[i].latency < candidates[j].latency
+		}
+		return candidates[i].name < candidates[j].name
+	})
+	return candidates, probed, ctrl.Result{}, nil, true
 }
 
 type ingressCandidate struct {
@@ -538,23 +622,6 @@ type ingressCandidate struct {
 // a dead ingress is worse than picking a slow one — the client pins the ingress
 // public key in its config, so the mistake persists until the peer is re-issued.
 const ingressHeartbeatThreshold = 5 * time.Minute
-
-// freshlyReportedPeers returns the set of peers whose agent has published a
-// heartbeat recently. An empty result means no peer reports one at all, which
-// callers must treat as "no information" rather than "everyone is dead".
-func freshlyReportedPeers(peerList *wirekubev1alpha1.WireKubePeerList, now time.Time) map[string]bool {
-	live := map[string]bool{}
-	for i := range peerList.Items {
-		peer := &peerList.Items[i]
-		if peer.Status.LastReportedAt == nil {
-			continue
-		}
-		if now.Sub(peer.Status.LastReportedAt.Time) < ingressHeartbeatThreshold {
-			live[peer.Name] = true
-		}
-	}
-	return live
-}
 
 func (r *Reconciler) resolveNamedIngressPeer(ctx context.Context, cr *wirekubev1alpha1.WireKubeExternalPeer, peerName, source string, relayCtl RelayController) (string, [32]byte, ctrl.Result, error, bool) {
 	var zero [32]byte

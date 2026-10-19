@@ -4,13 +4,26 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// GatewayElectionAnnotation marks a gateway the election controller owns. Agents
+// follow status.activePeer for a marked gateway and elect an unmarked one
+// themselves.
+const (
+	GatewayElectionAnnotation = "wirekube.io/gateway-election"
+	GatewayElectionController = "controller"
+)
+
+// ElectedByController reports whether the election controller owns gw.
+func (gw *WireKubeGateway) ElectedByController() bool {
+	return gw.Annotations[GatewayElectionAnnotation] == GatewayElectionController
+}
+
 // WireKubeGatewaySpec defines the desired state of WireKubeGateway.
 // A gateway acts as a Virtual Gateway (VGW) in the mesh, enabling other nodes
 // to access networks behind the gateway node via its WireGuard tunnel.
 type WireKubeGatewaySpec struct {
-	// PeerRefs references WireKubePeer resources that serve as gateway nodes.
-	// The first healthy peer is elected as the active gateway (HA failover).
-	// Each entry is a WireKubePeer name (e.g. "node-worker1").
+	// PeerRefs lists the WireKubePeers that can serve as gateway, most preferred
+	// first. The gateway stays on a healthy active peer, fails over to the first
+	// healthy one, and returns to a more preferred one after two healthy minutes.
 	// +kubebuilder:validation:MinItems=1
 	PeerRefs []string `json:"peerRefs"`
 
@@ -42,8 +55,9 @@ type WireKubeGatewaySpec struct {
 	// +kubebuilder:validation:MaxItems=8
 	IPsec []GatewayIPsecTunnel `json:"ipsec,omitempty"`
 
-	// HealthCheck verifies that the target network is reachable through the gateway.
-	// When the health check fails, traffic is rerouted to the next peer in PeerRefs.
+	// HealthCheck has every peer in PeerRefs probe the target network; a peer whose
+	// probe fails FailureThreshold times in a row is not eligible. Probes run at most
+	// once per agent sync.
 	// +optional
 	HealthCheck *GatewayHealthCheck `json:"healthCheck,omitempty"`
 }
@@ -97,7 +111,8 @@ type GatewayHealthCheck struct {
 
 // WireKubeGatewayStatus defines the observed state of WireKubeGateway.
 type WireKubeGatewayStatus struct {
-	// ActivePeer is the WireKubePeer name currently serving as the active gateway.
+	// ActivePeer is the WireKubePeer name currently serving as the active
+	// gateway. The controller writes it and every agent follows it.
 	// +optional
 	ActivePeer string `json:"activePeer,omitempty"`
 

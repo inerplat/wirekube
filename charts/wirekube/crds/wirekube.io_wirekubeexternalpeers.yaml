@@ -93,11 +93,9 @@ spec:
                 type: string
               ingressPeer:
                 description: |-
-                  IngressPeer, when set, pins this external peer to a specific WireKubePeer
-                  by name. Useful when the operator wants the official WireGuard client to
-                  use a particular node as its server identity. When empty, the controller
-                  auto-selects the first ready WireKubePeer at allocation time and writes
-                  the choice into status.ingressPeerName.
+                  IngressPeer is the preferred ingress WireKubePeer. A shared-identity peer uses
+                  it while healthy and fails over otherwise; a peer issued under a node key stays
+                  on that node. When empty, the controller picks the best ready node.
                 type: string
               mtu:
                 description: |-
@@ -217,18 +215,15 @@ spec:
                 type: boolean
               ingressPeerName:
                 description: |-
-                  IngressPeerName is the WireKubePeer name this external peer is bound to
-                  as its official WireGuard server identity. Pinned at allocation time from
-                  spec.ingressPeer or auto-selected. Migration to a different ingress peer
-                  requires re-issuance.
+                  IngressPeerName is the WireKubePeer currently serving this peer. It follows
+                  node health under the shared identity; under a node key it is fixed until the
+                  peer is re-issued.
                 type: string
               ingressPublicKey:
                 description: |-
-                  IngressPublicKey is the WireGuard public key of the ingress peer. The
-                  rendered conf places this in the [Peer] PublicKey field so the
-                  external client can authenticate inbound traffic from the cluster.
-                  Populated at allocation time from the selected ingress peer's
-                  WireKubePeer.spec.publicKey; mirrors IngressPeerName.
+                  IngressPublicKey is the server public key the client config carries in
+                  its [Peer] PublicKey field: the shared external ingress identity, or for
+                  peers issued before it existed, the ingress node's own key.
                 type: string
               lastHandshake:
                 description: |-

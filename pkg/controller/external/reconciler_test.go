@@ -187,12 +187,25 @@ func newIngressPeer() *wirekubev1alpha1.WireKubePeer {
 	return newIngressPeerWith(testIngressPeer, ingressPubKey())
 }
 
+// newIngressPeerWith is a node running a current agent, which serves the
+// shared external ingress identity.
 func newIngressPeerWith(name, pubKey string) *wirekubev1alpha1.WireKubePeer {
 	return &wirekubev1alpha1.WireKubePeer{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: wirekubev1alpha1.WireKubePeerSpec{
 			PublicKey: pubKey,
 		},
+		Status: wirekubev1alpha1.WireKubePeerStatus{SharedExternalIngress: true},
+	}
+}
+
+// issuedUnderNodeKey marks a peer as issued before the shared external
+// ingress identity existed: its client config names the node's own key, so
+// it stays pinned to that node.
+func issuedUnderNodeKey(node, nodeKey string) func(*wirekubev1alpha1.WireKubeExternalPeer) {
+	return func(p *wirekubev1alpha1.WireKubeExternalPeer) {
+		p.Status.IngressPeerName = node
+		p.Status.IngressPublicKey = nodeKey
 	}
 }
 
@@ -336,8 +349,8 @@ func TestReconcile_ExplicitIngressPeer(t *testing.T) {
 	if got.Status.IngressPeerName != "node-z" {
 		t.Fatalf("ingressPeerName = %q, want node-z", got.Status.IngressPeerName)
 	}
-	if got.Status.IngressPublicKey != alternateIngressPubKey() {
-		t.Fatalf("ingressPublicKey = %q, want explicit peer key", got.Status.IngressPublicKey)
+	if got.Status.IngressPublicKey != sharedIngressPubKey(t, c) {
+		t.Fatalf("ingressPublicKey = %q, want the shared ingress identity", got.Status.IngressPublicKey)
 	}
 }
 
@@ -484,7 +497,7 @@ func TestReconcile_ExplicitIngressPeerMustBeReachableFromRelay(t *testing.T) {
 	}
 	cr := newExternalPeer(testExternalName, func(p *wirekubev1alpha1.WireKubeExternalPeer) {
 		p.Spec.IngressPeer = "node-a"
-	})
+	}, issuedUnderNodeKey("node-a", nodeAKey))
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeerWith("node-a", nodeAKey))
 	relayCtl := newProbeRelay(testRelayHost, map[[32]byte]time.Duration{
 		// An unrelated result proves the controller does not accept a

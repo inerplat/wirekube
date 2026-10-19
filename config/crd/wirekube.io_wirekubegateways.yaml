@@ -74,8 +74,9 @@ spec:
                 type: array
               healthCheck:
                 description: |-
-                  HealthCheck verifies that the target network is reachable through the gateway.
-                  When the health check fails, traffic is rerouted to the next peer in PeerRefs.
+                  HealthCheck has every peer in PeerRefs probe the target network; a peer whose
+                  probe fails FailureThreshold times in a row is not eligible. Probes run at most
+                  once per agent sync.
                 properties:
                   enabled:
                     description: Enabled activates periodic health checking.
@@ -286,9 +287,9 @@ spec:
                 x-kubernetes-list-type: map
               peerRefs:
                 description: |-
-                  PeerRefs references WireKubePeer resources that serve as gateway nodes.
-                  The first healthy peer is elected as the active gateway (HA failover).
-                  Each entry is a WireKubePeer name (e.g. "node-worker1").
+                  PeerRefs lists the WireKubePeers that can serve as gateway, most preferred
+                  first. The gateway stays on a healthy active peer, fails over to the first
+                  healthy one, and returns to a more preferred one after two healthy minutes.
                 items:
                   type: string
                 minItems: 1
@@ -340,8 +341,9 @@ spec:
             description: WireKubeGatewayStatus defines the observed state of WireKubeGateway.
             properties:
               activePeer:
-                description: ActivePeer is the WireKubePeer name currently serving
-                  as the active gateway.
+                description: |-
+                  ActivePeer is the WireKubePeer name currently serving as the active
+                  gateway. The controller writes it and every agent follows it.
                 type: string
               conditions:
                 description: Conditions reflect the current state of the gateway.

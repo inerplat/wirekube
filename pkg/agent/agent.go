@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/inerplat/wirekube/pkg/agent/nat"
@@ -37,9 +38,14 @@ import (
 //   - Agent syncs all WireKubePeer CRDs into WireGuard peer config + kernel routes.
 //   - No IPAM, no mesh IP assignment, no kubelet modification.
 type Agent struct {
-	log          logr.Logger
-	client       client.Client
-	wgMgr        wireguard.WGEngine
+	log    logr.Logger
+	client client.Client
+	wgMgr  wireguard.WGEngine
+	// lastSharedIngress is the shared external ingress identity as last read,
+	// kept across a failed read.
+	lastSharedIngress *wireguard.KeyPair
+	// gwProbes runs the gateway health checks this node owes.
+	gwProbes     gatewayProbes
 	nodeName     string
 	podName      string
 	podNamespace string
@@ -625,25 +631,39 @@ func (a *Agent) upsertOwnPeer(ctx context.Context, mesh *wirekubev1alpha1.WireKu
 		return err
 	}
 
-	patch := client.MergeFrom(existing.DeepCopy())
-	existing.Spec.PublicKey = pubKey
-	if endpoint != "" {
-		existing.Spec.Endpoint = endpoint
-	}
-	// Backfill ownerReference for CRs created before this fix existed, so K8s
-	// GC cascade-deletes them the moment the underlying Node is removed.
-	if !hasNodeOwnerReference(existing.OwnerReferences, node) {
-		existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
-	}
-	claimed, err := a.allocateMeshIP(ctx, mesh, name, existing.Status.MeshIP)
+	// The gateway election controller edits spec.allowedIPs too, and this patch
+	// replaces the list whole, so it is optimistically locked and recomputed on
+	// conflict rather than dropping the controller's change.
+	var assigned string
+	first := true
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if !first {
+			if err := a.client.Get(ctx, client.ObjectKey{Name: name}, existing); err != nil {
+				return err
+			}
+		}
+		first = false
+		patch := client.MergeFromWithOptions(existing.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		existing.Spec.PublicKey = pubKey
+		if endpoint != "" {
+			existing.Spec.Endpoint = endpoint
+		}
+		// Backfill ownerReference for CRs created before this fix existed, so K8s
+		// GC cascade-deletes them the moment the underlying Node is removed.
+		if !hasNodeOwnerReference(existing.OwnerReferences, node) {
+			existing.OwnerReferences = append(existing.OwnerReferences, nodeOwnerReferences(node)...)
+		}
+		claimed, err := a.allocateMeshIP(ctx, mesh, name, existing.Status.MeshIP)
+		if err != nil {
+			return err
+		}
+		assigned = applyMeshIP(a.log, mesh, name, claimed, &existing.Spec)
+		applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
+		existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
+		return a.client.Patch(ctx, existing, patch)
+	})
 	if err != nil {
-		return err
-	}
-	assigned := applyMeshIP(a.log, mesh, name, claimed, &existing.Spec)
-	applyNodeInternalIP(a.log, mesh, node, &existing.Spec)
-	existing.Spec.PersistentKeepalive = migrateDefaultKeepalive(existing.Spec.PersistentKeepalive)
-	if patchErr := a.client.Patch(ctx, existing, patch); patchErr != nil {
-		return fmt.Errorf("patching own WireKubePeer: %w", patchErr)
+		return fmt.Errorf("patching own WireKubePeer: %w", err)
 	}
 	if err := a.recordMeshIP(ctx, mesh, name, assigned); err != nil {
 		return err
@@ -1093,7 +1113,26 @@ func (a *Agent) sync(ctx context.Context) error {
 	// external peer.
 	// KeepaliveSeconds is 0 because the external peer initiates keepalives;
 	// the ingress peer only responds.
+	var (
+		sharedIngress      *wireguard.KeyPair
+		sharedIngressB64   string
+		sharedIngressPeers []wireguard.ExternalPeerConfig
+	)
 	if externalList != nil {
+		if kp, err := a.sharedExternalIngressKey(ctx); err != nil {
+			// Keep serving under the identity last read: tearing the device
+			// down would drop every session on it over one failed read.
+			a.log.Error(err, "reading the shared external ingress identity; keeping the one last read")
+			kp = a.lastSharedIngress
+			if kp != nil {
+				sharedIngress, sharedIngressB64 = kp, kp.PublicKeyBase64()
+			}
+		} else {
+			a.lastSharedIngress = kp
+			if kp != nil {
+				sharedIngress, sharedIngressB64 = kp, kp.PublicKeyBase64()
+			}
+		}
 		for i := range externalList.Items {
 			ep := &externalList.Items[i]
 			if ep.Status.IngressPeerName != myPeerName {
@@ -1105,6 +1144,18 @@ func (a *Agent) sync(ctx context.Context) error {
 			if ep.Status.PublicKey == "" || ep.Status.AssignedMeshIP == "" {
 				continue
 			}
+			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
+			routeOwners[ep.Status.AssignedMeshIP] = ep.Status.PublicKey
+			allowRoutesBeforeHandshake[ep.Status.PublicKey] = true
+			// A shared-identity peer goes on the device holding that identity,
+			// not the mesh device, so that any node can serve it.
+			if sharedIngress != nil && ep.ServerPublicKey() == sharedIngressB64 {
+				sharedIngressPeers = append(sharedIngressPeers, wireguard.ExternalPeerConfig{
+					PublicKeyB64: ep.Status.PublicKey,
+					AllowedIP:    ep.Status.AssignedMeshIP,
+				})
+				continue
+			}
 			wgPeers = append(wgPeers, wireguard.PeerConfig{
 				PublicKeyB64:     ep.Status.PublicKey,
 				Endpoint:         "",
@@ -1112,9 +1163,6 @@ func (a *Agent) sync(ctx context.Context) error {
 				KeepaliveSeconds: 0,
 				ForceEndpoint:    false,
 			})
-			allRoutes = append(allRoutes, ep.Status.AssignedMeshIP)
-			routeOwners[ep.Status.AssignedMeshIP] = ep.Status.PublicKey
-			allowRoutesBeforeHandshake[ep.Status.PublicKey] = true
 		}
 	}
 
@@ -1130,6 +1178,15 @@ func (a *Agent) sync(ctx context.Context) error {
 
 	if err := a.wgMgr.SyncPeers(wgPeers); err != nil {
 		return fmt.Errorf("syncing WireGuard peers: %w", err)
+	}
+	if ext, ok := a.wgMgr.(externalIngressEngine); ok && externalList != nil {
+		var key *[32]byte
+		if sharedIngress != nil {
+			key = &sharedIngress.Private
+		}
+		if err := ext.SyncExternalIngress(key, sharedIngressPeers); err != nil {
+			a.log.Error(err, "syncing shared external ingress peers")
+		}
 	}
 
 	// Poke all peers after SyncPeers has applied PathModeRelay in the bind.
@@ -1638,6 +1695,9 @@ func (a *Agent) updateOwnStatus(
 	// tell "this peer's agent is alive but idle" from "nobody is home".
 	reportedAt := metav1.NewTime(time.Now())
 	peer.Status.LastReportedAt = &reportedAt
+	_, peer.Status.SharedExternalIngress = a.wgMgr.(externalIngressEngine)
+	peer.Status.GatewayProbes = a.gwProbes.results()
+	peer.Status.GatewayElection = true
 	// Publish this node's own link addresses so observers on the same segment
 	// can complete the adjacency check. The claim carries weight because this
 	// peer's status has exactly one writer: its own agent. A node in another
@@ -3004,4 +3064,29 @@ func (a *Agent) annotateOwnPod(ctx context.Context, internalIP string) {
 	if err := a.client.Patch(ctx, pod, patch); err != nil {
 		a.log.Error(err, "annotating own pod with node internal IP")
 	}
+}
+
+// externalIngressEngine is implemented by engines that can serve external
+// peers under the shared external ingress identity.
+type externalIngressEngine interface {
+	SyncExternalIngress(key *[32]byte, peers []wireguard.ExternalPeerConfig) error
+}
+
+// sharedExternalIngressKey reads the shared external ingress identity the
+// controller keeps in this agent's namespace. It returns nil, nil while the
+// controller has not created it yet.
+func (a *Agent) sharedExternalIngressKey(ctx context.Context) (*wireguard.KeyPair, error) {
+	ns := a.podNamespace
+	if ns == "" {
+		ns = "wirekube-system"
+	}
+	secret := &corev1.Secret{}
+	err := a.client.Get(ctx, client.ObjectKey{Namespace: ns, Name: wirekubev1alpha1.ExternalIngressSecretName}, secret)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return wireguard.ParseKeyPair(string(secret.Data[wirekubev1alpha1.ExternalIngressSecretKey]))
 }

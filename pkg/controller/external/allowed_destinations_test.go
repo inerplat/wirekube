@@ -571,7 +571,9 @@ func TestAllowedDestinations_DegradedReadRequeues(t *testing.T) {
 // TestAllowedDestinations_HealthyReadDoesNotRequeue keeps the retry scoped to
 // actual failures rather than becoming an unconditional poll.
 func TestAllowedDestinations_HealthyReadDoesNotRequeue(t *testing.T) {
-	cr := newExternalPeer(testExternalName)
+	// A roaming peer is polled for ingress health regardless, so this uses
+	// one pinned under its node's key.
+	cr := newExternalPeer(testExternalName, issuedUnderNodeKey(testIngressPeer, ingressPubKey()))
 	c := newFakeClient(t, cr, newReadyMesh(), newIngressPeer(), newNode("node-a", "10.244.1.0/24"))
 	r := &Reconciler{
 		Client: c, Scheme: testScheme(t), Relay: newMockRelay(testRelayHost),

@@ -127,6 +127,7 @@ const (
 	wgMessageInitiation byte = 1
 	wgMessageResponse   byte = 2
 	wgMessageCookie     byte = 3
+	wgMessageTransport  byte = 4
 
 	// Fixed sizes of the three handshake messages, from wireguard-go's
 	// device/noise-protocol.go (MessageInitiationSize, MessageResponseSize,
@@ -135,6 +136,9 @@ const (
 	wgInitiationLen  = 148
 	wgResponseLen    = 92
 	wgCookieReplyLen = 64
+	// wgTransportMinLen is a transport message header plus the
+	// authentication tag of an empty (keepalive) payload.
+	wgTransportMinLen = 32
 )
 
 // classify is the single point that decides a frame's queue. writeFrame calls
@@ -471,7 +475,17 @@ func (c *clientConn) drainQueues() {
 
 func (s *Server) dropPeer(c *clientConn) {
 	c.close()
-	s.unregister(c)
+	if s.unregister(c) {
+		s.forgetExternalIngress(c.pubKey)
+	}
+}
+
+// forgetExternalIngress unpins external flows from an agent that left. It
+// runs outside s.mu: the listener takes its own lock.
+func (s *Server) forgetExternalIngress(key [PubKeySize]byte) {
+	if s.externalWG != nil {
+		s.externalWG.ForgetIngress(key)
+	}
 }
 
 // register makes cc the connection for its key and returns the connection it
@@ -533,7 +547,7 @@ func (s *Server) EnableCluster(c *Cluster) {
 		// This replica issued the token, so it owns the UDP flow. Pin the
 		// flow to the agent that answered — later packets skip the fanout
 		// and travel a single cluster hop straight to it.
-		s.externalWG.BindTokenIngress(token, ingress)
+		s.externalWG.BindTokenIngress(token, ingress, payload)
 		if err := s.externalWG.SendToExternal(token, payload); err != nil {
 			s.destMissLog.Logf("relay cluster: external reply token=%d: %v", token, err)
 		}
@@ -745,6 +759,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		// the queues until the next write error.
 		cc.close()
 		stillOwner := s.unregister(cc)
+		if stillOwner {
+			s.forgetExternalIngress(pubKey)
+		}
 		// Withdraw only when this connection was still the registered one:
 		// if a reconnect already replaced it, the peer is still local and
 		// the registry entry must survive.
@@ -840,7 +857,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 				continue
 			}
-			s.externalWG.BindTokenIngress(token, pubKey)
+			s.externalWG.BindTokenIngress(token, pubKey, payload)
 			if err := s.externalWG.SendToExternal(token, payload); err != nil {
 				log.Printf("relay: external data response from %x token=%d failed: %v", pubKey[:8], token, err)
 			} else if relayDebug {

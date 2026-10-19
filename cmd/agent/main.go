@@ -30,6 +30,7 @@ import (
 	agentpkg "github.com/inerplat/wirekube/pkg/agent"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	externalctrl "github.com/inerplat/wirekube/pkg/controller/external"
+	gatewayctrl "github.com/inerplat/wirekube/pkg/controller/gateway"
 	meshallocctrl "github.com/inerplat/wirekube/pkg/controller/meshalloc"
 	relayendpointctrl "github.com/inerplat/wirekube/pkg/controller/relayendpoint"
 	"github.com/inerplat/wirekube/pkg/ipsec"
@@ -335,6 +336,13 @@ func startExternalPeerReconciler(ctx context.Context, log logr.Logger, restConfi
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup external-peer reconciler: %w", err)
+	}
+
+	// Gateway election rides the same leader election: one agent decides
+	// every gateway's active peer and which peer advertises its routes.
+	gatewayElection := &gatewayctrl.Reconciler{Client: mgr.GetClient()}
+	if err := gatewayElection.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup gateway election: %w", err)
 	}
 
 	// The relay-endpoint reconciler shares this manager's leader election

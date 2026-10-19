@@ -114,6 +114,26 @@ type WireKubePeerStatus struct {
 	// +optional
 	LastReportedAt *metav1.Time `json:"lastReportedAt,omitempty"`
 
+	// SharedExternalIngress reports that this agent can serve peers under the shared
+	// external ingress identity. Only such agents are given those peers, so a rolling
+	// upgrade cannot hand them to one that cannot answer their handshakes.
+	// +optional
+	SharedExternalIngress bool `json:"sharedExternalIngress,omitempty"`
+
+	// GatewayElection reports that this agent follows the gateway election
+	// controller. The controller owns a gateway only while every live peer in its
+	// peerRefs reports this, so it never decides alongside an agent that elects.
+	// +optional
+	GatewayElection bool `json:"gatewayElection,omitempty"`
+
+	// GatewayProbes reports this node's spec.healthCheck results for each
+	// WireKubeGateway it is a peerRef of, so the controller can move a
+	// gateway off a node that can no longer reach the target network.
+	// +optional
+	// +listType=map
+	// +listMapKey=gateway
+	GatewayProbes []GatewayProbeStatus `json:"gatewayProbes,omitempty"`
+
 	// BytesReceived is the number of bytes received from this peer.
 	BytesReceived int64 `json:"bytesReceived,omitempty"`
 
@@ -209,4 +229,25 @@ type WireKubePeerList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []WireKubePeer `json:"items"`
+}
+
+// GatewayProbeStatus is one node's health-check result for one gateway.
+type GatewayProbeStatus struct {
+	// Gateway is the WireKubeGateway name.
+	Gateway string `json:"gateway"`
+
+	// Healthy is false once spec.healthCheck.failureThreshold consecutive
+	// probes have failed, and true again after one succeeds.
+	Healthy bool `json:"healthy"`
+
+	// ConsecutiveFailures counts failed probes since the last success.
+	// +optional
+	ConsecutiveFailures int32 `json:"consecutiveFailures,omitempty"`
+
+	// CheckedAt is when the last probe finished.
+	CheckedAt metav1.Time `json:"checkedAt"`
+
+	// Message describes the last failure.
+	// +optional
+	Message string `json:"message,omitempty"`
 }

@@ -184,6 +184,50 @@ spec:
                   EndpointDiscoveryMethod records how the endpoint was discovered.
                   One of: manual, annotation, stun, aws-metadata, internal-ip
                 type: string
+              gatewayElection:
+                description: |-
+                  GatewayElection reports that this agent follows the gateway election
+                  controller. The controller owns a gateway only while every live peer in its
+                  peerRefs reports this, so it never decides alongside an agent that elects.
+                type: boolean
+              gatewayProbes:
+                description: |-
+                  GatewayProbes reports this node's spec.healthCheck results for each
+                  WireKubeGateway it is a peerRef of, so the controller can move a
+                  gateway off a node that can no longer reach the target network.
+                items:
+                  description: GatewayProbeStatus is one node's health-check result
+                    for one gateway.
+                  properties:
+                    checkedAt:
+                      description: CheckedAt is when the last probe finished.
+                      format: date-time
+                      type: string
+                    consecutiveFailures:
+                      description: ConsecutiveFailures counts failed probes since
+                        the last success.
+                      format: int32
+                      type: integer
+                    gateway:
+                      description: Gateway is the WireKubeGateway name.
+                      type: string
+                    healthy:
+                      description: |-
+                        Healthy is false once spec.healthCheck.failureThreshold consecutive
+                        probes have failed, and true again after one succeeds.
+                      type: boolean
+                    message:
+                      description: Message describes the last failure.
+                      type: string
+                  required:
+                  - checkedAt
+                  - gateway
+                  - healthy
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - gateway
+                x-kubernetes-list-type: map
               iceCandidates:
                 description: |-
                   ICECandidates lists connectivity candidates gathered by this peer's agent.
@@ -323,6 +367,12 @@ spec:
                   Only set when TransportMode is "relay".
                 format: int32
                 type: integer
+              sharedExternalIngress:
+                description: |-
+                  SharedExternalIngress reports that this agent can serve peers under the shared
+                  external ingress identity. Only such agents are given those peers, so a rolling
+                  upgrade cannot hand them to one that cannot answer their handshakes.
+                type: boolean
             type: object
         type: object
     served: true

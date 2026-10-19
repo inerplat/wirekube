@@ -17,6 +17,10 @@ type Options struct {
 	Context    string
 	Namespace  string
 	Timeout    time.Duration
+	// Overrides carries the kubectl-style connection flags (--cluster,
+	// --user, --server, --token, --as, ...). Context and Namespace above
+	// take precedence over the matching fields in it.
+	Overrides *clientcmd.ConfigOverrides
 }
 
 type Factory struct {
@@ -85,7 +89,13 @@ func (f *Factory) clientConfig() clientcmd.ClientConfig {
 	if f.options.Kubeconfig != "" {
 		loadingRules.ExplicitPath = f.options.Kubeconfig
 	}
-	overrides := &clientcmd.ConfigOverrides{CurrentContext: f.options.Context}
+	overrides := &clientcmd.ConfigOverrides{}
+	if f.options.Overrides != nil {
+		*overrides = *f.options.Overrides
+	}
+	if f.options.Context != "" {
+		overrides.CurrentContext = f.options.Context
+	}
 	if f.options.Namespace != "" {
 		overrides.Context.Namespace = f.options.Namespace
 	}

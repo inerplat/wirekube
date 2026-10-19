@@ -45,6 +45,8 @@ func Render(options Options) (*Bundle, error) {
 		agentServiceAccount(options, labels),
 		agentClusterRole(options, labels),
 		agentClusterRoleBinding(options, labels),
+		agentExternalIngressRole(options, labels),
+		agentExternalIngressRoleBinding(options, labels),
 		meshObject(options),
 	}
 	if options.Relay == RelayLoadBalancer || options.Relay == RelayNodePort {
@@ -316,6 +318,29 @@ func charonDaemonSet(options Options, labels map[string]string) *appsv1.DaemonSe
 				},
 			},
 		},
+	}
+}
+
+// agentExternalIngressRole lets the agent read the shared external ingress
+// identity, and lets the external-peer controller (which runs in the agent)
+// create it on first use. Create cannot be narrowed to one name.
+func agentExternalIngressRole(options Options, labels map[string]string) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "Role"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent-external-ingress", Namespace: options.Namespace, Labels: labels},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{wirekubev1alpha1.ExternalIngressSecretName}, Verbs: []string{"get"}},
+			{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create"}},
+		},
+	}
+}
+
+func agentExternalIngressRoleBinding(options Options, labels map[string]string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		TypeMeta:   typeMeta(rbacv1.SchemeGroupVersion.String(), "RoleBinding"),
+		ObjectMeta: metav1.ObjectMeta{Name: "wirekube-agent-external-ingress", Namespace: options.Namespace, Labels: labels},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "wirekube-agent-external-ingress"},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: "wirekube-agent", Namespace: options.Namespace}},
 	}
 }
 

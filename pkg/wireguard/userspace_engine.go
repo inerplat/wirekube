@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,6 +41,13 @@ type UserspaceEngine struct {
 	tunDev tun.Device
 	bind   *WireKubeBind
 	wgDev  *device.Device
+
+	// split is the mesh device's view of tunDev, through which the external
+	// ingress device takes the packets for shared-identity external peers.
+	split *splitTUN
+	// ext serves those peers; nil while this node serves none. It is read
+	// from the relay delivery goroutine, hence atomic.
+	ext atomic.Pointer[ExternalIngress]
 
 	preferredSrc net.IP
 	linkIndex    int
@@ -141,7 +149,8 @@ func (u *UserspaceEngine) EnsureInterface() error {
 	// Create wireguard-go device on the TUN (link stays down until Configure).
 	u.bind = NewWireKubeBind()
 	u.bind.SetHeartbeatConfig(u.keyPair, u.mtu)
-	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
+	u.split = newSplitTUN(u.tunDev)
+	u.wgDev = device.NewDevice(u.split, u.bind, u.log)
 
 	return nil
 }
@@ -187,7 +196,8 @@ func (u *UserspaceEngine) attachExistingTUN() error {
 
 	u.bind = NewWireKubeBind()
 	u.bind.SetHeartbeatConfig(u.keyPair, u.mtu)
-	u.wgDev = device.NewDevice(u.tunDev, u.bind, u.log)
+	u.split = newSplitTUN(u.tunDev)
+	u.wgDev = device.NewDevice(u.split, u.bind, u.log)
 	return nil
 }
 
@@ -294,6 +304,10 @@ func (u *UserspaceEngine) Close() error {
 }
 
 func (u *UserspaceEngine) closeDev() {
+	if ext := u.ext.Swap(nil); ext != nil {
+		ext.Close()
+	}
+	u.split = nil
 	if u.wgDev != nil {
 		u.wgDev.Close()
 		u.wgDev = nil
@@ -646,12 +660,51 @@ func (u *UserspaceEngine) PeerPathStats(pubKey string) (PathStats, bool) {
 	return u.bind.PeerPathStats(pubKey)
 }
 
-// DeliverRelayPacket pushes a relay-received packet into the bind's relay
-// channel so wireguard-go processes it as an incoming WireGuard packet.
+// DeliverRelayPacket hands a relay-received packet to wireguard-go. An external
+// packet goes to both devices, since the relay cannot tell which identity it is
+// for; each drops what it holds no key or session for.
 func (u *UserspaceEngine) DeliverRelayPacket(pkt RelayPacket) {
+	if pkt.ExternalSource.Valid {
+		if ext := u.ext.Load(); ext != nil {
+			ext.Deliver(pkt)
+		}
+	}
 	if u.bind != nil {
 		u.bind.DeliverRelayPacket(pkt)
 	}
+}
+
+// SyncExternalIngress serves peers under the shared identity key. A nil key or no
+// peers takes the device down; a changed key recreates it, dropping its sessions.
+func (u *UserspaceEngine) SyncExternalIngress(key *[32]byte, peers []ExternalPeerConfig) error {
+	if u.split == nil {
+		return fmt.Errorf("wireguard-go device not initialized")
+	}
+	ext := u.ext.Load()
+	if key == nil || len(peers) == 0 || (ext != nil && ext.key != *key) {
+		if ext != nil {
+			u.ext.Store(nil)
+			ext.Close()
+		}
+		ext = nil
+		if key == nil || len(peers) == 0 {
+			return nil
+		}
+	}
+	if ext == nil {
+		created, err := newExternalIngress(u.split, func() RelayTransport {
+			if u.bind == nil {
+				return nil
+			}
+			return u.bind.RelayTransport()
+		}, *key)
+		if err != nil {
+			return err
+		}
+		ext = created
+		u.ext.Store(ext)
+	}
+	return ext.SyncPeers(peers)
 }
 
 // MarkBimodalHint arms the bind's dual-send window for a peer identified by

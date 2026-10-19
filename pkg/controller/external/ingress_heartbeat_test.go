@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/failover"
 )
 
 func reportedAt(peer *wirekubev1alpha1.WireKubePeer, t time.Time) *wirekubev1alpha1.WireKubePeer {
@@ -108,13 +109,13 @@ func TestFreshlyReportedPeers(t *testing.T) {
 		},
 	}
 
-	live := freshlyReportedPeers(list, now)
+	live := failover.Live(list.Items, now, ingressHeartbeatThreshold, "")
 
-	if !live["fresh"] {
+	if !live("fresh") {
 		t.Error("fresh peer missing from live set")
 	}
 	for _, name := range []string{"edge", "stale", "silent"} {
-		if live[name] {
+		if live(name) {
 			t.Errorf("%q counted as live", name)
 		}
 	}

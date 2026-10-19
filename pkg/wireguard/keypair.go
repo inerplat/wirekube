@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -95,6 +96,19 @@ func GenerateKeyPair() (*KeyPair, error) {
 	kp.Private[0] &= 248
 	kp.Private[31] &= 127
 	kp.Private[31] |= 64
+	curve25519.ScalarBaseMult(&kp.Public, &kp.Private)
+	return kp, nil
+}
+
+// ParseKeyPair rebuilds a key pair from a base64 private key, as stored in
+// the shared external ingress Secret.
+func ParseKeyPair(privateKeyB64 string) (*KeyPair, error) {
+	priv, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privateKeyB64))
+	if err != nil || len(priv) != 32 {
+		return nil, fmt.Errorf("not a base64 WireGuard private key")
+	}
+	kp := &KeyPair{}
+	copy(kp.Private[:], priv)
 	curve25519.ScalarBaseMult(&kp.Public, &kp.Private)
 	return kp, nil
 }

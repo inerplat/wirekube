@@ -95,9 +95,52 @@ func TestRenderWithoutIPsecHasNoCharon(t *testing.T) {
 			t.Errorf("IPsec enabled without --ipsec")
 		}
 	}
-	if len(r.roles)+len(r.bindings) != 0 {
-		t.Errorf("Secret access granted without --ipsec")
+	if len(ipsecOnly(r.roles))+len(ipsecOnlyBindings(r.bindings)) != 0 {
+		t.Errorf("IPsec Secret access granted without --ipsec")
 	}
+}
+
+// TestRenderScopesExternalIngressSecretAccess pins the agent's standing
+// Secret access to reading the one shared external ingress identity, plus
+// the create the controller needs to mint it.
+func TestRenderScopesExternalIngressSecretAccess(t *testing.T) {
+	r := renderAgent(t, Options{Image: "inerplat/wirekube:v1", Relay: RelayNone, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1"})
+	var role *rbacv1.Role
+	for _, candidate := range r.roles {
+		if candidate.Name == "wirekube-agent-external-ingress" {
+			role = candidate
+		}
+	}
+	if role == nil || role.Namespace != "wirekube-system" || len(role.Rules) != 2 {
+		t.Fatalf("external ingress role = %+v", role)
+	}
+	get, create := role.Rules[0], role.Rules[1]
+	if len(get.Verbs) != 1 || get.Verbs[0] != "get" || len(get.ResourceNames) != 1 || get.ResourceNames[0] != "wirekube-external-ingress" {
+		t.Errorf("read rule = %+v", get)
+	}
+	if len(create.Verbs) != 1 || create.Verbs[0] != "create" {
+		t.Errorf("create rule = %+v", create)
+	}
+}
+
+func ipsecOnly(roles []*rbacv1.Role) []*rbacv1.Role {
+	var out []*rbacv1.Role
+	for _, r := range roles {
+		if r.Name == "wirekube-agent-ipsec" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func ipsecOnlyBindings(bindings []*rbacv1.RoleBinding) []*rbacv1.RoleBinding {
+	var out []*rbacv1.RoleBinding
+	for _, b := range bindings {
+		if b.Name == "wirekube-agent-ipsec" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 func TestRenderWithIPsecAddsCharonAndScopedSecretAccess(t *testing.T) {
@@ -136,12 +179,13 @@ func TestRenderWithIPsecAddsCharonAndScopedSecretAccess(t *testing.T) {
 	if !hostDir(agent) || !hostDir(charon) {
 		t.Errorf("vici socket directory not shared on the host by agent and charon")
 	}
-	if len(r.roles) != 1 || r.roles[0].Namespace != "wirekube-system" || len(r.roles[0].Rules) != 1 ||
-		r.roles[0].Rules[0].Resources[0] != "secrets" || len(r.roles[0].Rules[0].Verbs) != 1 || r.roles[0].Rules[0].Verbs[0] != "get" {
-		t.Errorf("roles = %+v", r.roles)
+	roles, bindings := ipsecOnly(r.roles), ipsecOnlyBindings(r.bindings)
+	if len(roles) != 1 || roles[0].Namespace != "wirekube-system" || len(roles[0].Rules) != 1 ||
+		roles[0].Rules[0].Resources[0] != "secrets" || len(roles[0].Rules[0].Verbs) != 1 || roles[0].Rules[0].Verbs[0] != "get" {
+		t.Errorf("roles = %+v", roles)
 	}
-	if len(r.bindings) != 1 || r.bindings[0].Subjects[0].Name != "wirekube-agent" {
-		t.Errorf("bindings = %+v", r.bindings)
+	if len(bindings) != 1 || bindings[0].Subjects[0].Name != "wirekube-agent" {
+		t.Errorf("bindings = %+v", bindings)
 	}
 
 	o.CharonImage = "registry.example.test/charon:custom"

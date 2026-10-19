@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -20,11 +21,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	internalinstall "github.com/inerplat/wirekube/internal/install"
-	internalconfig "github.com/inerplat/wirekube/internal/kubeconfig"
 	internalversion "github.com/inerplat/wirekube/internal/version"
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	"github.com/inerplat/wirekube/pkg/externalpeer"
@@ -37,9 +38,12 @@ type globalOptions struct {
 	kubeconfig string
 	context    string
 	namespace  string
-	timeout    time.Duration
-	output     string
-	client     func() (client.Client, error)
+	// overrides holds the remaining kubectl connection flags (--cluster,
+	// --user, --server, --token, --as, ...).
+	overrides clientcmd.ConfigOverrides
+	timeout   time.Duration
+	output    string
+	client    func() (client.Client, error)
 }
 
 var options = &globalOptions{}
@@ -52,6 +56,10 @@ func init() {
 
 func main() {
 	root := newRootCommand()
+	// Installed as kubectl-wirekube, the binary runs as "kubectl wirekube".
+	if strings.HasPrefix(filepath.Base(os.Args[0]), "kubectl-") {
+		root.Annotations = map[string]string{cobra.CommandDisplayNameAnnotation: "kubectl wirekube"}
+	}
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
 	if err := root.ExecuteContext(context.Background()); err != nil {
@@ -87,7 +95,8 @@ func newRootCommand() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&options.kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
 	root.PersistentFlags().StringVar(&options.context, "context", "", "kubeconfig context to use")
-	root.PersistentFlags().StringVar(&options.namespace, "namespace", "wirekube-system", "namespace for WireKube workloads")
+	root.PersistentFlags().StringVarP(&options.namespace, "namespace", "n", "wirekube-system", "namespace for WireKube workloads; for connect, the namespace whose Services resolve by short name")
+	bindKubectlFlags(root)
 	// The agent DaemonSet paces rolling updates with minReadySeconds (90s per
 	// node, maxUnavailable 1), so an upgrade's readiness wait scales with the
 	// node count; 5 minutes covered fewer than four nodes.
@@ -111,21 +120,28 @@ func newRootCommand() *cobra.Command {
 		inviteCmd(),
 		revokeCmd(),
 		ipsecCmd(),
+		connectCmd(),
 	)
 	return root
+}
+
+// bindKubectlFlags gives the CLI, and so the kubectl plugin, kubectl's connection
+// flags. --kubeconfig, --context and --namespace are registered separately, and
+// --timeout stands in for --request-timeout.
+func bindKubectlFlags(root *cobra.Command) {
+	names := clientcmd.RecommendedConfigOverrideFlags("")
+	names.CurrentContext = clientcmd.FlagInfo{}
+	names.Timeout = clientcmd.FlagInfo{}
+	names.ContextOverrideFlags.Namespace = clientcmd.FlagInfo{}
+	names.ClusterOverrideFlags.APIServer.ShortName = "s"
+	clientcmd.BindOverrideFlags(&options.overrides, root.PersistentFlags(), names)
 }
 
 func k8sClient() (client.Client, error) {
 	if options.client != nil {
 		return options.client()
 	}
-	factory := internalconfig.New(internalconfig.Options{
-		Kubeconfig: options.kubeconfig,
-		Context:    options.context,
-		Namespace:  options.namespace,
-		Timeout:    options.timeout,
-	}, scheme)
-	return factory.Client()
+	return kubeFactory().Client()
 }
 
 func versionCmd() *cobra.Command {

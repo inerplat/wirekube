@@ -27,16 +27,16 @@ type gatewayState struct {
 	ipForwardEnabled bool
 }
 
-// setupGateway checks if this node should act as a gateway and configures
-// IP forwarding, SNAT/masquerade, and route injection.
-// The agent performs gateway activation directly (no operator required):
-// the first peer in PeerRefs that exists and has a public key is elected active.
+// setupGateway configures IP forwarding and SNAT on this node for the gateways
+// it is the active peer of. For gateways the agents elect themselves, it also
+// advertises their routes in this node's own peer.
 func (a *Agent) setupGateway(ctx context.Context) error {
 	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
 	if err := a.client.List(ctx, gwList); err != nil {
 		a.log.Error(err, "gateway list error")
 		return nil
 	}
+	a.gwProbes.schedule(gwList.Items, a.nodeName, time.Now())
 	if len(gwList.Items) == 0 {
 		// Shutdown no longer removes SNAT rules, so a node that stops being a
 		// gateway while its agent is down would keep masquerading forever if
@@ -53,6 +53,12 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 	}
 
 	myPeerName := a.nodeName
+	// While any gateway is elected by the agents, this agent advertises the
+	// routes of the gateways it holds in its own peer.
+	selfInject := false
+	for i := range gwList.Items {
+		selfInject = selfInject || !gwList.Items[i].ElectedByController()
+	}
 	desiredSNATCIDRs := map[string]bool{}
 	allGatewayRouteCIDRs := map[string]bool{}
 	activeGateways := []string{}
@@ -80,9 +86,9 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 		}
 
 		activeGateways = append(activeGateways, gw.Name)
-
-		// Inject gateway routes into our own WireKubePeer AllowedIPs
-		a.injectGatewayRoutes(ctx, gw, myPeerName)
+		if selfInject {
+			a.injectGatewayRoutes(ctx, gw, myPeerName)
+		}
 
 		if gw.Spec.SNAT != nil && gw.Spec.SNAT.Enabled {
 			for _, route := range gw.Spec.Routes {
@@ -106,9 +112,11 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 	}
 
 	if len(activeGateways) == 0 {
-		// The loop above only runs on elected peers; a peer that lost the
-		// election must still withdraw what it advertised.
-		a.injectGatewayRoutes(ctx, nil, myPeerName)
+		if selfInject {
+			// A peer that lost the election must still withdraw what it
+			// advertised.
+			a.injectGatewayRoutes(ctx, nil, myPeerName)
+		}
 		a.cleanupGateway()
 		return nil
 	}
@@ -128,10 +136,20 @@ func (a *Agent) setupGateway(ctx context.Context) error {
 	return nil
 }
 
-// electActivePeer returns the first peer in PeerRefs whose WireKubePeer
+// electActivePeer returns gw's active peer: the controller's status.activePeer
+// for a gateway it owns (nobody until it has decided), and legacyElectActivePeer
+// otherwise, which agents that do not follow the controller also pick.
+func (a *Agent) electActivePeer(ctx context.Context, gw *wirekubev1alpha1.WireKubeGateway) (string, error) {
+	if gw.ElectedByController() {
+		return gw.Status.ActivePeer, nil
+	}
+	return a.legacyElectActivePeer(ctx, gw)
+}
+
+// legacyElectActivePeer returns the first peer in PeerRefs whose WireKubePeer
 // exists and has a public key. A lookup error other than NotFound is
 // returned, since skipping that peer could elect a second active node.
-func (a *Agent) electActivePeer(ctx context.Context, gw *wirekubev1alpha1.WireKubeGateway) (string, error) {
+func (a *Agent) legacyElectActivePeer(ctx context.Context, gw *wirekubev1alpha1.WireKubeGateway) (string, error) {
 	for _, peerName := range gw.Spec.PeerRefs {
 		peer := &wirekubev1alpha1.WireKubePeer{}
 		if err := a.client.Get(ctx, client.ObjectKey{Name: peerName}, peer); err != nil {
@@ -291,16 +309,27 @@ func (a *Agent) updateGatewayStatus(ctx context.Context, gw *wirekubev1alpha1.Wi
 			tunnels = append(tunnels, st)
 		}
 	}
-	if gw.Status.ActivePeer == activePeer && gw.Status.Ready == ready &&
+	// For a gateway the controller owns, ActivePeer is the controller's.
+	writeActive := !gw.ElectedByController()
+	if (!writeActive || gw.Status.ActivePeer == activePeer) && gw.Status.Ready == ready &&
 		gw.Status.RoutesInjected == int32(len(gw.Spec.Routes)) && tunnelStatusesEqual(gw.Status.IPsec, tunnels) {
 		return
 	}
 	patch := client.MergeFrom(gw.DeepCopy())
-	gw.Status.ActivePeer = activePeer
+	if writeActive {
+		// Locked to the version the election was made from, so it fails
+		// if the controller took the gateway over in the meantime.
+		patch = client.MergeFromWithOptions(gw.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		gw.Status.ActivePeer = activePeer
+	}
 	gw.Status.Ready = ready
 	gw.Status.RoutesInjected = int32(len(gw.Spec.Routes))
 	gw.Status.IPsec = tunnels
 	if err := a.client.Status().Patch(ctx, gw, patch); err != nil {
+		if apierrors.IsConflict(err) {
+			a.log.V(1).Info("gateway changed since it was read; status left to the next sync", "gateway", gw.Name)
+			return
+		}
 		a.log.Error(err, "updating gateway status")
 	}
 }
@@ -530,8 +559,6 @@ func (a *Agent) collectNonGatewayPeerIPs(ctx context.Context, peerList *wirekube
 	gwList := &wirekubev1alpha1.WireKubeGatewayList{}
 	if err := a.client.List(ctx, gwList); err == nil {
 		for i := range gwList.Items {
-			// Use electActivePeer (reads Spec.PeerRefs) rather than Status.ActivePeer
-			// so new gateways are recognised immediately, before their status is set.
 			ap, err := a.electActivePeer(ctx, &gwList.Items[i])
 			if err != nil {
 				// Keep the previous filter rather than build one from a

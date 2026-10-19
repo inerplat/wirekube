@@ -155,3 +155,42 @@ subjects:
 - kind: ServiceAccount
   name: wirekube-agent
   namespace: wirekube-system
+---
+# The shared external ingress identity: external peers issued under it are
+# served by whichever node is healthy. The agent reads it, and the embedded
+# external-peer controller creates it on first use (create cannot be narrowed
+# to one name).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: wirekube-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  resourceNames:
+  - wirekube-external-ingress
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: wirekube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-agent-external-ingress
+subjects:
+- kind: ServiceAccount
+  name: wirekube-agent
+  namespace: wirekube-system

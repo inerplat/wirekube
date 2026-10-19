@@ -227,7 +227,7 @@ func (a *Agent) planTunnels(ctx context.Context, gateways []wirekubev1alpha1.Wir
 			return nil, nil, err
 		}
 		if active == "" {
-			pending = append(pending, &pendingGateway{gw, "no peer in peerRefs has a WireKubePeer with a public key"})
+			pending = append(pending, &pendingGateway{gw, "no peer in peerRefs is elected; check status.peerHealth"})
 			continue
 		}
 		if active != a.nodeName {

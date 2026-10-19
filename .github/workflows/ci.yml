@@ -148,6 +148,46 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
+  # The connect dataplane and the shared external ingress device create real
+  # tunnel interfaces, routes and resolver settings, so their tests need root
+  # and skip under the plain unit-test run.
+  connect-dataplane:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run connect tests as root
+        run: |
+          go test -c -o connect.test ./pkg/connect/
+          sudo ./connect.test -test.v
+
+      # The shared external ingress device splices into a real TUN; this
+      # pings the kernel through it.
+      - name: Run external ingress kernel test as root
+        if: runner.os == 'Linux'
+        run: |
+          go test -c -o wireguard.test ./pkg/wireguard/
+          sudo ./wireguard.test -test.v -test.run 'TestExternalIngress'
+
+      # Gateway health checks send real ICMP (v4 and v6) from a raw socket.
+      - name: Run gateway probe tests as root
+        if: runner.os == 'Linux'
+        run: |
+          go test -c -o agent.test ./pkg/agent/
+          sudo ./agent.test -test.v -test.run 'TestProbeTarget'
+
   build:
     needs: test
     runs-on: ubuntu-latest
@@ -166,6 +206,8 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay/
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/relay-ws/
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/wirekubectl/
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/wirekubectl/
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/wirekubectl/
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/agent/
 
       - name: Build Docker image

@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -14,6 +16,29 @@ const (
 	// lower than the in-cluster WireKube MTU because external VM-to-VM traffic
 	// traverses both the raw-WireGuard relay leg and an in-cluster mesh hop.
 	DefaultExternalPeerMTU int32 = 1248
+)
+
+const (
+	// ExternalPeerHeartbeatAnnotation opts a peer into liveness tracking: its client
+	// rewrites it while running, and the controller deletes the peer once the value
+	// has not changed for ExternalPeerHeartbeatTimeout on the controller's clock.
+	ExternalPeerHeartbeatAnnotation = "wirekube.io/heartbeat"
+
+	// ExternalPeerHeartbeatTimeout is how long a heartbeat may go unchanged
+	// before the controller deletes the peer.
+	ExternalPeerHeartbeatTimeout = 5 * time.Minute
+
+	// ExternalIngressSecretName holds the shared external ingress identity, which
+	// lets any node serve a peer issued under it. The controller creates it; deleting
+	// it rotates the identity and cuts off those peers until they are re-issued.
+	ExternalIngressSecretName = "wirekube-external-ingress"
+	// ExternalIngressSecretKey is the data key holding the base64 private key.
+	ExternalIngressSecretKey = "privateKey"
+
+	// ExternalPeerIssuedIngressKeyAnnotation records the shared server key a peer
+	// was issued with, i.e. the key in its client config. It is kept in metadata so
+	// that a controller rewriting status.ingressPublicKey cannot lose it.
+	ExternalPeerIssuedIngressKeyAnnotation = "wirekube.io/issued-ingress-key"
 )
 
 const (
@@ -74,11 +99,9 @@ type WireKubeExternalPeerSpec struct {
 	// +kubebuilder:validation:Maximum=1420
 	MTU int32 `json:"mtu,omitempty"`
 
-	// IngressPeer, when set, pins this external peer to a specific WireKubePeer
-	// by name. Useful when the operator wants the official WireGuard client to
-	// use a particular node as its server identity. When empty, the controller
-	// auto-selects the first ready WireKubePeer at allocation time and writes
-	// the choice into status.ingressPeerName.
+	// IngressPeer is the preferred ingress WireKubePeer. A shared-identity peer uses
+	// it while healthy and fails over otherwise; a peer issued under a node key stays
+	// on that node. When empty, the controller picks the best ready node.
 	// +optional
 	IngressPeer string `json:"ingressPeer,omitempty"`
 
@@ -118,18 +141,15 @@ type WireKubeExternalPeerStatus struct {
 	// +optional
 	PublicKey string `json:"publicKey,omitempty"`
 
-	// IngressPeerName is the WireKubePeer name this external peer is bound to
-	// as its official WireGuard server identity. Pinned at allocation time from
-	// spec.ingressPeer or auto-selected. Migration to a different ingress peer
-	// requires re-issuance.
+	// IngressPeerName is the WireKubePeer currently serving this peer. It follows
+	// node health under the shared identity; under a node key it is fixed until the
+	// peer is re-issued.
 	// +optional
 	IngressPeerName string `json:"ingressPeerName,omitempty"`
 
-	// IngressPublicKey is the WireGuard public key of the ingress peer. The
-	// rendered conf places this in the [Peer] PublicKey field so the
-	// external client can authenticate inbound traffic from the cluster.
-	// Populated at allocation time from the selected ingress peer's
-	// WireKubePeer.spec.publicKey; mirrors IngressPeerName.
+	// IngressPublicKey is the server public key the client config carries in
+	// its [Peer] PublicKey field: the shared external ingress identity, or for
+	// peers issued before it existed, the ingress node's own key.
 	// +optional
 	IngressPublicKey string `json:"ingressPublicKey,omitempty"`
 
@@ -192,6 +212,16 @@ type WireKubeExternalPeer struct {
 
 	Spec   WireKubeExternalPeerSpec   `json:"spec,omitempty"`
 	Status WireKubeExternalPeerStatus `json:"status,omitempty"`
+}
+
+// ServerPublicKey is the server key in this peer's client config: the issued-key
+// annotation if set, since status may hold a node key an older controller wrote,
+// else status. Empty means not issued yet.
+func (p *WireKubeExternalPeer) ServerPublicKey() string {
+	if key := p.Annotations[ExternalPeerIssuedIngressKeyAnnotation]; key != "" {
+		return key
+	}
+	return p.Status.IngressPublicKey
 }
 
 // +kubebuilder:object:root=true

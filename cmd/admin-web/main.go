@@ -640,7 +640,7 @@ func (s *server) currentPeerConfig(ctx context.Context, cr *wirekubev1alpha1.Wir
 		// written by something else; the stored text is all there is.
 		return stored, nil
 	}
-	if cr.Status.AssignedMeshIP == "" || cr.Status.IngressPublicKey == "" || cr.Status.RelayEndpoint == "" {
+	if cr.Status.AssignedMeshIP == "" || cr.ServerPublicKey() == "" || cr.Status.RelayEndpoint == "" {
 		// Allocation incomplete (peer back in Pending). A config rendered
 		// from half a status would be broken in new ways; keep the last
 		// known-good render until the allocation settles.
