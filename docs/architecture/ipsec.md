@@ -54,6 +54,9 @@ spec:
 | `dpd` | 30 s, `restart` | |
 | `forceEncapsulation` | off | a firewall passes UDP but not ESP |
 
+Traffic selectors must be IPv4: the plaintext guard covers IPv4 only, so a
+tunnel with an IPv6 selector reports `ConfigError`.
+
 Do not enable `snat` on the gateway: the remote side routes the local traffic
 selectors back through the tunnel, and SNAT would hide the mesh addresses.
 

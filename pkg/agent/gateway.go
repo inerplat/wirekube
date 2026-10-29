@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
+	"github.com/inerplat/wirekube/pkg/sitegw"
 )
 
 // gatewayState tracks gateway configuration applied to this node.
@@ -312,7 +313,7 @@ func (a *Agent) updateGatewayStatus(ctx context.Context, gw *wirekubev1alpha1.Wi
 	// For a gateway the controller owns, ActivePeer is the controller's.
 	writeActive := !gw.ElectedByController()
 	if (!writeActive || gw.Status.ActivePeer == activePeer) && gw.Status.Ready == ready &&
-		gw.Status.RoutesInjected == int32(len(gw.Spec.Routes)) && tunnelStatusesEqual(gw.Status.IPsec, tunnels) {
+		gw.Status.RoutesInjected == int32(len(gw.Spec.Routes)) && sitegw.StatusesEqual(gw.Status.IPsec, tunnels) {
 		return
 	}
 	patch := client.MergeFrom(gw.DeepCopy())

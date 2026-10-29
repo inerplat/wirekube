@@ -1,11 +1,16 @@
 package ipsec
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/strongswan/govici/vici"
 )
+
+// ErrRejected marks a request charon answered with a failure, as opposed to
+// one that did not reach it.
+var ErrRejected = errors.New("charon refused the request")
 
 // DefaultViciSocket is where charon listens unless strongswan.conf moves it.
 const DefaultViciSocket = "/var/run/charon.vici"
@@ -63,7 +68,10 @@ func (c *ViciCharon) command(cmd string, msg *vici.Message) error {
 		return err
 	}
 	defer s.Close()
-	if _, err := s.CommandRequest(cmd, msg); err != nil {
+	if resp, err := s.CommandRequest(cmd, msg); err != nil {
+		if resp != nil {
+			return fmt.Errorf("vici %s: %w: %w", cmd, ErrRejected, err)
+		}
 		return fmt.Errorf("vici %s: %w", cmd, err)
 	}
 	return nil

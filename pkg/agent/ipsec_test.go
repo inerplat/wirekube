@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -188,7 +188,8 @@ func ipsecFixture(t *testing.T, node string, mutate func(*wirekubev1alpha1.WireK
 	ch := &fakeCharon{conns: map[string]*ipsec.Tunnel{}, shared: map[string]bool{}}
 	dp := &fakeDataplane{ifaces: map[string]uint32{}}
 	a := &Agent{log: testr.New(t), client: c, nodeName: node, podNamespace: "wirekube-system"}
-	a.ipsec = &ipsecState{charon: ch, dataplane: dp, reported: map[[2]string]bool{}, keys: map[string][sha256.Size]byte{}}
+	a.ipsec = a.newIPsecState(ch, dp, nil)
+	a.ipsec.engine.SetActive(false)
 	return a, ch, dp, c
 }
 
@@ -289,7 +290,7 @@ func TestIPsecStandbyPeerDoesNothingAndDropsLeftovers(t *testing.T) {
 	a, ch, dp, c := ipsecFixture(t, "gw-b", nil)
 	ch.conns[testKey] = &ipsec.Tunnel{Name: testKey}
 	dp.ifaces[ipsec.InterfaceName(ipsec.DeriveInterfaceID(testKey))] = ipsec.DeriveInterfaceID(testKey)
-	a.ipsec.active = true
+	a.ipsec.engine.SetActive(true)
 
 	a.setupIPsec(context.Background())
 
@@ -441,7 +442,7 @@ func TestIPsecFailedConnectionLoadUnloadsItsKey(t *testing.T) {
 func TestIPsecRestartedStandbyCleansLeftoversOnFirstSync(t *testing.T) {
 	a, ch, dp, _ := ipsecFixture(t, "gw-b", nil)
 	a.EnableIPsec(ch, nil)
-	a.ipsec.dataplane = dp
+	a.ipsec.engine.Dataplane = dp
 	leftover := ipsec.InterfaceName(ipsec.DeriveInterfaceID(testKey))
 	dp.ifaces[leftover] = ipsec.DeriveInterfaceID(testKey)
 	dp.routes = map[string][]string{leftover: {"10.77.1.0/24"}}
@@ -496,23 +497,23 @@ func TestIPsecDisabledAgentRemovesLeftoversOnceAndKeepsTheGuard(t *testing.T) {
 func TestIPsecTeardownIsRetriedUntilCharonConfirms(t *testing.T) {
 	a, ch, _, _ := ipsecFixture(t, "gw-b", nil)
 	ch.conns[testKey] = &ipsec.Tunnel{Name: testKey}
-	a.ipsec.active = true
+	a.ipsec.engine.SetActive(true)
 
 	ch.listErr = errTest("vici: connection refused")
 	a.setupIPsec(context.Background())
-	if !a.ipsec.active {
+	if !a.ipsec.engine.Active() {
 		t.Fatalf("teardown abandoned while charon was unreachable")
 	}
 	ch.listErr = nil
 	ch.unloadErr = errTest("vici unload-conn: timeout")
 	a.setupIPsec(context.Background())
-	if !a.ipsec.active {
+	if !a.ipsec.engine.Active() {
 		t.Fatalf("teardown abandoned after a failed unload")
 	}
 	ch.unloadErr = nil
 	a.setupIPsec(context.Background())
-	if ch.conns[testKey] != nil || a.ipsec.active {
-		t.Fatalf("teardown not completed once charon recovered: conns=%v active=%v", ch.conns, a.ipsec.active)
+	if ch.conns[testKey] != nil || a.ipsec.engine.Active() {
+		t.Fatalf("teardown not completed once charon recovered: conns=%v active=%v", ch.conns, a.ipsec.engine.Active())
 	}
 }
 
@@ -727,17 +728,17 @@ func TestIPsecSettingChangeReplacesTheConnection(t *testing.T) {
 
 func TestIPsecConnectingTunnelExplainsTheFailure(t *testing.T) {
 	a, ch, _, c := ipsecFixture(t, "gw-a", nil)
-	a.ipsec.failures = &ipsec.FailureWatcher{}
+	a.ipsec.engine.Failures = &ipsec.FailureWatcher{}
 	a.setupIPsec(context.Background())
 	conn := ch.conns[testKey].ConnName()
 
 	ev := vici.NewMessage()
 	_ = ev.Set("ikesa-name", conn)
 	_ = ev.Set("msg", "received AUTHENTICATION_FAILED notify error")
-	a.ipsec.failures.Observe(ev, time.Now())
+	a.ipsec.engine.Failures.Observe(ev, time.Now())
 	a.setupIPsec(context.Background())
 	st := tunnelStatusOf(t, c, "vpn")
-	if st.Phase != wirekubev1alpha1.IPsecTunnelPhaseConnecting || !strings.Contains(st.Message, "pre-shared key") || !strings.Contains(st.Message, "AUTHENTICATION_FAILED") {
+	if st.Phase != wirekubev1alpha1.IPsecTunnelPhaseConnecting || !strings.Contains(st.Message, "pre-shared key") || st.Reason != wirekubev1alpha1.IPsecReasonAuthenticationFailed || strings.Contains(st.Message, "AUTHENTICATION_FAILED") {
 		t.Fatalf("status = %+v", st)
 	}
 
@@ -803,7 +804,7 @@ func TestIPsecRestartedAgentReloadsKeysButKeepsTheSAs(t *testing.T) {
 	delete(ch.shared, testKey)
 
 	// Simulate a new agent process: charon keeps the connection.
-	a.ipsec.keys = map[string][sha256.Size]byte{}
+	a.ipsec.engine.ForgetKeys()
 	a.setupIPsec(context.Background())
 	if ch.loads != 1 || len(ch.unloads) != 0 {
 		t.Errorf("restart renegotiated the tunnel: loads=%d unloads=%v", ch.loads, ch.unloads)
@@ -880,5 +881,37 @@ func TestIPsecReplacementWaitsForThePreviousConnectionToUnload(t *testing.T) {
 	a.setupIPsec(context.Background())
 	if tu := ch.conns[testKey]; tu == nil || tu.ConnName() == old || ch.loads != 2 {
 		t.Fatalf("replacement not loaded once the old connection unloaded: %+v loads=%d", tu, ch.loads)
+	}
+}
+
+func TestIPsecRetriesAgainstASilentPeerWriteNoStatus(t *testing.T) {
+	a, ch, _, c := ipsecFixture(t, "gw-a", nil)
+	a.ipsec.engine.Failures = &ipsec.FailureWatcher{}
+	a.setupIPsec(context.Background())
+	ev := vici.NewMessage()
+	_ = ev.Set("ikesa-name", ch.conns[testKey].ConnName())
+	_ = ev.Set("msg", "giving up after 5 retransmits")
+	a.ipsec.engine.Failures.Observe(ev, time.Now())
+	a.setupIPsec(context.Background())
+	before := getGateway(t, c).ResourceVersion
+	if st := tunnelStatusOf(t, c, "vpn"); st.Reason != wirekubev1alpha1.IPsecReasonPeerUnreachable {
+		t.Fatalf("reason = %q", st.Reason)
+	}
+
+	// charon keeps retrying: the IKE_SA comes and goes, and each attempt
+	// logs a new line.
+	for i, state := range []string{"CONNECTING", "", "CONNECTING", ""} {
+		ch.sa = ipsec.SAState{IKEState: state}
+		ev := vici.NewMessage()
+		_ = ev.Set("ikesa-name", ch.conns[testKey].ConnName())
+		_ = ev.Set("msg", fmt.Sprintf("giving up after 5 retransmits (attempt %d)", i))
+		a.ipsec.engine.Failures.Observe(ev, time.Now())
+		a.setupIPsec(context.Background())
+	}
+	if after := getGateway(t, c).ResourceVersion; after != before {
+		t.Fatalf("status was rewritten while nothing a user can act on changed (resourceVersion %s -> %s)", before, after)
+	}
+	if len(ch.initiated) == 0 {
+		t.Fatal("a connection without an IKE_SA was not initiated again")
 	}
 }

@@ -424,11 +424,16 @@ spec:
                       - Policy
                       type: string
                     ikeState:
-                      description: IKEState is the IKE_SA state reported by the IKE
-                        daemon.
+                      description: |-
+                        IKEState is the IKE_SA state reported by the IKE daemon when status
+                        was last written. A change of this field alone does not trigger a
+                        write, so it can lag.
                       type: string
                     installedChildSAs:
-                      description: InstalledChildSAs counts installed CHILD_SAs.
+                      description: |-
+                        InstalledChildSAs counts installed CHILD_SAs when status was last
+                        written; like IKEState it can lag. The wirekube_ipsec_tunnel_child_sas
+                        metric carries the live count.
                       format: int32
                       type: integer
                     interfaceID:
@@ -468,6 +473,12 @@ spec:
                       - Connecting
                       - Established
                       - Error
+                      - Unknown
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is a machine-readable cause when the tunnel is not
+                        Established, when known.
                       type: string
                     remoteTrafficSelectors:
                       items:

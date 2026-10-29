@@ -10,7 +10,20 @@ import (
 // every default applied except the pre-shared key. meshCIDR defaults the
 // local selectors and localID the local identity.
 func FromSpec(gw *wirekubev1alpha1.WireKubeGateway, s *wirekubev1alpha1.GatewayIPsecTunnel, meshCIDR, localID string) *Tunnel {
-	key := gw.Name + "/" + s.Name
+	var localTS, remoteTS []string
+	if meshCIDR != "" {
+		localTS = []string{meshCIDR}
+	}
+	for _, r := range gw.Spec.Routes {
+		remoteTS = append(remoteTS, r.CIDR)
+	}
+	return FromTunnelSpec(gw.Name, s, localTS, remoteTS, localID)
+}
+
+// FromTunnelSpec builds the defaulted tunnel of group/s.Name. localTS,
+// remoteTS and localID fill the spec's empty selectors and local identity.
+func FromTunnelSpec(group string, s *wirekubev1alpha1.GatewayIPsecTunnel, localTS, remoteTS []string, localID string) *Tunnel {
+	key := group + "/" + s.Name
 	t := &Tunnel{
 		Name:          key,
 		RemoteAddress: s.RemoteAddress,
@@ -32,13 +45,11 @@ func FromSpec(gw *wirekubev1alpha1.WireKubeGateway, s *wirekubev1alpha1.GatewayI
 	if t.LocalID == "" {
 		t.LocalID = localID
 	}
-	if len(t.LocalTS) == 0 && meshCIDR != "" {
-		t.LocalTS = []string{meshCIDR}
+	if len(t.LocalTS) == 0 {
+		t.LocalTS = append([]string(nil), localTS...)
 	}
 	if len(t.RemoteTS) == 0 {
-		for _, r := range gw.Spec.Routes {
-			t.RemoteTS = append(t.RemoteTS, r.CIDR)
-		}
+		t.RemoteTS = append([]string(nil), remoteTS...)
 	}
 	if t.IKEVersion == 0 {
 		t.IKEVersion = 2

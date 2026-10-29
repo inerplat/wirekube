@@ -26,7 +26,7 @@ const (
 )
 
 // IPsecTunnelPhase is the lifecycle phase of a gateway IPsec tunnel.
-// +kubebuilder:validation:Enum=Pending;Connecting;Established;Error
+// +kubebuilder:validation:Enum=Pending;Connecting;Established;Error;Unknown
 type IPsecTunnelPhase string
 
 const (
@@ -41,6 +41,36 @@ const (
 	// IPsecTunnelPhaseError means the active gateway peer could not apply the
 	// tunnel; status.message says why.
 	IPsecTunnelPhaseError IPsecTunnelPhase = "Error"
+	// IPsecTunnelPhaseUnknown means whoever terminates the tunnel stopped
+	// reporting, so the last phase it wrote can no longer be trusted.
+	IPsecTunnelPhaseUnknown IPsecTunnelPhase = "Unknown"
+)
+
+// IPsecTunnelReason is a machine-readable cause of a tunnel not being
+// Established. Consumers must treat values they do not know as unexplained.
+type IPsecTunnelReason string
+
+const (
+	// IPsecReasonConfigError: the tunnel cannot be applied as specified.
+	IPsecReasonConfigError IPsecTunnelReason = "ConfigError"
+	// IPsecReasonIKEDaemonUnavailable: charon cannot be reached.
+	IPsecReasonIKEDaemonUnavailable IPsecTunnelReason = "IKEDaemonUnavailable"
+	// IPsecReasonDataplaneError: the kernel refused an XFRM interface or route.
+	IPsecReasonDataplaneError IPsecTunnelReason = "DataplaneError"
+	// IPsecReasonGuardNotInstalled: the plaintext guard is missing.
+	IPsecReasonGuardNotInstalled IPsecTunnelReason = "GuardNotInstalled"
+	// IPsecReasonProposalMismatch: the two sides share no IKE or ESP proposal.
+	IPsecReasonProposalMismatch IPsecTunnelReason = "ProposalMismatch"
+	// IPsecReasonDHGroupMismatch: the DH groups differ.
+	IPsecReasonDHGroupMismatch IPsecTunnelReason = "DHGroupMismatch"
+	// IPsecReasonAuthenticationFailed: the pre-shared key or the IDs differ.
+	IPsecReasonAuthenticationFailed IPsecTunnelReason = "AuthenticationFailed"
+	// IPsecReasonTrafficSelectorMismatch: the networks on the two sides differ.
+	IPsecReasonTrafficSelectorMismatch IPsecTunnelReason = "TrafficSelectorMismatch"
+	// IPsecReasonPeerUnreachable: the remote gateway does not answer.
+	IPsecReasonPeerUnreachable IPsecTunnelReason = "PeerUnreachable"
+	// IPsecReasonNotReporting: the terminating peer stopped reporting.
+	IPsecReasonNotReporting IPsecTunnelReason = "NotReporting"
 )
 
 // GatewayIPsecTunnel is a site-to-site IPsec tunnel terminated by the
@@ -205,10 +235,14 @@ type GatewayIPsecTunnelStatus struct {
 	// InterfaceID is the XFRM interface ID in use.
 	// +optional
 	InterfaceID int64 `json:"interfaceID,omitempty"`
-	// IKEState is the IKE_SA state reported by the IKE daemon.
+	// IKEState is the IKE_SA state reported by the IKE daemon when status
+	// was last written. A change of this field alone does not trigger a
+	// write, so it can lag.
 	// +optional
 	IKEState string `json:"ikeState,omitempty"`
-	// InstalledChildSAs counts installed CHILD_SAs.
+	// InstalledChildSAs counts installed CHILD_SAs when status was last
+	// written; like IKEState it can lag. The wirekube_ipsec_tunnel_child_sas
+	// metric carries the live count.
 	// +optional
 	InstalledChildSAs int32 `json:"installedChildSAs,omitempty"`
 	// LocalTrafficSelectors and RemoteTrafficSelectors are the selectors the
@@ -220,6 +254,10 @@ type GatewayIPsecTunnelStatus struct {
 	// LocalID is the IKE identity in use after defaulting.
 	// +optional
 	LocalID string `json:"localID,omitempty"`
+	// Reason is a machine-readable cause when the tunnel is not
+	// Established, when known.
+	// +optional
+	Reason IPsecTunnelReason `json:"reason,omitempty"`
 	// Message explains why the tunnel is not Established, when known.
 	// +optional
 	Message string `json:"message,omitempty"`
