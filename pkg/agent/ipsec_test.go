@@ -465,7 +465,7 @@ func TestIPsecDisabledAgentRemovesLeftoversOnceAndKeepsTheGuard(t *testing.T) {
 	guardCalls := 0
 	origRemove, origGuard := removeTunnelState, syncDisabledGuard
 	removeTunnelState = func() error { removes++; return nil }
-	syncDisabledGuard = func(p []ipsec.SelectorPair) error { guardCalls++; guard = p; return nil }
+	syncDisabledGuard = func(p []ipsec.SelectorPair, _ []string) error { guardCalls++; guard = p; return nil }
 	defer func() { removeTunnelState, syncDisabledGuard = origRemove, origGuard }()
 
 	a, _, _, c := ipsecFixture(t, "gw-a", nil)
