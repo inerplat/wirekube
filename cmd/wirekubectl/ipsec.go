@@ -111,7 +111,7 @@ func runIPsecStatus(cmd *cobra.Command, name string) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "GATEWAY\tTUNNEL\tREMOTE\tNODE\tPHASE\tCARRIER\tDATAPLANE\tCHILD-SAS\tSINCE\tMESSAGE")
+	fmt.Fprintln(w, "GATEWAY\tTUNNEL\tREMOTE\tNODE\tPHASE\tCARRIER\tDATAPLANE\tREASON\tSINCE\tMESSAGE")
 	for _, r := range out.Tunnels {
 		since := "-"
 		if t := r.Status.LastTransitionTime; t != nil {
@@ -121,9 +121,9 @@ func runIPsecStatus(cmd *cobra.Command, name string) error {
 		if phase == "" {
 			phase = "Unknown"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			r.Gateway, r.Status.Name, r.Remote, dash(r.Node), phase, yesNo(r.Status.Carrier),
-			dash(string(r.Status.Dataplane)), r.Status.InstalledChildSAs, since, dash(r.Status.Message))
+			dash(string(r.Status.Dataplane)), dash(string(r.Status.Reason)), since, dash(r.Status.Message))
 	}
 	if err := w.Flush(); err != nil {
 		return err

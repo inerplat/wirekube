@@ -21,6 +21,7 @@ import (
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	"github.com/inerplat/wirekube/pkg/failover"
+	"github.com/inerplat/wirekube/pkg/sitegw"
 )
 
 // InjectedCIDRsAnnotation lists, on a WireKubePeer, the gateway routes in its
@@ -44,6 +45,9 @@ type Reconciler struct {
 
 	mu       sync.Mutex
 	trackers map[string]*failover.Tracker
+	// markedUnknown holds the gateways this process marked Unknown; they are
+	// not marked again until their holder is live.
+	markedUnknown map[string]bool
 }
 
 // SetupWithManager registers the reconciler. Gateway and peer events both
@@ -90,6 +94,11 @@ func (r *Reconciler) forgetGatewaysExcept(gateways []wirekubev1alpha1.WireKubeGa
 	for name := range r.trackers {
 		if !keep[name] {
 			delete(r.trackers, name)
+		}
+	}
+	for name := range r.markedUnknown {
+		if !keep[name] {
+			delete(r.markedUnknown, name)
 		}
 	}
 }
@@ -151,6 +160,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 			// until the move is recorded.
 			errs = append(errs, err)
 			active = persisted
+		} else if silent := silentHolder(active, persisted, live); silent != "" {
+			if err := r.markTunnelsUnknown(ctx, gw, silent, now); err != nil {
+				errs = append(errs, err)
+			}
+		} else {
+			r.setMarkedUnknown(gw.Name, false)
 		}
 		if active != "" {
 			if desired[active] == nil {
@@ -241,6 +256,80 @@ func (r *Reconciler) writeStatus(ctx context.Context, gw *wirekubev1alpha1.WireK
 		return fmt.Errorf("update gateway %s status: %w", gw.Name, err)
 	}
 	return nil
+}
+
+// markTunnelsUnknown replaces the tunnel states a silent active peer wrote:
+// nothing else would overwrite them, and a dead node's last word is often
+// Established. The agent rewrites them once it reports again.
+// silentHolder names the peer whose tunnel states nobody refreshes: the
+// active peer while it does not report, or the last one once none holds.
+func silentHolder(active, persisted string, live func(string) bool) string {
+	if active == "" {
+		return persisted
+	}
+	if !live(active) {
+		return active
+	}
+	return ""
+}
+
+func (r *Reconciler) markTunnelsUnknown(ctx context.Context, gw *wirekubev1alpha1.WireKubeGateway, active string, now time.Time) error {
+	if len(gw.Spec.IPsec) == 0 || len(gw.Status.IPsec) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	marked := r.markedUnknown[gw.Name]
+	r.mu.Unlock()
+	if marked {
+		return nil
+	}
+	msg := fmt.Sprintf("peer %s has not reported for %s; its last tunnel state may be stale", active, failover.LivenessThreshold)
+	prev := map[string]wirekubev1alpha1.GatewayIPsecTunnelStatus{}
+	for _, st := range gw.Status.IPsec {
+		prev[st.Name] = st
+	}
+	next := make([]wirekubev1alpha1.GatewayIPsecTunnelStatus, 0, len(gw.Spec.IPsec))
+	for _, t := range gw.Spec.IPsec {
+		st := prev[t.Name]
+		st.Name = t.Name
+		st.Phase = wirekubev1alpha1.IPsecTunnelPhaseUnknown
+		st.Reason = wirekubev1alpha1.IPsecReasonNotReporting
+		st.Message = msg
+		st.Carrier = false
+		next = append(next, st)
+	}
+	sitegw.KeepTransitionTimes(gw.Status.IPsec, next, now)
+	summary := sitegw.Summary(next)
+	if !gw.Status.Ready && gw.Status.IPsecSummary == summary && sitegw.StatusesEqual(gw.Status.IPsec, next) {
+		return nil
+	}
+	// Locked to the version read, so a report the agent wrote meanwhile
+	// is not overwritten; the next pass looks again.
+	patch := client.MergeFromWithOptions(gw.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	gw.Status.IPsec = next
+	gw.Status.IPsecSummary = summary
+	gw.Status.Ready = false
+	if err := r.Status().Patch(ctx, gw, patch); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			return nil
+		}
+		return fmt.Errorf("mark gateway %s tunnels unknown: %w", gw.Name, err)
+	}
+	r.setMarkedUnknown(gw.Name, true)
+	return nil
+}
+
+func (r *Reconciler) setMarkedUnknown(gw string, v bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !v {
+		delete(r.markedUnknown, gw)
+		return
+	}
+	if r.markedUnknown == nil {
+		r.markedUnknown = map[string]bool{}
+	}
+	r.markedUnknown[gw] = true
 }
 
 // advertise makes peer's spec.allowedIPs carry exactly the gateway routes in

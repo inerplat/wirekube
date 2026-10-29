@@ -199,9 +199,9 @@ NAME      ACTIVE   READY   ROUTES   IPSEC             AGE
 site-gw   node-a   true    1        1/2 Established   3d
 
 $ wirekubectl ipsec status
-GATEWAY  TUNNEL    REMOTE        NODE    PHASE        CARRIER  DATAPLANE      CHILD-SAS  SINCE  MESSAGE
-site-gw  tunnel-1  203.0.113.10  node-a  Established  yes      XFRMInterface  1          2h     -
-site-gw  tunnel-2  203.0.113.20  node-a  Connecting   no       XFRMInterface  0          5m     authentication failed: check the pre-shared key and the local and remote IDs (charon: received AUTHENTICATION_FAILED notify error)
+GATEWAY  TUNNEL    REMOTE        NODE    PHASE        CARRIER  DATAPLANE      REASON                SINCE  MESSAGE
+site-gw  tunnel-1  203.0.113.10  node-a  Established  yes      XFRMInterface  -                     2h     -
+site-gw  tunnel-2  203.0.113.20  node-a  Connecting   no       XFRMInterface  AuthenticationFailed  5m     authentication failed: check the pre-shared key and the local and remote IDs
 ```
 
 The same data is in `status.ipsec`. A gateway with tunnels is `ready` only
@@ -213,10 +213,22 @@ while at least one of them is `Established`.
 | `Connecting` | The connection is loaded but no CHILD_SA is installed. |
 | `Established` | At least one CHILD_SA is installed. |
 | `Error` | The active peer could not apply the tunnel; `message` says why. |
+| `Unknown` | The active peer stopped reporting for longer than 90s while other peers still report, or its peer object is gone and no other peer can take over, so the controller no longer trusts the state it last wrote. Only for gateways the controller elects; when every peer goes quiet at once the last states stay, since that points at failing status writes. Once marked, the tunnels are not marked again until the holder reports again, so an agent that still writes them with a late heartbeat keeps its states. |
 
 A `Connecting` tunnel shows, for ten minutes, the reason charon logged for
-its last failed negotiation (proposals, DH group, authentication, traffic
-selectors, or no answer), followed by the charon log line.
+its last failed negotiation: `reason` is one of `ProposalMismatch`,
+`DHGroupMismatch`, `AuthenticationFailed`, `TrafficSelectorMismatch` and
+`PeerUnreachable`, and `message` says what to change. The charon log line
+itself goes to the agent log, once per new line. Other reasons are
+`ConfigError` (the tunnel cannot be applied as specified),
+`IKEDaemonUnavailable`, `DataplaneError`, `GuardNotInstalled` and, for
+`Unknown`, `NotReporting`; treat a reason you do not know as unexplained.
+
+Status is written when something a user can act on changes. `ikeState` and
+`installedChildSAs` are recorded with each write but do not cause one, so a
+tunnel retrying against a silent peer does not rewrite its status on every
+attempt. `wirekube_ipsec_tunnel_child_sas` below carries the live CHILD_SA
+count.
 
 `Error` is reported for a tunnel whose plaintext guard could not be installed
 (the connection stays loaded), whose local and remote selectors overlap,

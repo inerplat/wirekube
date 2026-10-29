@@ -355,3 +355,141 @@ func TestGatewayDoesNotFailBackOntoADeadPeerWhenAllGoQuiet(t *testing.T) {
 		t.Fatalf("active = %q once everyone went quiet, want it left on gw-b", f.active("site"))
 	}
 }
+
+func TestGatewayTunnelsTurnUnknownWhenTheActivePeerGoesSilent(t *testing.T) {
+	gw := gateway("site", []string{"gw-a"}, "10.77.1.0/24")
+	gw.Spec.IPsec = []wirekubev1alpha1.GatewayIPsecTunnel{{Name: "vpn", RemoteAddress: "203.0.113.10"}}
+	// Another node keeps reporting: when every node goes quiet at once the
+	// holder counts as alive, since that points at failing status writes.
+	f := newFixture(t, peer("gw-a", "198.18.0.1/32"), peer("other", "198.18.0.9/32"), gw)
+	f.report("gw-a", "other")
+	f.reconcile()
+
+	// The agent on gw-a reports the tunnel up, then its node dies.
+	g := &wirekubev1alpha1.WireKubeGateway{}
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	at := metav1.NewTime(f.now)
+	g.Status.Ready = true
+	g.Status.IPsecSummary = "Established"
+	g.Status.IPsec = []wirekubev1alpha1.GatewayIPsecTunnelStatus{{Name: "vpn", Phase: wirekubev1alpha1.IPsecTunnelPhaseEstablished, Carrier: true, LastTransitionTime: &at}}
+	if err := f.c.Status().Update(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile()
+	if got := tunnelPhase(t, f, "site"); got != wirekubev1alpha1.IPsecTunnelPhaseEstablished {
+		t.Fatalf("phase = %q while gw-a still reports", got)
+	}
+
+	f.advance(2*time.Minute, "other")
+	f.reconcile()
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	st := g.Status.IPsec[0]
+	if st.Phase != wirekubev1alpha1.IPsecTunnelPhaseUnknown || st.Reason != wirekubev1alpha1.IPsecReasonNotReporting || st.Carrier || g.Status.Ready || g.Status.IPsecSummary != "Unknown" {
+		t.Fatalf("a silent peer's Established survived: %+v ready=%v summary=%q", st, g.Status.Ready, g.Status.IPsecSummary)
+	}
+	rv := g.ResourceVersion
+	f.advance(time.Minute, "other")
+	f.reconcile()
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.ResourceVersion != rv {
+		t.Fatal("an unchanged Unknown was written again")
+	}
+}
+
+func tunnelPhase(t *testing.T, f *fixture, gw string) wirekubev1alpha1.IPsecTunnelPhase {
+	t.Helper()
+	g := &wirekubev1alpha1.WireKubeGateway{}
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: gw}, g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Status.IPsec) == 0 {
+		return ""
+	}
+	return g.Status.IPsec[0].Phase
+}
+
+func TestGatewayWithoutTunnelsIsNotMarkedUnknown(t *testing.T) {
+	gw := gateway("site", []string{"gw-a"}, "10.77.1.0/24")
+	f := newFixture(t, peer("gw-a", "198.18.0.1/32"), peer("other", "198.18.0.9/32"), gw)
+	f.report("gw-a", "other")
+	f.reconcile()
+	g := &wirekubev1alpha1.WireKubeGateway{}
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	// A tunnel was removed from spec; its last status entry is left over.
+	g.Status.Ready = true
+	g.Status.IPsec = []wirekubev1alpha1.GatewayIPsecTunnelStatus{{Name: "old", Phase: wirekubev1alpha1.IPsecTunnelPhaseEstablished}}
+	if err := f.c.Status().Update(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(2*time.Minute, "other")
+	f.reconcile()
+	if got := tunnelPhase(t, f, "site"); got != wirekubev1alpha1.IPsecTunnelPhaseEstablished {
+		t.Fatalf("a gateway with no tunnels in spec was marked %q", got)
+	}
+}
+
+func TestGatewayLeavesTunnelsToAnAgentThatStillWrites(t *testing.T) {
+	gw := gateway("site", []string{"gw-a"}, "10.77.1.0/24")
+	gw.Spec.IPsec = []wirekubev1alpha1.GatewayIPsecTunnel{{Name: "vpn", RemoteAddress: "203.0.113.10"}}
+	f := newFixture(t, peer("gw-a", "198.18.0.1/32"), peer("other", "198.18.0.9/32"), gw)
+	f.report("gw-a", "other")
+	f.reconcile()
+	setPhase := func(phase wirekubev1alpha1.IPsecTunnelPhase) {
+		g := &wirekubev1alpha1.WireKubeGateway{}
+		if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+			t.Fatal(err)
+		}
+		g.Status.IPsec = []wirekubev1alpha1.GatewayIPsecTunnelStatus{{Name: "vpn", Phase: phase}}
+		if err := f.c.Status().Update(context.Background(), g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPhase(wirekubev1alpha1.IPsecTunnelPhaseEstablished)
+	// gw-a's heartbeat stops, but its agent keeps writing the tunnels.
+	f.advance(2*time.Minute, "other")
+	f.reconcile()
+	if tunnelPhase(t, f, "site") != wirekubev1alpha1.IPsecTunnelPhaseUnknown {
+		t.Fatal("not marked Unknown")
+	}
+	setPhase(wirekubev1alpha1.IPsecTunnelPhaseEstablished)
+	f.advance(30*time.Second, "other")
+	f.reconcile()
+	if got := tunnelPhase(t, f, "site"); got != wirekubev1alpha1.IPsecTunnelPhaseEstablished {
+		t.Fatalf("phase = %q; the controller overwrote an agent that still writes", got)
+	}
+}
+
+func TestGatewayTunnelsTurnUnknownWhenTheHolderIsDeleted(t *testing.T) {
+	gw := gateway("site", []string{"gw-a"}, "10.77.1.0/24")
+	gw.Spec.IPsec = []wirekubev1alpha1.GatewayIPsecTunnel{{Name: "vpn", RemoteAddress: "203.0.113.10"}}
+	f := newFixture(t, peer("gw-a", "198.18.0.1/32"), peer("other", "198.18.0.9/32"), gw)
+	f.report("gw-a", "other")
+	f.reconcile()
+	g := &wirekubev1alpha1.WireKubeGateway{}
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	g.Status.Ready = true
+	g.Status.IPsec = []wirekubev1alpha1.GatewayIPsecTunnelStatus{{Name: "vpn", Phase: wirekubev1alpha1.IPsecTunnelPhaseEstablished, Carrier: true}}
+	if err := f.c.Status().Update(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.Delete(context.Background(), f.peer("gw-a")); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile()
+	if err := f.c.Get(context.Background(), client.ObjectKey{Name: "site"}, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.Status.ActivePeer != "" || g.Status.IPsec[0].Phase != wirekubev1alpha1.IPsecTunnelPhaseUnknown || g.Status.Ready {
+		t.Fatalf("a deleted holder's tunnel stayed: active=%q %+v ready=%v", g.Status.ActivePeer, g.Status.IPsec[0], g.Status.Ready)
+	}
+}
