@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -53,7 +55,7 @@ func EnsureRule(iif string) error {
 	if present {
 		return nil
 	}
-	if err := netlink.RuleAdd(rule); err != nil && !errors.Is(err, syscall.EEXIST) {
+	if err := addRule(rule); err != nil && !errors.Is(err, syscall.EEXIST) {
 		return fmt.Errorf("adding ip rule for table %#x: %w", RouteTable, err)
 	}
 	return nil
@@ -94,6 +96,30 @@ func RemoveRule() {
 			_ = netlink.RuleDel(&rules[i])
 		}
 	}
+}
+
+// addRule is netlink.RuleAdd for rules of RouteTable: netlink drops
+// suppress_prefixlen for tables above 255.
+var addRule = func(r *netlink.Rule) error {
+	req := nl.NewNetlinkRequest(unix.RTM_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+	msg := nl.NewRtMsg()
+	msg.Family = unix.AF_INET
+	msg.Protocol = unix.RTPROT_BOOT
+	msg.Type = unix.RTN_UNICAST
+	req.AddData(msg)
+	u32 := func(v int) []byte {
+		b := make([]byte, 4)
+		nl.NativeEndian().PutUint32(b, uint32(v))
+		return b
+	}
+	req.AddData(nl.NewRtAttr(nl.FRA_PRIORITY, u32(r.Priority)))
+	req.AddData(nl.NewRtAttr(nl.FRA_TABLE, u32(r.Table)))
+	req.AddData(nl.NewRtAttr(nl.FRA_SUPPRESS_PREFIXLEN, u32(r.SuppressPrefixlen)))
+	if r.IifName != "" {
+		req.AddData(nl.NewRtAttr(nl.FRA_IIFNAME, nl.ZeroTerminated(r.IifName)))
+	}
+	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
+	return err
 }
 
 func ipsecRule(iif string) *netlink.Rule {
