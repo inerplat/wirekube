@@ -20,6 +20,10 @@ func TestRuleIsScopedToTheInputInterface(t *testing.T) {
 	if err := EnsureRule("net1"); err != nil {
 		t.Fatal(err)
 	}
+	// A rule already in place is kept, not replaced on every sync.
+	add := addRule
+	defer func() { addRule = add }()
+	addRule = func(*netlink.Rule) error { t.Fatal("rule re-added on a repeated sync"); return nil }
 	if err := EnsureRule("net1"); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +37,7 @@ func TestRuleIsScopedToTheInputInterface(t *testing.T) {
 			ours = append(ours, r)
 		}
 	}
-	if len(ours) != 1 || ours[0].IifName != "net1" {
+	if len(ours) != 1 || ours[0].IifName != "net1" || ours[0].SuppressPrefixlen != 0 {
 		t.Fatalf("rules for table %#x = %+v", RouteTable, ours)
 	}
 }
