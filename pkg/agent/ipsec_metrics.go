@@ -6,6 +6,7 @@ import (
 
 	wirekubev1alpha1 "github.com/inerplat/wirekube/pkg/api/v1alpha1"
 	"github.com/inerplat/wirekube/pkg/ipsec"
+	"github.com/inerplat/wirekube/pkg/sitegw"
 )
 
 var (
@@ -55,7 +56,7 @@ func (a *Agent) dropStaleTunnelMetrics(current map[string][]*tunnelPlan) {
 	keep := map[[2]string]bool{}
 	for gw, plans := range current {
 		for _, p := range plans {
-			keep[[2]string{gw, p.spec.Name}] = true
+			keep[[2]string{gw, p.Name}] = true
 		}
 	}
 	for key := range a.ipsec.reported {
@@ -69,7 +70,7 @@ func (a *Agent) dropStaleTunnelMetrics(current map[string][]*tunnelPlan) {
 	}
 }
 
-func recordGuardMetrics(dp ipsecDataplane, pairs []ipsec.SelectorPair) {
+func recordGuardMetrics(dp sitegw.Dataplane, pairs []ipsec.SelectorPair) {
 	ipsecGuardDropped.Reset()
 	if len(pairs) == 0 {
 		return
