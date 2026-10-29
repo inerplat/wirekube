@@ -39,11 +39,13 @@ type Dataplane interface {
 	XFRMInterfaceBlocker() string
 }
 
-// KernelDataplane is the Dataplane of the running kernel.
-type KernelDataplane struct{}
+// KernelDataplane is the Dataplane of the running kernel. A non-empty
+// InputInterface sends only traffic arriving on it into the tunnels, and
+// then the guard covers forwarded traffic only.
+type KernelDataplane struct{ InputInterface string }
 
-func (KernelDataplane) EnsureRule() error { return ipsec.EnsureRule() }
-func (KernelDataplane) RemoveRule()       { ipsec.RemoveRule() }
+func (d KernelDataplane) EnsureRule() error { return ipsec.EnsureRule(d.InputInterface) }
+func (KernelDataplane) RemoveRule()         { ipsec.RemoveRule() }
 func (KernelDataplane) EnsureInterface(n string, id uint32, mtu int) error {
 	return ipsec.EnsureInterface(n, id, mtu)
 }
@@ -57,7 +59,12 @@ func (KernelDataplane) XFRMInterfaceBlocker() string { return ipsec.XFRMInterfac
 func (KernelDataplane) GuardDrops() (map[ipsec.SelectorPair]uint64, error) {
 	return ipsec.GuardDrops()
 }
-func (KernelDataplane) SyncGuard(p []ipsec.SelectorPair) error { return ipsec.SyncGuard(p) }
+func (d KernelDataplane) SyncGuard(p []ipsec.SelectorPair) error {
+	if d.InputInterface != "" {
+		return ipsec.SyncGuard(p, []string{"FORWARD"})
+	}
+	return ipsec.SyncGuard(p, nil)
+}
 
 // Plan is one tunnel to terminate, or the reason it cannot be.
 type Plan struct {

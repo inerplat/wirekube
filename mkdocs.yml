@@ -63,6 +63,7 @@ nav:
     - Connect from Your Machine: guides/connect.md
     - EKS Hybrid Nodes: guides/eks-hybrid-nodes.md
     - WSL2 GPU Node: guides/wsl2-gpu-node.md
+    - Standalone Site Gateway: guides/site-gateway.md
   - Architecture:
     - Overview: architecture/overview.md
     - NAT Traversal: architecture/nat-traversal.md

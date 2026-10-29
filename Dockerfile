@@ -26,6 +26,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o /out/wirekube-admin-web ./cmd/admin-web/
 
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /out/sitegw ./cmd/sitegw/
+
 FROM alpine:3.21
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 RUN apk add --no-cache wireguard-tools iptables ip6tables iproute2
@@ -35,4 +38,5 @@ COPY --from=builder /out/wirekube-relay /usr/local/bin/wirekube-relay
 COPY --from=builder /out/wirekube-relay-ws /usr/local/bin/wirekube-relay-ws
 COPY --from=builder /out/wirekubectl /usr/local/bin/wirekubectl
 COPY --from=builder /out/wirekube-admin-web /usr/local/bin/wirekube-admin-web
+COPY --from=builder /out/sitegw /usr/local/bin/sitegw
 ENTRYPOINT ["wirekube-agent"]

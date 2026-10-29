@@ -143,7 +143,7 @@ func (a *Agent) reconcileDisabledIPsec(ctx context.Context) {
 	if len(pairs) == 0 && a.ipsecDisabledGuardClear {
 		return
 	}
-	if err := syncDisabledGuard(pairs); err != nil {
+	if err := syncDisabledGuard(pairs, nil); err != nil {
 		a.log.Error(err, "syncing IPsec plaintext guard with IPsec disabled")
 		return
 	}

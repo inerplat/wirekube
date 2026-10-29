@@ -28,9 +28,10 @@ const (
 )
 
 // EnsureRule installs "from all lookup RouteTable" with suppress_prefixlen 0
-// so a default route in the table can never capture all traffic.
-func EnsureRule() error {
-	rule := ipsecRule()
+// so a default route in the table can never capture all traffic. A non-empty
+// iif limits the rule to traffic arriving on that interface.
+func EnsureRule(iif string) error {
+	rule := ipsecRule(iif)
 	rules, err := netlink.RuleList(netlink.FAMILY_V4)
 	if err != nil {
 		return fmt.Errorf("listing ip rules: %w", err)
@@ -41,7 +42,7 @@ func EnsureRule() error {
 		if r.Table != RouteTable {
 			continue
 		}
-		if r.Priority == RulePriority && r.SuppressPrefixlen == 0 && r.Src == nil && r.Dst == nil && r.Mark == 0 {
+		if r.Priority == RulePriority && r.SuppressPrefixlen == 0 && r.Src == nil && r.Dst == nil && r.Mark == 0 && r.IifName == iif {
 			present = true
 			continue
 		}
@@ -85,7 +86,7 @@ func IsUnsupported(err error) bool {
 func RemoveRule() {
 	rules, err := netlink.RuleList(netlink.FAMILY_V4)
 	if err != nil {
-		_ = netlink.RuleDel(ipsecRule())
+		_ = netlink.RuleDel(ipsecRule(""))
 		return
 	}
 	for i := range rules {
@@ -95,8 +96,9 @@ func RemoveRule() {
 	}
 }
 
-func ipsecRule() *netlink.Rule {
+func ipsecRule(iif string) *netlink.Rule {
 	r := netlink.NewRule()
+	r.IifName = iif
 	r.Table = RouteTable
 	r.Priority = RulePriority
 	r.SuppressPrefixlen = 0
@@ -150,6 +152,12 @@ func setLooseRPFilter(name string) error {
 	// /proc/sys may be read-only in the container.
 	if _, err := os.Stat("/host/proc/sys/net/ipv4/conf/" + name); err == nil {
 		path = "/host" + path
+	}
+	// An interface inherits conf/default when it is created, so a namespace
+	// whose default is loose needs no write, which matters where /proc/sys
+	// is read-only.
+	if cur, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(cur)) == "2" {
+		return nil
 	}
 	if err := os.WriteFile(path, []byte("2"), 0o644); err != nil {
 		return fmt.Errorf("setting rp_filter on %s: %w", name, err)

@@ -6,14 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 )
 
-// guardHooks are the built-in chains that jump to GuardChain: FORWARD for
-// mesh traffic the gateway relays, OUTPUT for traffic it originates.
+// guardHooks are the built-in chains that may jump to GuardChain: FORWARD
+// for traffic the gateway relays, OUTPUT for traffic it originates.
 var guardHooks = []string{"FORWARD", "OUTPUT"}
 
-func iptables(args ...string) (string, error) {
+var iptables = func(args ...string) (string, error) {
 	out, err := exec.Command("iptables", append([]string{"-w"}, args...)...).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("iptables %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
@@ -24,8 +25,11 @@ func iptables(args ...string) (string, error) {
 // SyncGuard makes GuardChain hold exactly one drop rule per pair. New rules
 // are added before stale ones are removed, so a selector never goes
 // unguarded during a change. With no pairs the chain and its jumps are
-// removed.
-func SyncGuard(pairs []SelectorPair) error {
+// removed. Only the hooks given jump to the chain; nil means all of them.
+func SyncGuard(pairs []SelectorPair, hooks []string) error {
+	if hooks == nil {
+		hooks = guardHooks
+	}
 	if len(pairs) == 0 {
 		RemoveGuard()
 		return nil
@@ -36,6 +40,10 @@ func SyncGuard(pairs []SelectorPair) error {
 		}
 	}
 	for _, hook := range guardHooks {
+		if !slices.Contains(hooks, hook) {
+			_, _ = iptables("-D", hook, "-j", GuardChain)
+			continue
+		}
 		if _, err := iptables("-C", hook, "-j", GuardChain); err != nil {
 			if _, err := iptables("-I", hook, "1", "-j", GuardChain); err != nil {
 				return err

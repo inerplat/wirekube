@@ -4,6 +4,9 @@ A [WireKubeGateway](gateway.md) can terminate site-to-site IPsec tunnels
 toward the networks in its `routes`, for example a managed VPN gateway or an
 on-premises router. The remote side needs only its own IPsec gateway.
 
+The same tunnel code runs without the mesh as a [standalone site
+gateway](../guides/site-gateway.md), for a network that is not the mesh.
+
 ```mermaid
 flowchart LR
     subgraph Mesh["WireKube mesh"]
