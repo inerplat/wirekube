@@ -145,7 +145,10 @@ func agentClusterRole(options Options, labels map[string]string) *rbacv1.Cluster
 			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "patch"}},
 			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubepeers"}, Verbs: []string{"get", "list", "create", "patch", "update", "delete", "watch"}},
 			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubepeers/status", "wirekubemeshes/status", "wirekubegateways/status", "wirekubeexternalpeers/status"}, Verbs: []string{"get", "patch", "update"}},
-			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubemeshes", "wirekubegateways"}, Verbs: []string{"get", "list", "watch"}},
+			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubemeshes"}, Verbs: []string{"get", "list", "watch"}},
+			// patch: the gateway controller records election ownership in an
+			// annotation on the gateway itself, not in its status.
+			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubegateways"}, Verbs: []string{"get", "list", "watch", "patch"}},
 			{APIGroups: []string{"wirekube.io"}, Resources: []string{"wirekubeexternalpeers"}, Verbs: []string{"get", "list", "watch", "update", "delete"}},
 			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
 			{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},

@@ -83,6 +83,8 @@ rules:
   verbs:
   - get
   - list
+  # patch: the gateway controller records election ownership in an annotation.
+  - patch
   - watch
 - apiGroups:
   - wirekube.io

@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -643,6 +644,29 @@ func TestDefaultAgentRBACDoesNotGrantAdministrativeCreate(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The gateway controller runs inside the agent and patches the election
+// ownership annotation on the WireKubeGateway itself (not its status). Without
+// this grant every pass is forbidden and gateways never fail over.
+func TestDefaultAgentRBACCanPatchGateways(t *testing.T) {
+	bundle, err := Render(Options{Image: testImage, Relay: RelayNone, MeshCIDR: "100.96.0.0/11", WireKubeVersion: "v1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range bundle.Objects {
+		role, ok := object.(*rbacv1.ClusterRole)
+		if !ok || role.Name != "wirekube-agent" {
+			continue
+		}
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "wirekube.io") && slices.Contains(rule.Resources, "wirekubegateways") && slices.Contains(rule.Verbs, "patch") {
+				return
+			}
+		}
+		t.Fatalf("agent role cannot patch wirekubegateways: %+v", role.Rules)
+	}
+	t.Fatal("agent ClusterRole was not rendered")
 }
 
 func TestPlannerAvoidsOccupiedCIDRsWithoutMutation(t *testing.T) {

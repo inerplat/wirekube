@@ -14,9 +14,31 @@ rules:
   - ""
   resources:
   - nodes
+  - services
   verbs:
   - get
   - list
+  - watch
+# ServiceCIDR carries the cluster's Service ClusterIP range(s), which the
+# external-peer reconciler advertises to off-cluster WireGuard clients. The
+# kind is served only by newer API servers and is read across the group
+# versions that have carried it; a cluster that serves none simply yields no
+# ranges. WireKubeMesh.spec.serviceCIDRs pins them when this is unavailable.
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - servicecidrs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
 - apiGroups:
   - wirekube.io
   resources:
@@ -27,6 +49,8 @@ rules:
   - create
   - patch
   - update
+  - delete
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -43,6 +67,7 @@ rules:
   - get
   - list
   - update
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -50,6 +75,7 @@ rules:
   verbs:
   - get
   - patch
+  - update
 - apiGroups:
   - wirekube.io
   resources:
@@ -57,6 +83,9 @@ rules:
   verbs:
   - get
   - list
+  # patch: the gateway controller records election ownership in an annotation.
+  - patch
+  - watch
 - apiGroups:
   - wirekube.io
   resources:
@@ -65,6 +94,56 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers
+  verbs:
+  - get
+  - list
+  - watch
+  # create/delete are required because wirekubectl runs inside the agent
+  # pod ("kubectl exec ... wirekubectl invite alice") and uses the agent
+  # ServiceAccount to mint/revoke external peer CRs. The reconciler is the
+  # only writer of status; the agent itself does not patch status here.
+  - create
+  - delete
+  - patch
+  - update
+- apiGroups:
+  - wirekube.io
+  resources:
+  - wirekubeexternalpeers/status
+  verbs:
+  - get
+  - patch
+  - update
+# Leader election for the embedded WireKubeExternalPeer reconciler. Every
+# agent pod runs the reconciler manager but only the leader actually
+# reconciles, preventing N-fold relay-port allocations across the
+# DaemonSet replicas.
+# Also the mesh address claims: a claim is a Lease named after the address, so
+# creating it is how two peers racing for one address are arbitrated, and the
+# leader's sweep deletes the ones whose holder is gone.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -74,6 +153,45 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: wirekube-agent
+subjects:
+- kind: ServiceAccount
+  name: wirekube-agent
+  namespace: wirekube-system
+---
+# The shared external ingress identity: external peers issued under it are
+# served by whichever node is healthy. The agent reads it, and the embedded
+# external-peer controller creates it on first use (create cannot be narrowed
+# to one name).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: wirekube-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  resourceNames:
+  - wirekube-external-ingress
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wirekube-agent-external-ingress
+  namespace: wirekube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wirekube-agent-external-ingress
 subjects:
 - kind: ServiceAccount
   name: wirekube-agent
