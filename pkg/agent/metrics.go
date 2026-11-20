@@ -105,6 +105,12 @@ var (
 		Help:      "1 while MTU-sized heartbeat probes go unanswered although small ones are answered, which forces dual-send.",
 	}, []string{"source", "peer"})
 
+	peerForwardStale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_forward_stale",
+		Help:      "1 while heartbeat pings to this peer go pongStaleWindow (3s) without any pong, which forces dual-send. Catches the one-way blackhole where reverse traffic keeps DirectHealth.LastSeen fresh.",
+	}, []string{"source", "peer"})
+
 	peerEndpointType = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_endpoint_type",
@@ -185,6 +191,7 @@ func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
 		peerDirectRTT.DeletePartialMatch(labels)
 		peerDirectPongAge.DeletePartialMatch(labels)
 		peerMTUProbeStale.DeletePartialMatch(labels)
+		peerForwardStale.DeletePartialMatch(labels)
 	}
 	a.peerMetricLabels = currentPeers
 }
@@ -282,6 +289,7 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			peerHeartbeatAuthFailures.WithLabelValues(me, p.Name).Set(float64(st.AuthFail))
 			peerHeartbeatReplayDrops.WithLabelValues(me, p.Name).Set(float64(st.ReplayDrop))
 			peerMTUProbeStale.WithLabelValues(me, p.Name).Set(boolGauge(st.MTUStale))
+			peerForwardStale.WithLabelValues(me, p.Name).Set(boolGauge(st.ForwardStale))
 			if st.RTTNs > 0 {
 				peerDirectRTT.WithLabelValues(me, p.Name).Set(time.Duration(st.RTTNs).Seconds())
 			}

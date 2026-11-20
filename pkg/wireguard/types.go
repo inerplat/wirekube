@@ -45,4 +45,6 @@ type PathStats struct {
 	RTTNs         int64 // round trip measured by the last pong
 
 	MTUStale bool // MTU probes unanswered while small pongs are fresh; forces dual-send
+
+	ForwardStale bool // pings unanswered (no pong) past pongStaleWindowNs; forces dual-send
 }

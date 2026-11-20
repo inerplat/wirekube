@@ -43,6 +43,11 @@ const (
 // loop, so failover blackout is bounded by this window rather than by the
 // agent's sync cadence. The heartbeat (heartbeatTickNs) refreshes trust on a
 // healthy path well inside the window, so an idle pair no longer lapses.
+//
+// max(LastSeen, lastPongNs) has a one-way blind spot: LastSeen proves only
+// the reverse direction, so a sender whose outbound pings are being dropped
+// still looks healthy while its peer receives nothing. pongStaleWindowNs
+// closes it — see the forwardUnproven term in Send.
 const directTrustWindowNs = int64(3 * time.Second)
 
 // Heartbeat scheduler parameters (see runHeartbeat).
@@ -86,6 +91,18 @@ const bimodalHintWindowNs = int64(10 * time.Second)
 // second-scale retries are enough to survive transient reconnect jitter without
 // turning a persistent direct-path stall into control-plane log noise.
 const bimodalHintSendIntervalNs = int64(2 * time.Second)
+
+// pongStaleWindowNs is how long pings may keep leaving the socket without a
+// single pong coming back before the direct leg's forward direction counts as
+// unproven. Pings leave at 1 Hz, so on a healthy path lastPongNs never ages
+// past ~1s+RTT; three missed round trips mean the pings — or their pongs —
+// are being dropped. This is the sender-side half of the one-way blackhole
+// fix: DirectHealth.LastSeen only proves the reverse direction, so a peer
+// whose inbound traffic keeps arriving looks healthy in
+// max(LastSeen, lastPongNs) terms while everything we send dies. Peers that
+// have never answered a pong are excluded (lastPongNs == 0): for
+// heartbeat-less pairs, receive-side staleness remains the only signal.
+const pongStaleWindowNs = int64(3 * time.Second)
 
 const sendDiagLogIntervalNs = int64(1 * time.Second)
 
@@ -197,6 +214,12 @@ type PeerPath struct {
 	// unanswered while small pongs stayed fresh, so the path is passing small
 	// frames and blackholing large ones. Send treats it as directStale.
 	mtuStale atomic.Bool
+	// forwardStale mirrors the scheduler's pong-staleness verdict for logs
+	// and PathStats: true while pings have gone pongStaleWindowNs without a
+	// pong. The send decision itself is recomputed from lastPongNs per
+	// packet; this only tracks the false→true transition so the log fires
+	// once per outage, like the MTU veto's.
+	forwardStale atomic.Bool
 
 	// pendingMu guards the outstanding-ping ring and the MTU miss counter.
 	pendingMu sync.Mutex
@@ -793,8 +816,9 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	//
 	//	evidence    := max(LastSeen, lastPongNs)
 	//	directStale := evidence == 0 || now - evidence > directTrustWindowNs || mtuStale
+	//	unproven    := lastPongNs > 0 && now - lastPongNs > pongStaleWindowNs
 	//	sendDirect  := mode != Relay
-	//	sendRelay   := mode == Relay || directStale || hintActive || contested
+	//	sendRelay   := mode == Relay || directStale || unproven || hintActive || contested
 	//
 	// Warm therefore no longer dual-sends unconditionally: it dual-sends while
 	// evidence is missing or stale, which for a healthy pair means until the
@@ -811,6 +835,7 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	// until the next FSM cycle.
 	nowNs := b.clockNs()
 	directStale := false
+	forwardUnproven := false
 	if mode != PathModeRelay && pp != nil {
 		evidence := pp.DirectHealth.LastSeen.Load()
 		if pong := pp.lastPongNs.Load(); pong > evidence {
@@ -819,12 +844,21 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		if evidence == 0 || nowNs-evidence > directTrustWindowNs || pp.mtuStale.Load() {
 			directStale = true
 		}
+		// Forward-path probe: a pong is the only evidence that the peer still
+		// receives what we send. Reverse traffic proves the opposite direction
+		// only, so once the round trip has been silent past pongStaleWindowNs
+		// the direct leg is unproven even while LastSeen is fresh — the
+		// one-way-blackhole signature that left the busy side direct-only for
+		// the whole outage while its pings died unseen.
+		if pong := pp.lastPongNs.Load(); pong > 0 && nowNs-pong > pongStaleWindowNs {
+			forwardUnproven = true
+		}
 	}
 	sendDirect := mode != PathModeRelay
 	// The contested-address branch resolves no pp, so it contributes its own
 	// term: without it a contested destination would lose the relay leg that
 	// its relay-only claimants depend on.
-	sendRelay := mode == PathModeRelay || directStale || len(contestedKeys) > 0
+	sendRelay := mode == PathModeRelay || directStale || forwardUnproven || len(contestedKeys) > 0
 
 	if bindDebug && directStale && !(relay != nil && hasPeerKey) {
 		last := lastLogDirectStaleNoRelayNs.Load()
@@ -877,20 +911,14 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		sendRelay = false
 	}
 
-	// Fire a bimodal hint to the remote when our receive watermark has
-	// stalled but we still have a relay to forward through. This pulls the
-	// remote into dual-send mode so its replies reach us over relay while
-	// direct is blackholed one-way. Rate-limited by pp.lastHintSentNs.
-	if directStale && relayAvailable && pp != nil {
-		last := pp.lastHintSentNs.Load()
-		if nowNs-last > bimodalHintSendIntervalNs {
-			if pp.lastHintSentNs.CompareAndSwap(last, nowNs) {
-				if err := relay.SendBimodalHint(peerKeyBytes); err != nil {
-					log.Printf("[bind] SendBimodalHint peer=%s err=%v",
-						shortKey(base64.StdEncoding.EncodeToString(peerKeyBytes[:])), err)
-				}
-			}
-		}
+	// Fire a bimodal hint to the remote when either staleness term says our
+	// direct leg is in trouble but we still have a relay to forward through.
+	// This pulls the remote into dual-send mode so its replies reach us over
+	// relay while direct is blackholed one-way. Rate-limited by
+	// pp.lastHintSentNs, shared with the heartbeat scheduler's identical
+	// check so the pair converges even when the data path is idle.
+	if (directStale || forwardUnproven) && relayAvailable && pp != nil {
+		maybeSendBimodalHint(relay, pp, peerKeyBytes, nowNs)
 	}
 
 	if !sendDirect && !sendRelay {
@@ -1245,6 +1273,26 @@ func (b *WireKubeBind) MarkBimodalHint(srcPubKey [32]byte) {
 	}
 }
 
+// maybeSendBimodalHint tells a peer, over the relay, that our direct leg to
+// it is in trouble so it dual-sends its own packets for bimodalHintWindowNs.
+// Two call sites share the per-peer rate limit: Send (which only runs while
+// there is traffic to send) and the heartbeat scheduler (which runs every
+// tick regardless — the side that most needs the relay is often the one
+// whose data path just went idle, and its Send-side hint would never fire).
+func maybeSendBimodalHint(relay RelayTransport, pp *PeerPath, peerKey [32]byte, nowNs int64) {
+	last := pp.lastHintSentNs.Load()
+	if nowNs-last <= bimodalHintSendIntervalNs {
+		return
+	}
+	if !pp.lastHintSentNs.CompareAndSwap(last, nowNs) {
+		return
+	}
+	if err := relay.SendBimodalHint(peerKey); err != nil {
+		log.Printf("[bind] SendBimodalHint peer=%s err=%v",
+			shortKey(base64.StdEncoding.EncodeToString(peerKey[:])), err)
+	}
+}
+
 // LastDirectPong returns the unix nano timestamp of the last heartbeat pong
 // from a peer, or 0 if none has arrived. Kept separate from
 // DirectHealth.LastSeen so callers can apply their own liveness gate.
@@ -1276,6 +1324,7 @@ func (b *WireKubeBind) PeerPathStats(pubKeyB64 string) (PathStats, bool) {
 		LastMTUPongNs:  pp.lastMTUPongNs.Load(),
 		RTTNs:          pp.rttNs.Load(),
 		MTUStale:       pp.mtuStale.Load(),
+		ForwardStale:   pp.forwardStale.Load(),
 	}, true
 }
 
@@ -1502,6 +1551,11 @@ func (b *WireKubeBind) runHeartbeat(udpConn *net.UDPConn, tickOverride <-chan ti
 // heartbeatMTUProbeEvery-th tick sends the MTU probe instead of the small
 // ping. Heartbeat frames bypass Send and do not touch lastSendNs. Returns the
 // first write error, for the caller's once-per-generation log.
+//
+// After each ping the tick re-evaluates Send's staleness terms and fires a
+// bimodal hint when either fails (see maybeSendBimodalHint): the scheduler
+// is the only hint source that keeps running while the data path is idle,
+// which is the state a one-way blackhole pushes the starved side into.
 func (b *WireKubeBind) heartbeatTick(udpConn *net.UDPConn) error {
 	cfg := b.hbConfig.Load()
 	if cfg == nil {
@@ -1517,6 +1571,7 @@ func (b *WireKubeBind) heartbeatTick(udpConn *net.UDPConn) error {
 	}
 	nowNs := b.clockNs()
 	var firstErr error
+	relay := b.relay
 	b.pathTable.Range(func(key, value any) bool {
 		pp := value.(*PeerPath)
 		if pp.Mode.Load() == PathModeRelay {
@@ -1565,6 +1620,40 @@ func (b *WireKubeBind) heartbeatTick(udpConn *net.UDPConn) error {
 		// and latch the veto on a path that was never tested.
 		pp.recordPing(txid, nowNs, uint16(frameLen), mtuProbe)
 		pp.pingsSent.Add(1)
+
+		// Scheduler-driven safety net. Send only dual-sends and fires hints
+		// while it has traffic, but the side that most needs the relay is
+		// often the one whose data path just went idle — a server whose
+		// clients' packets are being blackholed upstream has nothing to
+		// answer with, so its Send-side hint never fires. Re-evaluate the
+		// same staleness terms here every tick and fire the hint when either
+		// fails. Dual-send itself needs no arming from here: Send recomputes
+		// the terms per packet, so it picks the relay leg up on its next
+		// write without extra state.
+		if relay != nil {
+			lastSeen := pp.DirectHealth.LastSeen.Load()
+			rxStale := lastSeen == 0 || nowNs-lastSeen > directTrustWindowNs || pp.mtuStale.Load()
+			pong := pp.lastPongNs.Load()
+			forwardUnproven := pong > 0 && nowNs-pong > pongStaleWindowNs
+			if rxStale || forwardUnproven {
+				if raw, err := base64.StdEncoding.DecodeString(key.(string)); err == nil && len(raw) == 32 {
+					var kb [32]byte
+					copy(kb[:], raw)
+					maybeSendBimodalHint(relay, pp, kb, nowNs)
+				}
+			}
+			// Transition log for the forward probe, mirroring the MTU veto:
+			// pings left the socket for pongStaleWindowNs and nothing came
+			// back, so the peer is not receiving what we send.
+			if forwardUnproven {
+				if !pp.forwardStale.Swap(true) {
+					log.Printf("[bind] heartbeat pings unanswered for %s peer=%s — forward path unproven, dual-send until pongs resume",
+						time.Duration(nowNs-pong), shortKey(key.(string)))
+				}
+			} else {
+				pp.forwardStale.Store(false)
+			}
+		}
 		return true
 	})
 	return firstErr
