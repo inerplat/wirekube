@@ -797,11 +797,7 @@ func TestBindSendFiresBimodalHintOnStale(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	relay.mu.Lock()
-	defer relay.mu.Unlock()
-	if len(relay.hints) != 1 {
-		t.Fatalf("bimodal hints sent = %d, want 1", len(relay.hints))
-	}
+	waitForHints(t, relay, 1)
 }
 
 // TestBindSendRateLimitsBimodalHints asserts the rate-limit: repeated stale
@@ -829,11 +825,13 @@ func TestBindSendRateLimitsBimodalHints(t *testing.T) {
 		}
 	}
 
+	waitForHints(t, relay, 1)
+	time.Sleep(50 * time.Millisecond) // let in-flight async hints land
 	relay.mu.Lock()
-	defer relay.mu.Unlock()
-	if len(relay.hints) != 1 {
-		t.Fatalf("rate-limited hints = %d, want exactly 1", len(relay.hints))
+	if got := len(relay.hints); got != 1 {
+		t.Fatalf("rate-limited hints = %d, want exactly 1", got)
 	}
+	relay.mu.Unlock()
 }
 
 // TestBindMarkBimodalHintForcesDualSend asserts that an inbound hint makes

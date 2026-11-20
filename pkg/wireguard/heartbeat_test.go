@@ -88,6 +88,26 @@ func (p *hbPeer) tick(t *testing.T) {
 	}
 }
 
+// waitForHints polls until the mock has recorded at least n hints: hint sends
+// are fire-and-forget goroutines now, so a completed tick no longer implies
+// the hint has been appended.
+func waitForHints(t *testing.T, m *mockRelayTransport, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		got := len(m.hints)
+		m.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hints = %d, want >= %d", got, n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // recv runs the direct ReceiveFunc once with a deadline and returns its
 // result. Heartbeat frames must come back as (0, nil).
 func (p *hbPeer) recv(t *testing.T) (int, error) {
@@ -717,7 +737,12 @@ func TestHeartbeatPeerStopsAnsweringForcesDualSendWithin3s(t *testing.T) {
 	// The scheduler carries the hint on its own while the data path is idle
 	// (lastSeen==0 → rxStale) — the idle-sender gap Send alone can never
 	// cover — and shares the per-peer rate limit with Send's own hint.
-	if n := len(a.relay.hints); n < 2 || n > 3 {
+	waitForHints(t, a.relay, 2)
+	time.Sleep(50 * time.Millisecond) // let in-flight async hints land
+	a.relay.mu.Lock()
+	n := len(a.relay.hints)
+	a.relay.mu.Unlock()
+	if n < 2 || n > 3 {
 		t.Fatalf("bimodal hints = %d, want scheduler + send hints within the 2s rate limit (2..3)", n)
 	}
 	if a.relay.hints[0] != peer.Public {
@@ -814,15 +839,14 @@ func TestSchedulerHintsWhenRxStaleWithNoSendTraffic(t *testing.T) {
 
 	a.tick(t)
 	cap.read(t, time.Second) // the ping, unanswered
-	if len(a.relay.hints) != 1 {
-		t.Fatalf("hints = %d with zero Send calls, want 1 from the scheduler", len(a.relay.hints))
-	}
+	waitForHints(t, a.relay, 1)
 	if a.relay.hints[0] != peer.Public {
 		t.Fatal("hint dest is not the starved peer")
 	}
 	a.tick(t)
-	if len(a.relay.hints) != 1 {
-		t.Fatalf("hints = %d after a back-to-back tick, want 1 (per-peer rate limit)", len(a.relay.hints))
+	time.Sleep(50 * time.Millisecond) // let in-flight async hints land
+	if got := len(a.relay.hints); got != 1 {
+		t.Fatalf("hints = %d after a back-to-back tick, want 1 (per-peer rate limit)", got)
 	}
 
 	// Recovery: data arrives again and the scheduler stops hinting.
@@ -830,8 +854,9 @@ func TestSchedulerHintsWhenRxStaleWithNoSendTraffic(t *testing.T) {
 	clock.Advance(3 * time.Second) // let the rate limit lapse
 	a.tick(t)
 	cap.read(t, time.Second)
-	if len(a.relay.hints) != 1 {
-		t.Fatalf("hints = %d after rx recovered, want still 1", len(a.relay.hints))
+	time.Sleep(50 * time.Millisecond)
+	if got := len(a.relay.hints); got != 1 {
+		t.Fatalf("hints = %d after rx recovered, want still 1", got)
 	}
 }
 

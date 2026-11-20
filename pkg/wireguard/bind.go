@@ -619,10 +619,10 @@ func (b *WireKubeBind) Close() error {
 	b.hbStop, b.hbDone = nil, nil
 	b.mu.Unlock()
 
-	// Join the scheduler outside b.mu: it never takes the mutex itself, but
-	// joining under it would still serialize Close behind a tick in progress
-	// for no reason. Writes to the closed socket in that tick are expected
-	// and logged once.
+	// Join the scheduler outside b.mu: it only takes the mutex briefly (the
+	// relay accessor), but joining under it would still serialize Close
+	// behind a tick in progress for no reason. Writes to the closed socket
+	// in that tick are expected and logged once.
 	if stop != nil {
 		close(stop)
 		<-done
@@ -1287,10 +1287,17 @@ func maybeSendBimodalHint(relay RelayTransport, pp *PeerPath, peerKey [32]byte, 
 	if !pp.lastHintSentNs.CompareAndSwap(last, nowNs) {
 		return
 	}
-	if err := relay.SendBimodalHint(peerKey); err != nil {
-		log.Printf("[bind] SendBimodalHint peer=%s err=%v",
-			shortKey(base64.StdEncoding.EncodeToString(peerKey[:])), err)
-	}
+	// Fire-and-forget: the relay TCP write shares one mutex with every other
+	// relay send and can block for as long as the upstream path stalls, and
+	// neither the heartbeat tick (whose pings every other peer's staleness
+	// depends on) nor Bind.Close (which joins the scheduler) may queue behind
+	// it. The CAS above already limits this to one send per interval.
+	go func() {
+		if err := relay.SendBimodalHint(peerKey); err != nil {
+			log.Printf("[bind] SendBimodalHint peer=%s err=%v",
+				shortKey(base64.StdEncoding.EncodeToString(peerKey[:])), err)
+		}
+	}()
 }
 
 // LastDirectPong returns the unix nano timestamp of the last heartbeat pong
@@ -1571,7 +1578,7 @@ func (b *WireKubeBind) heartbeatTick(udpConn *net.UDPConn) error {
 	}
 	nowNs := b.clockNs()
 	var firstErr error
-	relay := b.relay
+	relay := b.RelayTransport()
 	b.pathTable.Range(func(key, value any) bool {
 		pp := value.(*PeerPath)
 		if pp.Mode.Load() == PathModeRelay {
