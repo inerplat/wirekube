@@ -137,3 +137,44 @@ func TestDropConnIgnoresReplacedConnection(t *testing.T) {
 		t.Fatal("dropConn for a stale connection tore down its replacement")
 	}
 }
+
+// A read loop whose connection was already replaced ends with a read error on
+// the closed socket. It must leave the replacement alone: tearing it down from
+// there is what turned one reconnect into a cascade of three.
+func TestReadLoopOnReplacedConnectionLeavesReplacementAlone(t *testing.T) {
+	oldServer, oldConn := net.Pipe()
+	defer oldServer.Close()
+	newServer, newConn := net.Pipe()
+	defer newServer.Close()
+	defer newConn.Close()
+
+	c := NewClient("pipe", [32]byte{}, 0)
+	c.conn = oldConn
+	c.writer = bufio.NewWriter(oldConn)
+	c.connected.Store(true)
+
+	done := make(chan struct{})
+	go func() { defer close(done); c.readLoop(context.Background()) }()
+	time.Sleep(20 * time.Millisecond) // let the loop pick up oldConn
+
+	// What dial does on a reconnect: install the new connection, close the old.
+	c.mu.Lock()
+	c.conn = newConn
+	c.writer = bufio.NewWriter(newConn)
+	c.mu.Unlock()
+	oldConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read loop did not exit after its connection closed")
+	}
+	if !c.IsConnected() || c.conn != newConn {
+		t.Fatal("the stale read loop tore down the replacement connection")
+	}
+	select {
+	case <-c.reconnectCh:
+		t.Fatal("the stale read loop woke the reconnect loop")
+	default:
+	}
+}

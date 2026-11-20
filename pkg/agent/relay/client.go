@@ -215,9 +215,13 @@ func (c *Client) readLoop(ctx context.Context) {
 
 		frame, err := relayproto.ReadFrame(reader)
 		if err != nil {
-			if ctx.Err() == nil {
+			// Only the loop whose connection is still current may tear the
+			// client down. A connection that keepaliveLoop dropped or a
+			// reconnect replaced also ends here, with "use of closed network
+			// connection"; signalling for it would close the replacement and
+			// start a reconnect cascade.
+			if ctx.Err() == nil && c.dropConn(conn) {
 				log.Printf("relay-client: read error: %v", err)
-				c.signalReconnect()
 			}
 			return
 		}
@@ -262,8 +266,8 @@ func (c *Client) readLoop(ctx context.Context) {
 				continue
 			}
 			if err := c.sendFrame(relayproto.MakeRelayProbeFrame(token)); err != nil {
+				// sendFrame already dropped the connection it failed on.
 				log.Printf("relay-client: relay probe response failed: %v", err)
-				c.signalReconnect()
 				return
 			}
 
@@ -328,13 +332,14 @@ func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
 }
 
 // dropConn tears down forConn and wakes the reconnect loop, but only while
-// forConn is still the client's current connection. A caller that decided on
-// stale evidence must not close the replacement a reconnect already installed.
-func (c *Client) dropConn(forConn net.Conn) {
+// forConn is still the client's current connection, and reports whether it
+// did. A caller that decided on stale evidence must not close the replacement
+// a reconnect already installed.
+func (c *Client) dropConn(forConn net.Conn) bool {
 	c.mu.Lock()
-	if c.conn != forConn {
+	if forConn == nil || c.conn != forConn {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	c.connected.Store(false)
 	c.conn.Close()
@@ -345,6 +350,7 @@ func (c *Client) dropConn(forConn net.Conn) {
 	case c.reconnectCh <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 func (c *Client) signalReconnect() {
@@ -408,8 +414,9 @@ func (c *Client) sendFrame(frame relayproto.Frame) error {
 		c.mu.Unlock()
 		return fmt.Errorf("not connected")
 	}
-	if c.conn != nil {
-		_ = c.conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
+	conn := c.conn
+	if conn != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
 	}
 	err := relayproto.WriteFrame(c.writer, frame)
 	if err == nil {
@@ -417,7 +424,9 @@ func (c *Client) sendFrame(frame relayproto.Frame) error {
 	}
 	c.mu.Unlock()
 	if err != nil {
-		c.signalReconnect()
+		// Drop the connection this write failed on, not whatever is current
+		// by now: a reconnect may already have replaced it.
+		c.dropConn(conn)
 	}
 	return err
 }
