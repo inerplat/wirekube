@@ -55,10 +55,15 @@ type Client struct {
 	writer  *bufio.Writer
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
-	onData      DataHandler
-	onExternal  ExternalDataHandler
-	onHint      HintHandler
-	connected   atomic.Bool
+	onData     DataHandler
+	onExternal ExternalDataHandler
+	onHint     HintHandler
+	connected  atomic.Bool
+	// lastRxNs is when the current connection last delivered a frame, and
+	// echoSeen whether the relay has echoed a keepalive on it. Together they
+	// let keepaliveLoop tell a dead inbound direction from an idle one.
+	lastRxNs    atomic.Int64
+	echoSeen    atomic.Bool
 	reconnectCh chan struct{} // signalled by readLoop on disconnect
 	cancel      context.CancelFunc
 }
@@ -126,6 +131,17 @@ const dialTimeout = 10 * time.Second
 // the same mutex — until the server's RST happens to arrive.
 var relayWriteTimeout = 10 * time.Second
 
+// relayKeepaliveInterval is how often the client sends a keepalive, which the
+// relay echoes. relayRxTimeout is how long the connection may then deliver
+// nothing before the client gives up on it. The timeout sits above the longest
+// inbound stall a connection is expected to ride out on its own and below the
+// point where the stall has outlived the relay's patience: tearing down
+// earlier would turn every short stall into a reconnect.
+var (
+	relayKeepaliveInterval = 2 * time.Second
+	relayRxTimeout         = 8 * time.Second
+)
+
 // dial performs a single TCP connect + register handshake.
 // The TCP socket is marked with the WireKube fwmark (SO_MARK) so that
 // it bypasses the WireKube routing table and uses the main table.
@@ -164,6 +180,8 @@ func (c *Client) dial(ctx context.Context) error {
 	old := c.conn
 	c.conn = conn
 	c.writer = writer
+	c.echoSeen.Store(false)
+	c.lastRxNs.Store(time.Now().UnixNano())
 	c.mu.Unlock()
 
 	if old != nil {
@@ -203,6 +221,7 @@ func (c *Client) readLoop(ctx context.Context) {
 			}
 			return
 		}
+		c.lastRxNs.Store(time.Now().UnixNano())
 
 		switch frame.Type {
 		case relayproto.MsgData:
@@ -262,7 +281,10 @@ func (c *Client) readLoop(ctx context.Context) {
 			log.Printf("relay-client: server error: %s", string(frame.Body))
 
 		case relayproto.MsgKeepalive:
-			// no-op
+			// The relay echoes keepalives; seeing one arms the receive
+			// timeout in keepaliveLoop. A relay that predates the echo never
+			// sends this, and the timeout stays off.
+			c.echoSeen.Store(true)
 		}
 	}
 }
@@ -270,7 +292,7 @@ func (c *Client) readLoop(ctx context.Context) {
 // keepaliveLoop is scoped to a single TCP connection. It exits when the
 // connection changes or the context is cancelled.
 func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
-	ticker := time.NewTicker(25 * time.Second)
+	ticker := time.NewTicker(relayKeepaliveInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -283,10 +305,45 @@ func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
 			if !sameConn {
 				return
 			}
+			// The relay echoes every keepalive, so once one echo has been
+			// seen a healthy connection delivers a frame at least every
+			// interval. Silence past relayRxTimeout means the inbound
+			// direction is dead even though our writes still succeed — the
+			// state in which the relay has already closed the connection and
+			// its RST is stuck behind the same blackout. Reconnecting now
+			// instead of waiting for that RST also discards the relay's stale
+			// queue and the old connection's backed-off retransmit timer.
+			if c.echoSeen.Load() {
+				if silent := time.Since(time.Unix(0, c.lastRxNs.Load())); silent > relayRxTimeout {
+					log.Printf("relay-client: no frame from relay for %v, reconnecting", silent.Round(time.Millisecond))
+					c.dropConn(forConn)
+					return
+				}
+			}
 			if err := c.sendFrame(relayproto.MakeKeepaliveFrame()); err != nil {
 				return
 			}
 		}
+	}
+}
+
+// dropConn tears down forConn and wakes the reconnect loop, but only while
+// forConn is still the client's current connection. A caller that decided on
+// stale evidence must not close the replacement a reconnect already installed.
+func (c *Client) dropConn(forConn net.Conn) {
+	c.mu.Lock()
+	if c.conn != forConn {
+		c.mu.Unlock()
+		return
+	}
+	c.connected.Store(false)
+	c.conn.Close()
+	c.conn = nil
+	c.writer = nil
+	c.mu.Unlock()
+	select {
+	case c.reconnectCh <- struct{}{}:
+	default:
 	}
 }
 

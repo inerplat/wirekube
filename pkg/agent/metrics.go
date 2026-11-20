@@ -69,6 +69,12 @@ var (
 		Help:      "Packets this node sent to the peer, by which legs carried them (direct_only, dual, relay_only).",
 	}, []string{"source", "peer", "leg"})
 
+	peerRelayCopyLimited = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_relay_copy_limited_total",
+		Help:      "Dual-send packets to the peer whose relay copy was withheld by the per-peer copy budget (they still went direct). A climbing value means dual-send wanted more relay bandwidth than the budget allows.",
+	}, []string{"source", "peer"})
+
 	peerHeartbeatPongs = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_heartbeat_pongs_total",
@@ -185,6 +191,7 @@ func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
 		peerDirectRxAge.DeletePartialMatch(labels)
 		peerEndpointType.DeletePartialMatch(labels)
 		peerSendPackets.DeletePartialMatch(labels)
+		peerRelayCopyLimited.DeletePartialMatch(labels)
 		peerHeartbeatPongs.DeletePartialMatch(labels)
 		peerHeartbeatAuthFailures.DeletePartialMatch(labels)
 		peerHeartbeatReplayDrops.DeletePartialMatch(labels)
@@ -285,6 +292,7 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			peerSendPackets.WithLabelValues(me, p.Name, "direct_only").Set(float64(st.SentDirectOnly))
 			peerSendPackets.WithLabelValues(me, p.Name, "dual").Set(float64(st.SentDual))
 			peerSendPackets.WithLabelValues(me, p.Name, "relay_only").Set(float64(st.SentRelayOnly))
+			peerRelayCopyLimited.WithLabelValues(me, p.Name).Set(float64(st.SentCopyLimited))
 			peerHeartbeatPongs.WithLabelValues(me, p.Name).Set(float64(st.PongsRecv))
 			peerHeartbeatAuthFailures.WithLabelValues(me, p.Name).Set(float64(st.AuthFail))
 			peerHeartbeatReplayDrops.WithLabelValues(me, p.Name).Set(float64(st.ReplayDrop))

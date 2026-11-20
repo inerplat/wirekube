@@ -65,6 +65,7 @@ const (
 	dropGone
 	dropWriteError
 	dropShutdown
+	dropSourceCap
 	dropReasonCount
 )
 
@@ -78,6 +79,8 @@ func (r dropReason) String() string {
 		return "write_error"
 	case dropShutdown:
 		return "shutdown"
+	case dropSourceCap:
+		return "source_cap"
 	default:
 		return "unknown"
 	}

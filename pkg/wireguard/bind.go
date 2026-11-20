@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -189,10 +190,13 @@ type PeerPath struct {
 	sentDirectOnly atomic.Uint64
 	sentDual       atomic.Uint64
 	sentRelayOnly  atomic.Uint64
-	pingsSent      atomic.Uint64
-	pongsRecv      atomic.Uint64
-	authFail       atomic.Uint64
-	replayDrop     atomic.Uint64
+	// sentCopyLimited counts dual-send packets whose relay copy was withheld
+	// by dualCopyBucket; they still went out on the direct leg.
+	sentCopyLimited atomic.Uint64
+	pingsSent       atomic.Uint64
+	pongsRecv       atomic.Uint64
+	authFail        atomic.Uint64
+	replayDrop      atomic.Uint64
 
 	// lastSendNs is the last Send for this peer on any leg; it gates the
 	// heartbeat (session active within heartbeatSessionActiveNs). Heartbeat
@@ -229,6 +233,9 @@ type PeerPath struct {
 
 	// pongBucket rate-limits pong replies to this peer.
 	pongBucket tokenBucket
+	// dualCopyBucket rate-limits the optional relay copies of a dual-send, in
+	// bytes; see dualCopyBytesPerSec.
+	dualCopyBucket tokenBucket
 }
 
 // pendingPing is one outstanding heartbeat ping awaiting its pong.
@@ -250,6 +257,11 @@ type tokenBucket struct {
 
 // allow takes one token if available, refilling at rate tokens/s up to burst.
 func (tb *tokenBucket) allow(nowNs int64, rate, burst float64) bool {
+	return tb.allowN(nowNs, 1, rate, burst)
+}
+
+// allowN takes n tokens if available, refilling at rate tokens/s up to burst.
+func (tb *tokenBucket) allowN(nowNs int64, n, rate, burst float64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	if tb.lastNs == 0 {
@@ -261,11 +273,53 @@ func (tb *tokenBucket) allow(nowNs int64, rate, burst float64) bool {
 		}
 	}
 	tb.lastNs = nowNs
-	if tb.tokens < 1 {
+	if tb.tokens < n {
 		return false
 	}
-	tb.tokens--
+	tb.tokens -= n
 	return true
+}
+
+// dualCopyBytesPerSec bounds the optional relay copies of a dual-send, per
+// peer. A dual-send duplicates traffic that already has a direct leg, so the
+// copy is insurance, not the delivery path, and it shares the destination's
+// relay queue and TCP stream with peers that have no other way in.
+//
+// Unbounded, the copy stream becomes a feedback loop wherever the relay's own
+// TCP connection to the destination rides this node's direct leg (a relay pod
+// behind an in-cluster load balancer, reached over the pod network): every
+// copy the relay writes comes back as fresh ciphertext for the same peer, is
+// copied again, and the pair saturates the path until the dual-send window
+// closes. That was measured at ~40 Mbit/s for ~10 s per outage, tail-dropping
+// the relay-only traffic queued behind it. The bucket caps the loop at a rate
+// a relay connection absorbs, and leaves handshakes and relay-only sends
+// (where the relay leg is the delivery path) untouched.
+//
+// WIREKUBE_DUAL_COPY_BYTES_PER_SEC overrides the rate; 0 removes the bound.
+var dualCopyBytesPerSec = dualCopyRateFromEnv(1 << 20)
+
+// dualCopyBurstBytes is the bucket depth: one second of copies, enough for a
+// handshake-sized burst at the start of an outage.
+func dualCopyBurstBytes() float64 { return dualCopyBytesPerSec }
+
+func dualCopyRateFromEnv(def float64) float64 {
+	v := os.Getenv("WIREKUBE_DUAL_COPY_BYTES_PER_SEC")
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n < 0 {
+		log.Printf("[bind] ignoring invalid WIREKUBE_DUAL_COPY_BYTES_PER_SEC=%q", v)
+		return def
+	}
+	return n
+}
+
+// wgTransportData reports whether buf is a WireGuard transport data message.
+// Handshake messages are never rate-limited: they are small, rare, and the
+// relay copy is what re-establishes a session across a one-way blackout.
+func wgTransportData(buf []byte) bool {
+	return len(buf) >= 4 && buf[0] == 4 && buf[1]|buf[2]|buf[3] == 0
 }
 
 // heartbeatConfig is the local identity and mesh MTU the heartbeat needs,
@@ -945,10 +999,22 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	addr := net.UDPAddrFromAddrPort(dst)
 
+	// The relay copy is optional only when a direct leg carries the same
+	// packet to a single resolved peer. Relay-only sends and the contested
+	// fan-out depend on the relay leg and are never limited.
+	limitCopies := sendDirect && sendRelay && pp != nil && len(contestedKeys) == 0 && dualCopyBytesPerSec > 0
+
 	for _, buf := range bufs {
 		// Send on every enabled leg. Errors on one leg do NOT suppress the other;
 		// any success satisfies delivery (the receiver dedupes via replay window).
 		var directErr, relayErr error
+
+		sendRelay := sendRelay
+		if limitCopies && wgTransportData(buf) &&
+			!pp.dualCopyBucket.allowN(nowNs, float64(len(buf)), dualCopyBytesPerSec, dualCopyBurstBytes()) {
+			sendRelay = false
+			pp.sentCopyLimited.Add(1)
+		}
 
 		if sendDirect {
 			if _, err := c.WriteToUDP(buf, addr); err != nil {
@@ -1319,19 +1385,20 @@ func (b *WireKubeBind) PeerPathStats(pubKeyB64 string) (PathStats, bool) {
 		return PathStats{}, false
 	}
 	return PathStats{
-		SentDirectOnly: pp.sentDirectOnly.Load(),
-		SentDual:       pp.sentDual.Load(),
-		SentRelayOnly:  pp.sentRelayOnly.Load(),
-		PingsSent:      pp.pingsSent.Load(),
-		PongsRecv:      pp.pongsRecv.Load(),
-		AuthFail:       pp.authFail.Load(),
-		ReplayDrop:     pp.replayDrop.Load(),
-		LastSendNs:     pp.lastSendNs.Load(),
-		LastPongNs:     pp.lastPongNs.Load(),
-		LastMTUPongNs:  pp.lastMTUPongNs.Load(),
-		RTTNs:          pp.rttNs.Load(),
-		MTUStale:       pp.mtuStale.Load(),
-		ForwardStale:   pp.forwardStale.Load(),
+		SentDirectOnly:  pp.sentDirectOnly.Load(),
+		SentDual:        pp.sentDual.Load(),
+		SentRelayOnly:   pp.sentRelayOnly.Load(),
+		SentCopyLimited: pp.sentCopyLimited.Load(),
+		PingsSent:       pp.pingsSent.Load(),
+		PongsRecv:       pp.pongsRecv.Load(),
+		AuthFail:        pp.authFail.Load(),
+		ReplayDrop:      pp.replayDrop.Load(),
+		LastSendNs:      pp.lastSendNs.Load(),
+		LastPongNs:      pp.lastPongNs.Load(),
+		LastMTUPongNs:   pp.lastMTUPongNs.Load(),
+		RTTNs:           pp.rttNs.Load(),
+		MTUStale:        pp.mtuStale.Load(),
+		ForwardStale:    pp.forwardStale.Load(),
 	}, true
 }
 

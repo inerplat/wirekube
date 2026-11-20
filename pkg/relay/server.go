@@ -98,6 +98,24 @@ const sendQueueDepth = 256
 // destination whose control queue overflows is not draining at all.
 const ctrlQueueDepth = 64
 
+// sourceQueueCap bounds how many of a destination's data-queue slots one
+// source peer may hold. The queue is shared by every peer sending to that
+// destination, and their traffic is not equally important: a peer dual-sending
+// has a direct leg carrying the same packets, while a relay-only peer has
+// nothing else. Without the cap one source's burst of optional copies fills
+// the queue and the relay-only peer's frames are the ones tail-dropped.
+//
+// The cap binds only while the queue is contended: another source has frames
+// queued, or had one tail-dropped within sourceContentionWindow. A source that
+// is alone keeps the whole queue, as before.
+const sourceQueueCap = sendQueueDepth * 3 / 4
+
+// sourceContentionWindow is how long a tail-dropped source keeps the queue
+// marked as contended. Without it a source that filled the queue while alone
+// would take every slot the writer frees, and the peer being dropped would
+// never get in to count as a second source.
+const sourceContentionWindow = time.Second
+
 // dropLogInterval rate-limits the overflow warning. Without it a single
 // wedged destination would reproduce the log flood this queue exists to
 // prevent.
@@ -224,6 +242,17 @@ type clientConn struct {
 	dropLogMu   sync.Mutex
 	lastDropLog time.Time
 
+	// srcQueued counts the frames each source peer currently holds in dataQ,
+	// for sourceQueueCap. Entries are removed when they reach zero, so the
+	// map is bounded by the queue depth.
+	srcMu         sync.Mutex
+	srcQueued     map[[PubKeySize]byte]int
+	lastSrcCapLog time.Time
+	// starvedSrc is the source of the last tail-dropped data frame and
+	// starvedAt when; see sourceContentionWindow.
+	starvedSrc [PubKeySize]byte
+	starvedAt  time.Time
+
 	// metrics is set under Server.mu when the peer registers and stays nil
 	// for connections that never register (tests, one-shot control
 	// sessions). The per-frame path tolerates nil.
@@ -243,7 +272,84 @@ func newClientConn(pubKey [PubKeySize]byte, conn net.Conn) *clientConn {
 		ctrlQ:  make(chan Frame, ctrlQueueDepth),
 		dataQ:  make(chan Frame, sendQueueDepth),
 		done:   make(chan struct{}),
+
+		srcQueued: make(map[[PubKeySize]byte]int),
 	}
+}
+
+// dataSource returns the source peer key of a queued data frame. Only MsgData
+// carries one on the outbound side (MakeDataFrame(src, payload)); every other
+// frame type is not attributed and not capped.
+func dataSource(frame Frame) (src [PubKeySize]byte, ok bool) {
+	if frame.Type != MsgData || len(frame.Body) < PubKeySize {
+		return src, false
+	}
+	copy(src[:], frame.Body[:PubKeySize])
+	return src, true
+}
+
+// reserveSource charges one data-queue slot to the frame's source and reports
+// false when that source already holds sourceQueueCap slots.
+func (c *clientConn) reserveSource(frame Frame) bool {
+	src, ok := dataSource(frame)
+	if !ok {
+		return true
+	}
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	if held := c.srcQueued[src]; held >= sourceQueueCap {
+		contended := len(c.srcQueued) > 1 ||
+			(c.starvedSrc != src && !c.starvedAt.IsZero() && time.Since(c.starvedAt) < sourceContentionWindow)
+		if contended {
+			return false
+		}
+	}
+	c.srcQueued[src]++
+	return true
+}
+
+// noteStarved records the source of a tail-dropped data frame, which marks
+// the queue as contended for sourceContentionWindow.
+func (c *clientConn) noteStarved(frame Frame) {
+	src, ok := dataSource(frame)
+	if !ok {
+		return
+	}
+	c.srcMu.Lock()
+	c.starvedSrc = src
+	c.starvedAt = time.Now()
+	c.srcMu.Unlock()
+}
+
+// releaseSource returns the slot reserveSource charged, once the frame has
+// left dataQ (written, drained, or never enqueued).
+func (c *clientConn) releaseSource(frame Frame) {
+	src, ok := dataSource(frame)
+	if !ok {
+		return
+	}
+	c.srcMu.Lock()
+	if n := c.srcQueued[src]; n <= 1 {
+		delete(c.srcQueued, src)
+	} else {
+		c.srcQueued[src] = n - 1
+	}
+	c.srcMu.Unlock()
+}
+
+func (c *clientConn) noteSourceCap(frame Frame) {
+	c.dropped.Add(1)
+	c.countDrop(classData, dropSourceCap)
+
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	now := time.Now()
+	if now.Sub(c.lastSrcCapLog) < dropLogInterval {
+		return
+	}
+	c.lastSrcCapLog = now
+	src, _ := dataSource(frame)
+	log.Printf("relay: source %x holds %d of %d queue slots for %x, dropping its frames", src[:8], sourceQueueCap, sendQueueDepth, c.pubKey[:8])
 }
 
 func (c *clientConn) queueFor(class frameClass) chan Frame {
@@ -268,6 +374,11 @@ func (c *clientConn) writeFrame(frame Frame) error {
 	default:
 	}
 
+	if class == classData && !c.reserveSource(frame) {
+		c.noteSourceCap(frame)
+		return nil
+	}
+
 	q := c.queueFor(class)
 	select {
 	case q <- frame:
@@ -277,6 +388,10 @@ func (c *clientConn) writeFrame(frame Frame) error {
 		}
 		return nil
 	default:
+		if class == classData {
+			c.releaseSource(frame)
+			c.noteStarved(frame)
+		}
 		c.noteDrop(class)
 		return nil
 	}
@@ -332,6 +447,7 @@ func (c *clientConn) writeLoop() {
 				return
 			}
 		case frame := <-c.dataQ:
+			c.releaseSource(frame)
 			c.noteDequeued(classData)
 			if err := c.writeBatch(frame, classData); err != nil {
 				log.Printf("relay: write to %x failed (%s): %v — closing connection", c.pubKey[:8], classData, err)
@@ -367,6 +483,7 @@ func (c *clientConn) nextQueued() (Frame, frameClass, bool) {
 	select {
 	case frame := <-c.dataQ:
 		c.ctrlStreak = 0
+		c.releaseSource(frame)
 		c.noteDequeued(classData)
 		return frame, classData, true
 	default:
@@ -465,7 +582,10 @@ func (c *clientConn) drainQueues() {
 		q := c.queueFor(class)
 		for {
 			select {
-			case <-q:
+			case frame := <-q:
+				if class == classData {
+					c.releaseSource(frame)
+				}
 				c.countDrop(class, dropShutdown)
 			default:
 				c.noteDequeued(class)
@@ -920,7 +1040,19 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 
 		case MsgKeepalive:
-			// no-op
+			// Echo it. The client cannot tell a connection whose inbound
+			// direction has gone silent from an idle one unless something
+			// comes back on a schedule, and without that it only learns the
+			// relay closed the connection when the RST happens to get
+			// through. It goes on the control queue so it is not held behind
+			// a data backlog; a full control queue means the writer is not
+			// draining at all, and the echo is dropped like anything else.
+			select {
+			case <-cc.done:
+				return
+			case cc.ctrlQ <- MakeKeepaliveFrame():
+			default:
+			}
 
 		case MsgRelayProbe:
 			token, err := ParseRelayProbeFrame(frame.Body)
