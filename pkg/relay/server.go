@@ -316,6 +316,7 @@ func (c *clientConn) writeLoop() {
 		}
 		if frame, class, ok := c.nextQueued(); ok {
 			if err := c.writeBatch(frame, class); err != nil {
+				log.Printf("relay: write to %x failed (%s): %v — closing connection", c.pubKey[:8], class, err)
 				return
 			}
 			continue
@@ -327,11 +328,13 @@ func (c *clientConn) writeLoop() {
 		case frame := <-c.ctrlQ:
 			c.noteDequeued(classCtrl)
 			if err := c.writeBatch(frame, classCtrl); err != nil {
+				log.Printf("relay: write to %x failed (%s): %v — closing connection", c.pubKey[:8], classCtrl, err)
 				return
 			}
 		case frame := <-c.dataQ:
 			c.noteDequeued(classData)
 			if err := c.writeBatch(frame, classData); err != nil {
+				log.Printf("relay: write to %x failed (%s): %v — closing connection", c.pubKey[:8], classData, err)
 				return
 			}
 		}
