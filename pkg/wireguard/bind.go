@@ -298,6 +298,13 @@ func (tb *tokenBucket) allowN(nowNs int64, n, rate, burst float64) bool {
 // WIREKUBE_DUAL_COPY_BYTES_PER_SEC overrides the rate; 0 removes the bound.
 var dualCopyBytesPerSec = dualCopyRateFromEnv(1 << 20)
 
+// dualCopyEvidenceWindowNs is how recently the direct leg must have carried
+// evidence (a received packet or a pong) for a relay copy to count as
+// optional. Past it the direct leg is not something to rely on and the copy
+// goes out unlimited; the agent's path FSM moves such a peer to relay-only on
+// roughly the same timescale.
+const dualCopyEvidenceWindowNs = int64(30 * time.Second)
+
 // dualCopyBurstBytes is the bucket depth: one second of copies, enough for a
 // handshake-sized burst at the start of an outage.
 func dualCopyBurstBytes() float64 { return dualCopyBytesPerSec }
@@ -890,11 +897,17 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	nowNs := b.clockNs()
 	directStale := false
 	forwardUnproven := false
+	// directRecentlyProven is whether the direct leg carried evidence within
+	// dualCopyEvidenceWindowNs. It decides if a relay copy is insurance for a
+	// leg that was just working (and may be rate-limited) or the only way the
+	// packet can arrive (and must not be).
+	directRecentlyProven := false
 	if mode != PathModeRelay && pp != nil {
 		evidence := pp.DirectHealth.LastSeen.Load()
 		if pong := pp.lastPongNs.Load(); pong > evidence {
 			evidence = pong
 		}
+		directRecentlyProven = evidence != 0 && nowNs-evidence <= dualCopyEvidenceWindowNs
 		if evidence == 0 || nowNs-evidence > directTrustWindowNs || pp.mtuStale.Load() {
 			directStale = true
 		}
@@ -999,10 +1012,16 @@ func (b *WireKubeBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	addr := net.UDPAddrFromAddrPort(dst)
 
-	// The relay copy is optional only when a direct leg carries the same
-	// packet to a single resolved peer. Relay-only sends and the contested
-	// fan-out depend on the relay leg and are never limited.
-	limitCopies := sendDirect && sendRelay && pp != nil && len(contestedKeys) == 0 && dualCopyBytesPerSec > 0
+	// The relay copy is optional only when a direct leg that was recently
+	// proven carries the same packet to a single resolved peer. Relay-only
+	// sends and the contested fan-out depend on the relay leg and are never
+	// limited — and neither is a dual-send to a peer whose direct leg has no
+	// recent evidence. That is a pair being probed for a direct path it may
+	// never have (both ends behind NAT): the mode is Warm and a direct write
+	// is attempted, but only the relay copy arrives, so withholding it drops
+	// the packet outright.
+	limitCopies := sendDirect && sendRelay && pp != nil && len(contestedKeys) == 0 &&
+		dualCopyBytesPerSec > 0 && directRecentlyProven
 
 	for _, buf := range bufs {
 		// Send on every enabled leg. Errors on one leg do NOT suppress the other;

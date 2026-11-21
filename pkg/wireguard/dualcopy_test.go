@@ -18,6 +18,12 @@ func relaySends(m *mockRelayTransport) int {
 	return len(m.sent)
 }
 
+// staleButRecent gives the peer direct evidence 5s old: past the 3s trust
+// window (so Send dual-sends) and inside dualCopyEvidenceWindowNs.
+func staleButRecent(p *hbPeer, key string, clock *fakeClock) {
+	p.b.GetPeerPath(key).DirectHealth.LastSeen.Store(clock.Before(5 * time.Second))
+}
+
 func withDualCopyRate(t *testing.T, bytesPerSec float64) {
 	t.Helper()
 	old := dualCopyBytesPerSec
@@ -35,8 +41,10 @@ func TestDualCopyBudgetBoundsRelayCopies(t *testing.T) {
 	a := newHBPeer(t, clock, true)
 	cap := newCapture(t)
 	peer := mustKeyPair(t)
-	// No evidence yet, so the direct leg is stale and every send is dual.
 	a.b.SetPeerPath(peer.PublicKeyBase64(), PathModeDirect, cap.addr)
+	// The direct leg worked 5s ago: stale enough to dual-send, recent enough
+	// that the relay copy is insurance rather than the delivery path.
+	staleButRecent(a, peer.PublicKeyBase64(), clock)
 	ep := &WireKubeEndpoint{dst: cap.addr}
 
 	const size, n = 1000, 30
@@ -77,6 +85,7 @@ func TestDualCopyBudgetExemptsHandshakes(t *testing.T) {
 	cap := newCapture(t)
 	peer := mustKeyPair(t)
 	a.b.SetPeerPath(peer.PublicKeyBase64(), PathModeDirect, cap.addr)
+	staleButRecent(a, peer.PublicKeyBase64(), clock)
 	ep := &WireKubeEndpoint{dst: cap.addr}
 
 	// Spend the whole budget on data.
@@ -140,5 +149,44 @@ func TestDualCopyBudgetDisabled(t *testing.T) {
 	}
 	if got := relaySends(a.relay); got != 20 {
 		t.Fatalf("relay copies = %d with the budget disabled, want 20", got)
+	}
+}
+
+// A pair with no direct evidence — one being probed for a direct path it has
+// never had, as two NATed nodes are — depends on the relay copy even though
+// the mode is Warm and a direct write is attempted. Limiting it there drops
+// the packet outright, so the budget must not apply.
+func TestDualCopyBudgetNeverLimitsUnprovenDirectLeg(t *testing.T) {
+	withDualCopyRate(t, 1000)
+	clock := newFakeClock()
+	a := newHBPeer(t, clock, true)
+	cap := newCapture(t)
+	peer := mustKeyPair(t)
+	a.b.SetPeerPath(peer.PublicKeyBase64(), PathModeWarm, cap.addr)
+	ep := &WireKubeEndpoint{dst: cap.addr}
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		if err := a.b.Send([][]byte{wgData(1000)}, ep); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+	if got := relaySends(a.relay); got != n {
+		t.Fatalf("relay copies = %d for a never-proven direct leg, want all %d", got, n)
+	}
+	if s := stats(t, a, peer.PublicKeyBase64()); s.SentCopyLimited != 0 {
+		t.Fatalf("SentCopyLimited = %d, want 0", s.SentCopyLimited)
+	}
+
+	// Evidence that has aged out of the window is the same situation.
+	pp := a.b.GetPeerPath(peer.PublicKeyBase64())
+	pp.DirectHealth.LastSeen.Store(clock.Before(time.Duration(dualCopyEvidenceWindowNs) + time.Second))
+	for i := 0; i < n; i++ {
+		if err := a.b.Send([][]byte{wgData(1000)}, ep); err != nil {
+			t.Fatalf("Send (aged evidence) %d: %v", i, err)
+		}
+	}
+	if got := relaySends(a.relay); got != 2*n {
+		t.Fatalf("relay copies = %d with evidence older than the window, want %d", got, 2*n)
 	}
 }
