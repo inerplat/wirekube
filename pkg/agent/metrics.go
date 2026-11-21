@@ -69,6 +69,12 @@ var (
 		Help:      "Packets this node sent to the peer, by which legs carried them (direct_only, dual, relay_only).",
 	}, []string{"source", "peer", "leg"})
 
+	peerRelayCopyLimited = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_relay_copy_limited_total",
+		Help:      "Dual-send packets to the peer whose relay copy was withheld by the per-peer copy budget (they still went direct). A climbing value means dual-send wanted more relay bandwidth than the budget allows.",
+	}, []string{"source", "peer"})
+
 	peerHeartbeatPongs = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "wirekube",
 		Name:      "peer_heartbeat_pongs_total",
@@ -103,6 +109,12 @@ var (
 		Namespace: "wirekube",
 		Name:      "peer_mtu_probe_stale",
 		Help:      "1 while MTU-sized heartbeat probes go unanswered although small ones are answered, which forces dual-send.",
+	}, []string{"source", "peer"})
+
+	peerForwardStale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "wirekube",
+		Name:      "peer_forward_stale",
+		Help:      "1 while heartbeat pings to this peer go pongStaleWindow (3s) without any pong, which forces dual-send. Catches the one-way blackhole where reverse traffic keeps DirectHealth.LastSeen fresh.",
 	}, []string{"source", "peer"})
 
 	peerEndpointType = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -179,12 +191,14 @@ func (a *Agent) dropStaleMetricLabels(currentPeers map[string]struct{}) {
 		peerDirectRxAge.DeletePartialMatch(labels)
 		peerEndpointType.DeletePartialMatch(labels)
 		peerSendPackets.DeletePartialMatch(labels)
+		peerRelayCopyLimited.DeletePartialMatch(labels)
 		peerHeartbeatPongs.DeletePartialMatch(labels)
 		peerHeartbeatAuthFailures.DeletePartialMatch(labels)
 		peerHeartbeatReplayDrops.DeletePartialMatch(labels)
 		peerDirectRTT.DeletePartialMatch(labels)
 		peerDirectPongAge.DeletePartialMatch(labels)
 		peerMTUProbeStale.DeletePartialMatch(labels)
+		peerForwardStale.DeletePartialMatch(labels)
 	}
 	a.peerMetricLabels = currentPeers
 }
@@ -278,10 +292,12 @@ func (a *Agent) updateMetrics(ctx context.Context, peerList *wirekubev1alpha1.Wi
 			peerSendPackets.WithLabelValues(me, p.Name, "direct_only").Set(float64(st.SentDirectOnly))
 			peerSendPackets.WithLabelValues(me, p.Name, "dual").Set(float64(st.SentDual))
 			peerSendPackets.WithLabelValues(me, p.Name, "relay_only").Set(float64(st.SentRelayOnly))
+			peerRelayCopyLimited.WithLabelValues(me, p.Name).Set(float64(st.SentCopyLimited))
 			peerHeartbeatPongs.WithLabelValues(me, p.Name).Set(float64(st.PongsRecv))
 			peerHeartbeatAuthFailures.WithLabelValues(me, p.Name).Set(float64(st.AuthFail))
 			peerHeartbeatReplayDrops.WithLabelValues(me, p.Name).Set(float64(st.ReplayDrop))
 			peerMTUProbeStale.WithLabelValues(me, p.Name).Set(boolGauge(st.MTUStale))
+			peerForwardStale.WithLabelValues(me, p.Name).Set(boolGauge(st.ForwardStale))
 			if st.RTTNs > 0 {
 				peerDirectRTT.WithLabelValues(me, p.Name).Set(time.Duration(st.RTTNs).Seconds())
 			}

@@ -1075,14 +1075,23 @@ func (a *Agent) sync(ctx context.Context) error {
 		// Symmetric peers must never be force-endpointed post-probe: the
 		// NAT-mapped source port drifts and writing a stale value clobbers
 		// wireguard-go's roamed endpoint.
-		iceStateNow := a.getICEState(p.Name)
 		peerIsSymmetric := p.Status.NATType == "symmetric"
 		forceForProbe := a.directProbing[p.Name] && (!peerIsSymmetric || !a.probeForced[p.Name])
 		if forceForProbe && peerIsSymmetric {
 			a.probeForced[p.Name] = true
 		}
-		forceEp := forceForProbe ||
-			(iceStateNow.State == iceStateConnected && !a.relayedPeers[p.Name] && !peerIsSymmetric)
+		// Outside an active probe the device keeps whatever endpoint it has
+		// roamed to. A connected direct peer is by definition answering from
+		// that endpoint; the advertised one is only what STUN saw, and behind
+		// a NAT that does not preserve ports the two differ. Forcing the
+		// advertised value on every sync tick repointed a working peer at a
+		// port its NAT never opened, and the path stayed dark until the peer
+		// happened to send something that roamed the endpoint back — a
+		// blackout phase-locked to this node's sync tick. This is the same
+		// failure e355b36 removed for symmetric peers; the NAT classification
+		// does not make the advertised endpoint of a "cone" peer any more
+		// trustworthy than the one it is actually sending from.
+		forceEp := forceForProbe
 		wgPeers = append(wgPeers, wireguard.PeerConfig{
 			PublicKeyB64:     p.Spec.PublicKey,
 			Endpoint:         endpoint,
@@ -1824,6 +1833,21 @@ func (a *Agent) driveTransportMode(
 		directAddr := peer.Spec.Endpoint
 		if ep, ok := a.directEndpoints[name]; ok && ep != "" {
 			directAddr = ep
+		}
+		// Follow the device when it has roamed. The address recorded for a
+		// peer is where it was reachable when the path was last probed or
+		// recovered; a NAT that later hands the peer another port moves the
+		// device's endpoint (authenticated packets do that) but not this
+		// record. Left stale, every sync tick re-commits the old address to
+		// the bind, which then probes and falls back to a port the peer no
+		// longer answers on. Only a live session's endpoint on the same host
+		// is adopted, so an unauthenticated or relay-synthetic address never
+		// replaces the recorded one.
+		if s, ok := statsByKey[peer.Spec.PublicKey]; ok && wgAlive {
+			if roamed := roamedDirectEndpoint(directAddr, s.ActualEndpoint); roamed != "" {
+				directAddr = roamed
+				a.directEndpoints[name] = roamed
+			}
 		}
 		// A dormant peer is demoted to direct-only dispatch. The relay leg is
 		// what costs the whole mesh: a warm peer keeps duplicating every
@@ -3089,4 +3113,27 @@ func (a *Agent) sharedExternalIngressKey(ctx context.Context) (*wireguard.KeyPai
 		return nil, err
 	}
 	return wireguard.ParseKeyPair(string(secret.Data[wirekubev1alpha1.ExternalIngressSecretKey]))
+}
+
+// roamedDirectEndpoint returns actual when it is the same host as recorded on
+// a different port — the signature of a NAT rebinding a peer's source port —
+// and "" otherwise. A different host is not adopted here: that is a peer that
+// moved, which the probe and reflection paths handle with more evidence than
+// a single device read.
+func roamedDirectEndpoint(recorded, actual string) string {
+	if actual == "" || actual == recorded || isLocalhostEndpoint(actual) {
+		return ""
+	}
+	recAddr, err := netip.ParseAddrPort(recorded)
+	if err != nil {
+		return ""
+	}
+	actAddr, err := netip.ParseAddrPort(actual)
+	if err != nil || actAddr.Port() == 0 {
+		return ""
+	}
+	if recAddr.Addr().Unmap() != actAddr.Addr().Unmap() {
+		return ""
+	}
+	return actual
 }

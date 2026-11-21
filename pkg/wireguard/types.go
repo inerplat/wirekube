@@ -34,10 +34,14 @@ type PathStats struct {
 	SentDirectOnly uint64
 	SentDual       uint64
 	SentRelayOnly  uint64
-	PingsSent      uint64
-	PongsRecv      uint64
-	AuthFail       uint64
-	ReplayDrop     uint64
+	// SentCopyLimited counts dual-send packets that went direct-only because
+	// the relay-copy byte budget was spent. They are included in
+	// SentDirectOnly.
+	SentCopyLimited uint64
+	PingsSent       uint64
+	PongsRecv       uint64
+	AuthFail        uint64
+	ReplayDrop      uint64
 
 	LastSendNs    int64 // last Send for this peer on any leg
 	LastPongNs    int64 // last heartbeat pong (small or MTU probe)
@@ -45,4 +49,6 @@ type PathStats struct {
 	RTTNs         int64 // round trip measured by the last pong
 
 	MTUStale bool // MTU probes unanswered while small pongs are fresh; forces dual-send
+
+	ForwardStale bool // pings unanswered (no pong) past pongStaleWindowNs; forces dual-send
 }

@@ -88,6 +88,26 @@ func (p *hbPeer) tick(t *testing.T) {
 	}
 }
 
+// waitForHints polls until the mock has recorded at least n hints: hint sends
+// are fire-and-forget goroutines now, so a completed tick no longer implies
+// the hint has been appended.
+func waitForHints(t *testing.T, m *mockRelayTransport, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		got := len(m.hints)
+		m.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hints = %d, want >= %d", got, n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // recv runs the direct ReceiveFunc once with a deadline and returns its
 // result. Heartbeat frames must come back as (0, nil).
 func (p *hbPeer) recv(t *testing.T) (int, error) {
@@ -714,8 +734,129 @@ func TestHeartbeatPeerStopsAnsweringForcesDualSendWithin3s(t *testing.T) {
 	if len(a.relay.sent) != 1 {
 		t.Fatalf("relay sends = %d after 3.1s of silence, want 1 (dual-send)", len(a.relay.sent))
 	}
-	if len(a.relay.hints) != 1 {
-		t.Fatalf("bimodal hints = %d, want 1 (stale evidence fires the hint)", len(a.relay.hints))
+	// The scheduler carries the hint on its own while the data path is idle
+	// (lastSeen==0 → rxStale) — the idle-sender gap Send alone can never
+	// cover — and shares the per-peer rate limit with Send's own hint.
+	waitForHints(t, a.relay, 2)
+	time.Sleep(50 * time.Millisecond) // let in-flight async hints land
+	a.relay.mu.Lock()
+	n := len(a.relay.hints)
+	a.relay.mu.Unlock()
+	if n < 2 || n > 3 {
+		t.Fatalf("bimodal hints = %d, want scheduler + send hints within the 2s rate limit (2..3)", n)
+	}
+	if a.relay.hints[0] != peer.Public {
+		t.Fatal("hint dest is not the silent peer")
+	}
+}
+
+// The 09:07-class one-way blackhole: the busy side's pings die upstream but
+// the peer's reverse traffic keeps arriving, so LastSeen stays fresh and
+// max(LastSeen, lastPongNs) hides the outage from the sender. The forward
+// probe must force dual-send anyway within ~3s of the last pong, and a
+// recovered pong must return the send to direct-only without any control
+// plane round trip.
+func TestForwardStaleForcesDualSendDespiteFreshLastSeen(t *testing.T) {
+	clock := newFakeClock()
+	a := newHBPeer(t, clock, true)
+	cap := newCapture(t)
+	peer := mustKeyPair(t)
+	a.b.SetPeerPath(peer.PublicKeyBase64(), PathModeDirect, cap.addr)
+	pp := a.b.GetPeerPath(peer.PublicKeyBase64())
+	pp.lastSendNs.Store(clock.Now())
+	key := pp.hbKey.Load()
+	ep := &WireKubeEndpoint{dst: cap.addr}
+
+	a.tick(t)
+	if !answerPing(t, a, cap, peer.Public, key, true) {
+		t.Fatal("first ping was not answered")
+	}
+	if err := a.b.Send([][]byte{{4}}, ep); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(a.relay.sent) != 0 {
+		t.Fatal("fresh pong did not keep the send direct-only")
+	}
+	cap.read(t, time.Second) // drain the direct data frame
+
+	// The blackhole: our pings (and data) die upstream, but the peer's
+	// reverse traffic keeps flowing, so LastSeen never goes stale. Steps of
+	// 1.1s put the third tick past pongStaleWindowNs (3.3s without a pong).
+	for i := 0; i < 3; i++ {
+		clock.Advance(1100 * time.Millisecond)
+		a.tick(t)
+		cap.read(t, 200*time.Millisecond) // swallow, no reply
+		pp.DirectHealth.LastSeen.Store(clock.Now())
+	}
+	if s := stats(t, a, peer.PublicKeyBase64()); !s.ForwardStale {
+		t.Fatal("forwardStale not latched after 3.3s of unanswered pings")
+	}
+	clock.Advance(100 * time.Millisecond)
+	pp.DirectHealth.LastSeen.Store(clock.Now())
+	if err := a.b.Send([][]byte{{4}}, ep); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(a.relay.sent) != 1 {
+		t.Fatalf("relay sends = %d with fresh LastSeen but no pong for 3.1s, want 1 (dual-send)", len(a.relay.sent))
+	}
+	cap.read(t, time.Second) // drain the dual-send data frame
+
+	// Recovery: a pong proves the round trip again and the send goes back
+	// to direct-only, with forwardStale cleared by the next tick.
+	clock.Advance(time.Second)
+	a.tick(t)
+	if !answerPing(t, a, cap, peer.Public, key, true) {
+		t.Fatal("recovery ping was not answered")
+	}
+	if err := a.b.Send([][]byte{{4}}, ep); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(a.relay.sent) != 1 {
+		t.Fatalf("relay sends = %d after pong recovery, want still 1 (direct-only again)", len(a.relay.sent))
+	}
+	a.tick(t)
+	if s := stats(t, a, peer.PublicKeyBase64()); s.ForwardStale {
+		t.Fatal("forwardStale not cleared after pongs resumed")
+	}
+}
+
+// The scheduler must fire the hint with no data-path traffic at all: the
+// side that most needs the relay during a one-way blackhole is often idle
+// (a server whose clients' packets are being dropped has nothing to answer
+// with), so Send's own hint never fires. This is the rx-starved variant —
+// pongs still make the round trip (small frames pass), but the peer's WG
+// data is not arriving, so LastSeen is stale while lastPongNs looks healthy.
+func TestSchedulerHintsWhenRxStaleWithNoSendTraffic(t *testing.T) {
+	clock := newFakeClock()
+	a := newHBPeer(t, clock, true)
+	cap := newCapture(t)
+	peer := mustKeyPair(t)
+	a.b.SetPeerPath(peer.PublicKeyBase64(), PathModeDirect, cap.addr)
+	pp := a.b.GetPeerPath(peer.PublicKeyBase64())
+	pp.lastSendNs.Store(clock.Now())
+	pp.lastPongNs.Store(clock.Now())
+	pp.DirectHealth.LastSeen.Store(clock.Before(10 * time.Second))
+
+	a.tick(t)
+	cap.read(t, time.Second) // the ping, unanswered
+	waitForHints(t, a.relay, 1)
+	if a.relay.hints[0] != peer.Public {
+		t.Fatal("hint dest is not the starved peer")
+	}
+	a.tick(t)
+	time.Sleep(50 * time.Millisecond) // let in-flight async hints land
+	if got := len(a.relay.hints); got != 1 {
+		t.Fatalf("hints = %d after a back-to-back tick, want 1 (per-peer rate limit)", got)
+	}
+
+	// Recovery: data arrives again and the scheduler stops hinting.
+	pp.DirectHealth.LastSeen.Store(clock.Now())
+	clock.Advance(3 * time.Second) // let the rate limit lapse
+	a.tick(t)
+	cap.read(t, time.Second)
+	time.Sleep(50 * time.Millisecond)
+	if got := len(a.relay.hints); got != 1 {
+		t.Fatalf("hints = %d after rx recovered, want still 1", got)
 	}
 }
 

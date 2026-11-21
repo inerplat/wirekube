@@ -55,10 +55,15 @@ type Client struct {
 	writer  *bufio.Writer
 	proxies map[[relayproto.PubKeySize]byte]*UDPProxy
 
-	onData      DataHandler
-	onExternal  ExternalDataHandler
-	onHint      HintHandler
-	connected   atomic.Bool
+	onData     DataHandler
+	onExternal ExternalDataHandler
+	onHint     HintHandler
+	connected  atomic.Bool
+	// lastRxNs is when the current connection last delivered a frame, and
+	// echoSeen whether the relay has echoed a keepalive on it. Together they
+	// let keepaliveLoop tell a dead inbound direction from an idle one.
+	lastRxNs    atomic.Int64
+	echoSeen    atomic.Bool
 	reconnectCh chan struct{} // signalled by readLoop on disconnect
 	cancel      context.CancelFunc
 }
@@ -119,6 +124,24 @@ func (c *Client) Connect(ctx context.Context) error {
 
 const dialTimeout = 10 * time.Second
 
+// relayWriteTimeout bounds every client-side relay TCP write. The server
+// kills a stalled connection from its side; without a client-side bound the
+// writing goroutine instead blocks indefinitely while holding c.mu, wedging
+// the keepalive, every other relay sender and signalReconnect — which needs
+// the same mutex — until the server's RST happens to arrive.
+var relayWriteTimeout = 10 * time.Second
+
+// relayKeepaliveInterval is how often the client sends a keepalive, which the
+// relay echoes. relayRxTimeout is how long the connection may then deliver
+// nothing before the client gives up on it. The timeout sits above the longest
+// inbound stall a connection is expected to ride out on its own and below the
+// point where the stall has outlived the relay's patience: tearing down
+// earlier would turn every short stall into a reconnect.
+var (
+	relayKeepaliveInterval = 2 * time.Second
+	relayRxTimeout         = 8 * time.Second
+)
+
 // dial performs a single TCP connect + register handshake.
 // The TCP socket is marked with the WireKube fwmark (SO_MARK) so that
 // it bypasses the WireKube routing table and uses the main table.
@@ -157,6 +180,8 @@ func (c *Client) dial(ctx context.Context) error {
 	old := c.conn
 	c.conn = conn
 	c.writer = writer
+	c.echoSeen.Store(false)
+	c.lastRxNs.Store(time.Now().UnixNano())
 	c.mu.Unlock()
 
 	if old != nil {
@@ -190,12 +215,17 @@ func (c *Client) readLoop(ctx context.Context) {
 
 		frame, err := relayproto.ReadFrame(reader)
 		if err != nil {
-			if ctx.Err() == nil {
+			// Only the loop whose connection is still current may tear the
+			// client down. A connection that keepaliveLoop dropped or a
+			// reconnect replaced also ends here, with "use of closed network
+			// connection"; signalling for it would close the replacement and
+			// start a reconnect cascade.
+			if ctx.Err() == nil && c.dropConn(conn) {
 				log.Printf("relay-client: read error: %v", err)
-				c.signalReconnect()
 			}
 			return
 		}
+		c.lastRxNs.Store(time.Now().UnixNano())
 
 		switch frame.Type {
 		case relayproto.MsgData:
@@ -235,17 +265,9 @@ func (c *Client) readLoop(ctx context.Context) {
 				log.Printf("relay-client: bad relay probe frame: %v", err)
 				continue
 			}
-			c.mu.Lock()
-			if c.writer != nil {
-				err = relayproto.WriteFrame(c.writer, relayproto.MakeRelayProbeFrame(token))
-				if err == nil {
-					err = c.writer.Flush()
-				}
-			}
-			c.mu.Unlock()
-			if err != nil {
+			if err := c.sendFrame(relayproto.MakeRelayProbeFrame(token)); err != nil {
+				// sendFrame already dropped the connection it failed on.
 				log.Printf("relay-client: relay probe response failed: %v", err)
-				c.signalReconnect()
 				return
 			}
 
@@ -263,7 +285,10 @@ func (c *Client) readLoop(ctx context.Context) {
 			log.Printf("relay-client: server error: %s", string(frame.Body))
 
 		case relayproto.MsgKeepalive:
-			// no-op
+			// The relay echoes keepalives; seeing one arms the receive
+			// timeout in keepaliveLoop. A relay that predates the echo never
+			// sends this, and the timeout stays off.
+			c.echoSeen.Store(true)
 		}
 	}
 }
@@ -271,7 +296,7 @@ func (c *Client) readLoop(ctx context.Context) {
 // keepaliveLoop is scoped to a single TCP connection. It exits when the
 // connection changes or the context is cancelled.
 func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
-	ticker := time.NewTicker(25 * time.Second)
+	ticker := time.NewTicker(relayKeepaliveInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -280,26 +305,52 @@ func (c *Client) keepaliveLoop(ctx context.Context, forConn net.Conn) {
 		case <-ticker.C:
 			c.mu.RLock()
 			sameConn := c.conn == forConn
-			w := c.writer
 			c.mu.RUnlock()
-			if !sameConn || w == nil {
+			if !sameConn {
 				return
 			}
-			c.mu.Lock()
-			var writeErr error
-			if c.writer != nil {
-				writeErr = relayproto.WriteFrame(c.writer, relayproto.MakeKeepaliveFrame())
-				if writeErr == nil {
-					writeErr = c.writer.Flush()
+			// The relay echoes every keepalive, so once one echo has been
+			// seen a healthy connection delivers a frame at least every
+			// interval. Silence past relayRxTimeout means the inbound
+			// direction is dead even though our writes still succeed — the
+			// state in which the relay has already closed the connection and
+			// its RST is stuck behind the same blackout. Reconnecting now
+			// instead of waiting for that RST also discards the relay's stale
+			// queue and the old connection's backed-off retransmit timer.
+			if c.echoSeen.Load() {
+				if silent := time.Since(time.Unix(0, c.lastRxNs.Load())); silent > relayRxTimeout {
+					log.Printf("relay-client: no frame from relay for %v, reconnecting", silent.Round(time.Millisecond))
+					c.dropConn(forConn)
+					return
 				}
 			}
-			c.mu.Unlock()
-			if writeErr != nil {
-				c.signalReconnect()
+			if err := c.sendFrame(relayproto.MakeKeepaliveFrame()); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// dropConn tears down forConn and wakes the reconnect loop, but only while
+// forConn is still the client's current connection, and reports whether it
+// did. A caller that decided on stale evidence must not close the replacement
+// a reconnect already installed.
+func (c *Client) dropConn(forConn net.Conn) bool {
+	c.mu.Lock()
+	if forConn == nil || c.conn != forConn {
+		c.mu.Unlock()
+		return false
+	}
+	c.connected.Store(false)
+	c.conn.Close()
+	c.conn = nil
+	c.writer = nil
+	c.mu.Unlock()
+	select {
+	case c.reconnectCh <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func (c *Client) signalReconnect() {
@@ -351,48 +402,50 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 	}
 }
 
+// sendFrame writes one frame to the current relay connection. The write is
+// bounded by relayWriteTimeout so a stalled socket cannot hold c.mu — and
+// every other relay sender queued behind it — indefinitely. A failed write
+// tears the connection down for the reconnect loop: bufio's error is sticky
+// and a timed-out batch may have left a partial frame on the wire, so the
+// stream cannot be trusted again.
+func (c *Client) sendFrame(frame relayproto.Frame) error {
+	c.mu.Lock()
+	if c.writer == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("not connected")
+	}
+	conn := c.conn
+	if conn != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
+	}
+	err := relayproto.WriteFrame(c.writer, frame)
+	if err == nil {
+		err = c.writer.Flush()
+	}
+	c.mu.Unlock()
+	if err != nil {
+		// Drop the connection this write failed on, not whatever is current
+		// by now: a reconnect may already have replaced it.
+		c.dropConn(conn)
+	}
+	return err
+}
+
 // SendNATProbe asks the relay to send a UDP probe from a different source port
 // to the specified mapped endpoint. Used for port-restricted cone detection.
 func (c *Client) SendNATProbe(ip net.IP, port int) error {
-	frame := relayproto.MakeNATProbeFrame(ip, port)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.writer == nil {
-		return fmt.Errorf("not connected")
-	}
-	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
-		return err
-	}
-	return c.writer.Flush()
+	return c.sendFrame(relayproto.MakeNATProbeFrame(ip, port))
 }
 
 // SendToPeer sends a UDP payload to a remote peer through the relay.
 func (c *Client) SendToPeer(destPubKey [relayproto.PubKeySize]byte, payload []byte) error {
-	frame := relayproto.MakeDataFrame(destPubKey, payload)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.writer == nil {
-		return fmt.Errorf("not connected")
-	}
-	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
-		return err
-	}
-	return c.writer.Flush()
+	return c.sendFrame(relayproto.MakeDataFrame(destPubKey, payload))
 }
 
 // SendToExternal sends a raw WireGuard response packet back to a source token
 // owned by this relay connection's shared external listener.
 func (c *Client) SendToExternal(sourceToken uint64, payload []byte) error {
-	frame := relayproto.MakeExternalDataFrame(sourceToken, "", payload)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.writer == nil {
-		return fmt.Errorf("not connected")
-	}
-	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
-		return err
-	}
-	if err := c.writer.Flush(); err != nil {
+	if err := c.sendFrame(relayproto.MakeExternalDataFrame(sourceToken, "", payload)); err != nil {
 		return err
 	}
 	if clientDebug {
@@ -406,16 +459,7 @@ func (c *Client) SendToExternal(sourceToken uint64, payload []byte) error {
 // the local receive watermark has stalled but send keeps succeeding, which
 // indicates an asymmetric UDP blackhole.
 func (c *Client) SendBimodalHint(destPubKey [relayproto.PubKeySize]byte) error {
-	frame := relayproto.MakeBimodalHintFrame(destPubKey)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.writer == nil {
-		return fmt.Errorf("not connected")
-	}
-	if err := relayproto.WriteFrame(c.writer, frame); err != nil {
-		return err
-	}
-	return c.writer.Flush()
+	return c.sendFrame(relayproto.MakeBimodalHintFrame(destPubKey))
 }
 
 // GetOrCreateProxy returns the UDP proxy for a given peer, creating one if needed.
